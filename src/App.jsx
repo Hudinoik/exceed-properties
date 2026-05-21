@@ -3833,6 +3833,99 @@ const INVOICE_TOOL = {
   },
 };
 
+// CIPC company registration document (e.g. CoR 14.3 / 14.1A or the CIPC
+// Disclosure Certificate). Identifies the legal entity that will sign the
+// lease — primary use is to confirm tenant company name, registration
+// number, type of entity, and current directors / members.
+const CIPC_TOOL = {
+  name: 'submit_cipc_data',
+  description: 'Extract company-level fields from a South African CIPC company-disclosure / registration certificate (CoR 14.3, CoR 9.4, Disclosure Certificate, etc).',
+  input_schema: {
+    type: 'object',
+    properties: {
+      tenant: {
+        type: 'object',
+        description: 'Tenant / company being disclosed by the CIPC document.',
+        properties: {
+          companyName: { type: 'string', description: 'Registered company name exactly as printed' },
+          tradingName: { type: 'string', description: 'Trading-as name if different from registered name' },
+          registrationNumber: { type: 'string', description: 'Format YYYY/NNNNNN/NN (CIPC registration number)' },
+          entityType: { type: 'string', description: 'Company | CC | Trust | Partnership | Sole Proprietor — pick the closest match' },
+          status: { type: 'string', description: 'Company status — In Business, In Deregistration, etc.' },
+          registrationDate: { type: 'string', description: 'ISO date YYYY-MM-DD' },
+          financialYearEnd: { type: 'string', description: 'Month name or ISO date (e.g. "February" or "2026-02-28")' },
+          principalAddress: { type: 'string', description: 'Registered principal business address, multi-line joined by ", "' },
+          postalAddress: { type: 'string', description: 'Postal address if different from principal' },
+        },
+      },
+      directors: {
+        type: 'array',
+        description: 'Active directors / members / trustees as listed on the document.',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Full name (First Middle Last)' },
+            idNumber: { type: 'string', description: '13-digit RSA ID number, digits only' },
+            role: { type: 'string', description: 'Director / Member / Trustee / Public Officer' },
+            appointmentDate: { type: 'string', description: 'ISO date YYYY-MM-DD if shown' },
+          },
+        },
+      },
+    },
+  },
+};
+
+// SA ID document — green ID book, smart-ID card, or ID copy. Used to
+// confirm the signatory's identity. The drafter fills section 1.2's
+// signatory name and 13-digit ID.
+const ID_DOCUMENT_TOOL = {
+  name: 'submit_id_data',
+  description: 'Extract identifying fields from a South African ID document (green book, smart card, passport).',
+  input_schema: {
+    type: 'object',
+    properties: {
+      signatory: {
+        type: 'object',
+        properties: {
+          fullName: { type: 'string', description: 'Surname, Given names — formatted as "Given Names Surname"' },
+          surname: { type: 'string' },
+          givenNames: { type: 'string' },
+          idNumber: { type: 'string', description: '13-digit RSA ID number; digits only, no spaces' },
+          dateOfBirth: { type: 'string', description: 'ISO YYYY-MM-DD' },
+          gender: { type: 'string', description: 'M | F' },
+          citizenship: { type: 'string', description: 'SA Citizen | Permanent Resident | etc.' },
+          nationality: { type: 'string' },
+          documentType: { type: 'string', description: 'Green ID Book | Smart ID Card | Passport | Asylum' },
+        },
+      },
+    },
+  },
+};
+
+// SARS Tax Clearance Certificate / Tax Compliance Status (TCS) PIN letter.
+// Pulls VAT number + tax-clearance reference for inclusion in the lease.
+const TAX_TOOL = {
+  name: 'submit_tax_data',
+  description: 'Extract VAT and tax-clearance fields from a SARS tax document (Tax Clearance Certificate or Tax Compliance Status PIN letter).',
+  input_schema: {
+    type: 'object',
+    properties: {
+      tenant: {
+        type: 'object',
+        properties: {
+          taxpayerName: { type: 'string', description: 'Registered taxpayer name (should match tenant company name)' },
+          vatNumber: { type: 'string', description: 'VAT registration number — 10 digits, usually starts with 4' },
+          taxNumber: { type: 'string', description: 'Income-tax reference number — typically 10 digits' },
+          taxClearanceRef: { type: 'string', description: 'TCS reference / PIN / certificate number' },
+          status: { type: 'string', description: 'Compliant | Non-Compliant | Unknown' },
+          issuedDate: { type: 'string', description: 'ISO YYYY-MM-DD' },
+          validUntil: { type: 'string', description: 'ISO YYYY-MM-DD if shown' },
+        },
+      },
+    },
+  },
+};
+
 // Route Claude calls through the backend proxy so the API key never
 // touches the browser. The proxy server-side reads the stored key from
 // the secrets vault and forwards to api.anthropic.com.
@@ -3878,6 +3971,52 @@ const parseLeaseControlPdf = async (pdfText, model) => callClaudeTool({
     '  • Dates: ISO YYYY-MM-DD. Numbers: plain digits, no currency symbols, no thousand separators. Account/branch codes: digits only.',
   ].join('\n'),
   userText: `Extract every field you can find from this Lease Control Schedule. Pay particular attention to section 1.2 THE TENANT — extract the tenant's company name, registration number, VAT number, address, phone, email, and contact person if present.\n\n${pdfText}`,
+});
+
+const parseCipcPdf = async (pdfText, model) => callClaudeTool({
+  model, tool: CIPC_TOOL,
+  systemPrompt: [
+    'You extract structured data from a South African CIPC company registration / disclosure document.',
+    '',
+    'EXTRACT:',
+    '  • The registered company name, registration number (YYYY/NNNNNN/NN), entity type, status, principal/postal addresses.',
+    '  • All active directors / members / trustees with their full names, 13-digit RSA ID numbers, role, and appointment dates.',
+    '',
+    'RULES:',
+    '  • IDs: 13 digits, no spaces.',
+    '  • Dates: ISO YYYY-MM-DD.',
+    '  • Omit any field you cannot find with high confidence.',
+    '  • If a director is listed as "Resigned" or no longer active, OMIT them.',
+  ].join('\n'),
+  userText: `Extract company and active-director details from this CIPC document.\n\n${pdfText}`,
+});
+
+const parseIdPdf = async (pdfText, model) => callClaudeTool({
+  model, tool: ID_DOCUMENT_TOOL,
+  systemPrompt: [
+    'You extract identity fields from a South African ID document (green book, smart-card ID, or passport).',
+    '',
+    'RULES:',
+    '  • idNumber must be exactly 13 digits with NO spaces.',
+    '  • Build fullName as "Given Names Surname" (e.g. "Wayne Marks" from surname=MARKS, names=WAYNE).',
+    '  • Date of birth ISO YYYY-MM-DD.',
+    '  • Omit fields you cannot find.',
+  ].join('\n'),
+  userText: `Extract the holder's identity details from this ID document.\n\n${pdfText}`,
+});
+
+const parseTaxPdf = async (pdfText, model) => callClaudeTool({
+  model, tool: TAX_TOOL,
+  systemPrompt: [
+    'You extract tax-registration details from a SARS Tax Clearance Certificate or Tax Compliance Status PIN letter.',
+    '',
+    'RULES:',
+    '  • VAT number: 10 digits, usually starts with 4.',
+    '  • Tax/Income-tax reference: 10 digits.',
+    '  • Dates ISO YYYY-MM-DD.',
+    '  • Omit anything you cannot read with high confidence.',
+  ].join('\n'),
+  userText: `Extract the taxpayer's tax-registration details from this SARS document.\n\n${pdfText}`,
 });
 
 const parseInvoicePdf = async (pdfText, model) => callClaudeTool({
@@ -4283,9 +4422,9 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   const [form, setForm] = useState(() => blankLeaseForm());
   const [dirtyPaths, setDirtyPaths] = useState(() => new Set());
   const [flashPaths, setFlashPaths] = useState(() => new Set());
-  const [uploadState, setUploadState] = useState({ leaseControl: 'idle', invoice: 'idle' }); // idle | loading | success | error
-  const [uploadError, setUploadError] = useState({ leaseControl: null, invoice: null });
-  const [uploadedName, setUploadedName] = useState({ leaseControl: null, invoice: null });
+  const [uploadState, setUploadState] = useState({ leaseControl: 'idle', invoice: 'idle', cipc: 'idle', id: 'idle', tax: 'idle' }); // idle | loading | success | error
+  const [uploadError, setUploadError] = useState({ leaseControl: null, invoice: null, cipc: null, id: null, tax: null });
+  const [uploadedName, setUploadedName] = useState({ leaseControl: null, invoice: null, cipc: null, id: null, tax: null });
   const anthropicCfg = integrations?.anthropic || {};
   // API key lives in the server vault — query it to decide if AI is available.
   const [anthropicHasKey, setAnthropicHasKey] = useState(false);
@@ -4977,9 +5116,51 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
       if (!text || text.trim().length < 20) {
         throw new Error('Could not extract text from this PDF — it may be scanned/image-only.');
       }
-      const parsed = kind === 'leaseControl'
-        ? await parseLeaseControlPdf(text, anthropicCfg.model)
-        : await parseInvoicePdf(text, anthropicCfg.model);
+      let parsed;
+      if (kind === 'leaseControl') parsed = await parseLeaseControlPdf(text, anthropicCfg.model);
+      else if (kind === 'invoice') parsed = await parseInvoicePdf(text, anthropicCfg.model);
+      else if (kind === 'cipc')    parsed = await parseCipcPdf(text, anthropicCfg.model);
+      else if (kind === 'id')      parsed = await parseIdPdf(text, anthropicCfg.model);
+      else if (kind === 'tax')     parsed = await parseTaxPdf(text, anthropicCfg.model);
+      else throw new Error(`Unknown PDF kind: ${kind}`);
+
+      // Remap Claude's natural-shape output to match the form's path schema.
+      // CIPC/ID/Tax responses don't use the same nesting the form uses.
+      if (kind === 'id') {
+        const s = parsed?.signatory || {};
+        const fullName = s.fullName || [s.givenNames, s.surname].filter(Boolean).join(' ').trim();
+        parsed = {
+          tenant: {
+            signatoryName: fullName || null,
+            signatoryIdNumber: s.idNumber || null,
+          },
+        };
+      } else if (kind === 'tax') {
+        const t = parsed?.tenant || {};
+        parsed = {
+          tenant: {
+            vatNumber: t.vatNumber || null,
+            taxNumber: t.taxNumber || null,
+            companyName: t.taxpayerName || null,
+          },
+        };
+      } else if (kind === 'cipc') {
+        const t = parsed?.tenant || {};
+        const dir = (parsed?.directors || [])[0];
+        parsed = {
+          tenant: {
+            companyName: t.companyName || null,
+            registrationNumber: t.registrationNumber || null,
+            entityType: t.entityType || null,
+            address: t.principalAddress || t.postalAddress || null,
+            ...(dir ? {
+              signatoryName: dir.name || null,
+              signatoryIdNumber: dir.idNumber || null,
+              signatoryRole: dir.role || null,
+            } : {}),
+          },
+        };
+      }
       // eslint-disable-next-line no-console
       console.log(`[Lease PDF Parse · ${kind}] Claude returned:`, parsed);
       const { mergedForm, filledPaths, skipped } = mergeParsedIntoForm(form, parsed, dirtyPaths);
@@ -5142,6 +5323,48 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
               state={uploadState.invoice}
               error={uploadError.invoice}
               filename={uploadedName.invoice}
+              aiReady={aiReady}
+              onFile={handlePdfUpload}
+              onNavigateToSettings={onNavigateToSettings}
+            />
+          </Card>
+
+          <Card className="p-4">
+            <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>Tenant CIPC</p>
+            <p className="text-[11px] mb-2" style={{ color: brand.textMuted }}>Company registration certificate (CoR 14.3, Disclosure)</p>
+            <PdfDropzone
+              kind="cipc"
+              state={uploadState.cipc}
+              error={uploadError.cipc}
+              filename={uploadedName.cipc}
+              aiReady={aiReady}
+              onFile={handlePdfUpload}
+              onNavigateToSettings={onNavigateToSettings}
+            />
+          </Card>
+
+          <Card className="p-4">
+            <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>Signatory ID</p>
+            <p className="text-[11px] mb-2" style={{ color: brand.textMuted }}>SA ID book, smart card, or passport</p>
+            <PdfDropzone
+              kind="id"
+              state={uploadState.id}
+              error={uploadError.id}
+              filename={uploadedName.id}
+              aiReady={aiReady}
+              onFile={handlePdfUpload}
+              onNavigateToSettings={onNavigateToSettings}
+            />
+          </Card>
+
+          <Card className="p-4">
+            <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>Tax Documents</p>
+            <p className="text-[11px] mb-2" style={{ color: brand.textMuted }}>SARS Tax Clearance / TCS PIN letter</p>
+            <PdfDropzone
+              kind="tax"
+              state={uploadState.tax}
+              error={uploadError.tax}
+              filename={uploadedName.tax}
               aiReady={aiReady}
               onFile={handlePdfUpload}
               onNavigateToSettings={onNavigateToSettings}
@@ -9937,24 +10160,10 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   const handleFetch = async () => {
     setFetching(true);
     try {
-      // OAuth authorization_code flow — token comes from the post-OAuth callback.
-      if (!pi.clientId || !pi.clientSecret) {
-        throw new Error('Save credentials first');
-      }
-      const tokenResult = await propertyInspectAPI.ensureAccessToken({
-        ...pi,
-        clientId: pi.clientId,
-        clientSecret: pi.clientSecret,
-        tokenUrl: pi.tokenUrl,
-      });
-      const accessToken = tokenResult.accessToken;
-      const updates = tokenResult.updates;
-      const result = await propertyInspectAPI.listInspections({
-        accessToken,
-        baseUrl: pi.baseUrl,
-        page: 1,
-        perPage: 50,
-      });
+      // Route through the backend proxy. The server holds the access token
+      // (stored in the vault) and forwards the call to PI — browser never
+      // touches PI directly, so no CORS issues in production.
+      const result = await api.proxy.piGet('/inspections?page=1&perPage=50');
       const list = Array.isArray(result?.data) ? result.data
         : Array.isArray(result?.items) ? result.items
         : Array.isArray(result) ? result
@@ -9964,7 +10173,6 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
         ...integrations,
         propertyInspect: {
           ...pi,
-          ...(updates || {}),
           connected: true,
           importedInspections: normalized,
           importedCount: normalized.length,
@@ -11628,7 +11836,7 @@ const TenancyActivitySection = ({ inspections, integrations, onNavigateToSetting
                 color: item.direction === 'in' ? brand.success : brand.warning,
               }}
             >
-              {item.direction === 'in' ? 'Move-In' : 'Move-Out'}
+              {item.direction === 'in' ? 'Entry' : 'Exit'}
             </span>
             <span className="text-xs px-1.5 py-0.5 rounded" style={{ backgroundColor: brand.cream, color: brand.navy }}>{item.type}</span>
             {item.status && <StatusBadge status={item.status} />}
@@ -11654,8 +11862,8 @@ const TenancyActivitySection = ({ inspections, integrations, onNavigateToSetting
       <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Tenancy</p>
-          <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Move-Ins / Move-Outs</h1>
-          <p className="text-sm" style={{ color: brand.textMuted }}>Units that have recently moved in or out, drawn from inspections in this app and from Property Inspect.</p>
+          <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Entries & Exits</h1>
+          <p className="text-sm" style={{ color: brand.textMuted }}>Units that have recently entered or exited a tenancy, drawn from inspections in this app and from Property Inspect.</p>
         </div>
         <div className="flex gap-2">
           {[30, 90, 180, 0].map(d => (
@@ -11679,14 +11887,14 @@ const TenancyActivitySection = ({ inspections, integrations, onNavigateToSetting
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
         <Card className="p-4">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-xs tracking-wider uppercase" style={{ color: brand.textMuted }}>Move-Ins</p>
+            <p className="text-xs tracking-wider uppercase" style={{ color: brand.textMuted }}>Entries</p>
             <CheckCircle2 size={14} style={{ color: brand.success }} />
           </div>
           <p className="text-2xl font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{moveIns.length}</p>
         </Card>
         <Card className="p-4">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-xs tracking-wider uppercase" style={{ color: brand.textMuted }}>Move-Outs</p>
+            <p className="text-xs tracking-wider uppercase" style={{ color: brand.textMuted }}>Exits</p>
             <Undo2 size={14} style={{ color: brand.warning }} />
           </div>
           <p className="text-2xl font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{moveOuts.length}</p>
@@ -11709,10 +11917,10 @@ const TenancyActivitySection = ({ inspections, integrations, onNavigateToSetting
         <div>
           <h2 className="text-base font-semibold mb-3 flex items-center gap-2" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>
             <CheckCircle2 size={16} style={{ color: brand.success }} />
-            Recent Move-Ins
+            Recent Entries
           </h2>
           {moveIns.length === 0 ? (
-            <Card><EmptyState icon={Home} title="No recent move-ins" message="Nothing matches the selected timeframe." /></Card>
+            <Card><EmptyState icon={Home} title="No recent entries" message="Nothing matches the selected timeframe." /></Card>
           ) : (
             moveIns.map(item => <Row key={item.id} item={item} />)
           )}
@@ -11720,10 +11928,10 @@ const TenancyActivitySection = ({ inspections, integrations, onNavigateToSetting
         <div>
           <h2 className="text-base font-semibold mb-3 flex items-center gap-2" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>
             <Undo2 size={16} style={{ color: brand.warning }} />
-            Recent Move-Outs
+            Recent Exits
           </h2>
           {moveOuts.length === 0 ? (
-            <Card><EmptyState icon={Home} title="No recent move-outs" message="Nothing matches the selected timeframe." /></Card>
+            <Card><EmptyState icon={Home} title="No recent exits" message="Nothing matches the selected timeframe." /></Card>
           ) : (
             moveOuts.map(item => <Row key={item.id} item={item} />)
           )}
@@ -12728,10 +12936,9 @@ export default function ExceedProperties() {
     { id: 'properties', label: 'Properties', icon: Building2, permission: PERMISSIONS.VIEW_PROPERTIES },
     { id: 'employees', label: 'Employees', icon: Users, permission: PERMISSIONS.VIEW_EMPLOYEES },
     { id: 'time', label: 'Time Tracking', icon: Clock, permission: PERMISSIONS.VIEW_TIME },
-    { id: 'inspections', label: 'Inspections', icon: ClipboardCheck, permission: PERMISSIONS.VIEW_INSPECTIONS },
     { id: 'maintenance', label: 'Maintenance', icon: Wrench, permission: PERMISSIONS.VIEW_MAINTENANCE },
     { id: 'outages', label: 'Report Outage', icon: Siren, permission: PERMISSIONS.VIEW_OUTAGES },
-    { id: 'tenancy', label: 'Move-Ins / Outs', icon: Home, permission: PERMISSIONS.VIEW_TENANCY },
+    { id: 'tenancy', label: 'Entries & Exits', icon: Home, permission: PERMISSIONS.VIEW_TENANCY },
     { id: 'leasing', label: 'Leasing', icon: FileSignature, permission: PERMISSIONS.VIEW_LEASING },
     { id: 'debtors', label: 'Debtors', icon: DollarSign, permission: PERMISSIONS.VIEW_DEBTORS },
     { id: 'projections', label: 'Projections', icon: TrendingUp, permission: PERMISSIONS.VIEW_PROJECTIONS },
@@ -12791,7 +12998,6 @@ export default function ExceedProperties() {
       case 'properties': return checkPerm(PERMISSIONS.VIEW_PROPERTIES) || <PropertiesSection properties={properties} setProperties={setProperties} tenancies={tenancies} setTenancies={setTenancies} showToast={showToast} logAction={logAction} />;
       case 'employees': return checkPerm(PERMISSIONS.VIEW_EMPLOYEES) || <EmployeesSection employees={employees} setEmployees={setEmployees} showToast={showToast} logAction={logAction} />;
       case 'time': return checkPerm(PERMISSIONS.VIEW_TIME) || <TimeTrackingSection employees={employees} showToast={showToast} integrations={integrations} setIntegrations={setIntegrations} onNavigateToSettings={() => setActiveNav('settings')} />;
-      case 'inspections': return checkPerm(PERMISSIONS.VIEW_INSPECTIONS) || <InspectionsSection inspections={inspections} setInspections={setInspections} employees={employees} properties={properties} showToast={showToast} />;
       case 'maintenance': return checkPerm(PERMISSIONS.VIEW_MAINTENANCE) || <MaintenanceSection maintenance={maintenance} setMaintenance={setMaintenance} properties={properties} employees={employees} showToast={showToast} logAction={logAction} />;
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'tenancy': return checkPerm(PERMISSIONS.VIEW_TENANCY) || <TenancyActivitySection inspections={inspections} integrations={integrations} onNavigateToSettings={() => setActiveNav('settings')} />;
