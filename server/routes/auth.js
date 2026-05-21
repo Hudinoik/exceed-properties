@@ -105,12 +105,13 @@ router.get('/me', (req, res) => {
 // --- POST /api/auth/change-password ---
 router.post('/change-password', requireAuth, writeLimiter, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
-  if (!newPassword || newPassword.length < 8) {
-    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  if (!newPassword || newPassword.length < 10) {
+    return res.status(400).json({ error: 'New password must be at least 10 characters' });
   }
-  // Basic strength rule: at least one letter and one digit OR symbol.
-  if (!/[A-Za-z]/.test(newPassword) || !/[\d\W]/.test(newPassword)) {
-    return res.status(400).json({ error: 'Password must contain letters and at least one digit or symbol' });
+  // Strength rule: must contain letters (upper or lower), at least one digit,
+  // and at least one symbol.
+  if (!/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword) || !/[^A-Za-z0-9]/.test(newPassword)) {
+    return res.status(400).json({ error: 'Password must contain letters, at least one digit, and at least one symbol (e.g. !@#$%)' });
   }
   const user = users.byId(req.session.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });

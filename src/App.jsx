@@ -2122,31 +2122,8 @@ const Dashboard = ({ employees, properties, inspections, leases, debtors, activi
         })}
       </div>
 
-      {/* Activity + Quick stats */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card className="lg:col-span-2 p-5 animate-fade-in-up stagger-5">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-base font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>Recent Activity</h2>
-            <button onClick={() => onNavigate && onNavigate('ondesk')} className="text-xs font-medium btn-press" style={{ color: brand.gold }}>View all in Dashboards →</button>
-          </div>
-          <div className="space-y-3">
-            {activity.map((a, i) => {
-              const Icon = a.icon;
-              return (
-                <div key={i} className="flex items-start gap-3 py-2.5" style={{ borderBottom: i < activity.length - 1 ? `1px solid ${brand.border}` : 'none' }}>
-                  <div className="p-1.5 rounded mt-0.5" style={{ backgroundColor: brand.cream, color: a.color || brand.navy }}>
-                    <Icon size={14} />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm" style={{ color: brand.text }}>{a.text}</p>
-                    <p className="text-xs mt-0.5" style={{ color: brand.textMuted }}>{a.time}</p>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </Card>
-
+      {/* Portfolio at a glance */}
+      <div className="grid grid-cols-1 gap-4">
         <Card className="p-5 animate-fade-in-up stagger-6">
           <h2 className="text-base font-semibold mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>Portfolio at a glance</h2>
           <div className="space-y-4">
@@ -2793,9 +2770,22 @@ const startOfMonthISO = () => {
 
 const TimeTrackingSection = ({ employees, showToast, integrations, setIntegrations, onNavigateToSettings }) => {
   const jibble = integrations?.jibble || {};
-  const isConfigured =
-    (jibble.authMethod === 'pat' && jibble.personalAccessToken) ||
-    (jibble.authMethod === 'client_credentials' && jibble.clientId && jibble.clientSecret);
+
+  // Configured-ness now comes from the server vault — query on mount.
+  // The local integrations.jibble state only holds non-secret status flags.
+  const [isConfigured, setIsConfigured] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.secrets.get('jibble')
+      .then(rows => {
+        if (cancelled) return;
+        const hasClientId = rows.some(r => r.key === 'clientId' && r.hasValue);
+        const hasSecret = rows.some(r => r.key === 'clientSecret' && r.hasValue);
+        setIsConfigured(hasClientId && hasSecret);
+      })
+      .catch(() => { if (!cancelled) setIsConfigured(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   const [rangeKey, setRangeKey] = useState('week');
   const [customFrom, setCustomFrom] = useState(startOfWeekISO());
@@ -2820,12 +2810,6 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     [rawLiveEntries, projectsMap]
   );
 
-  // Always-current jibble config (avoids stale closure without bloating deps)
-  const jibbleRef = useRef(jibble);
-  jibbleRef.current = jibble;
-
-  const credsKey = `${jibble.authMethod || ''}|${jibble.clientId || ''}|${jibble.personalAccessToken || ''}|${jibble.apiBaseUrl || ''}`;
-
   const dateRange = useMemo(() => {
     const today = todayISO();
     if (rangeKey === 'today') return { from: today, to: today };
@@ -2834,14 +2818,26 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return { from: customFrom, to: customTo };
   }, [rangeKey, customFrom, customTo]);
 
+  // Build the OData query string for /TimeEntries — same shape as the old
+  // jibbleAPI client expected, but now passed through the backend proxy.
+  const buildTimeEntriesPath = (from, to, top) => {
+    const filter = [];
+    if (from) filter.push(`belongsToDate ge ${from}`);
+    if (to) filter.push(`belongsToDate le ${to}`);
+    const params = new URLSearchParams();
+    params.set('$top', String(top));
+    if (filter.length) params.set('$filter', filter.join(' and '));
+    params.set('$orderby', 'time desc');
+    params.set('$expand', 'person');
+    return `/TimeEntries?${params.toString()}`;
+  };
+
   const fetchEntries = useCallback(async () => {
     if (!isConfigured) return;
     setLoading(true);
     setSyncError(null);
     try {
-      const data = await jibbleAPI.fetchTimeEntries(jibbleRef.current, {
-        from: dateRange.from, to: dateRange.to, top: 500,
-      });
+      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(dateRange.from, dateRange.to, 500), 'time');
       setRawEntries((data?.value || []).filter(e => !isJibbleExcluded(e)));
       setIntegrations(prev => ({
         ...prev,
@@ -2856,7 +2852,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     } finally {
       setLoading(false);
     }
-  }, [isConfigured, dateRange.from, dateRange.to, credsKey, setIntegrations]);
+  }, [isConfigured, dateRange.from, dateRange.to, setIntegrations]);
 
   useEffect(() => { fetchEntries(); }, [fetchEntries]);
 
@@ -2866,7 +2862,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     let cancelled = false;
     (async () => {
       try {
-        const data = await jibbleAPI.fetchProjects(jibbleRef.current);
+        const data = await api.proxy.jibbleGet('/Projects?$top=500', 'workspace');
         if (cancelled) return;
         const map = {};
         (data?.value || []).forEach(p => {
@@ -2878,19 +2874,19 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       }
     })();
     return () => { cancelled = true; };
-  }, [isConfigured, credsKey]);
+  }, [isConfigured]);
 
   const fetchLive = useCallback(async () => {
     if (!isConfigured) return;
     try {
       const today = todayISO();
-      const data = await jibbleAPI.fetchTimeEntries(jibbleRef.current, { from: today, to: today, top: 200 });
+      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(today, today, 200), 'time');
       setRawLiveEntries((data?.value || []).filter(e => !isJibbleExcluded(e)));
       setLiveLastRefresh(new Date());
     } catch {
       // Quiet failure for background refresh
     }
-  }, [isConfigured, credsKey]);
+  }, [isConfigured]);
 
   useEffect(() => {
     if (!isConfigured) return;
@@ -5051,12 +5047,14 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   const selectedAnnexures = form.annexures.filter(a => form.annexureSelected[a]).join(', ');
   const depositAmount = Number(form.deposit.amount) || 0;
 
-  if (!open) return null;
+  // No longer a modal overlay — renders inline inside the main content area
+  // so the sidebar stays visible. `open` is kept as a no-op prop for backwards
+  // compatibility with the old call site that mounted this in a Modal-style way.
 
   return (
-    <div className="fixed inset-0 z-40 overflow-y-auto" style={{ backgroundColor: brand.cream }}>
+    <div className="animate-fade-in-up">
       {/* Header banner — matches the app's navy + gold theme */}
-      <div className="sticky top-0 z-30 px-6 py-4" style={{ backgroundColor: brand.navy }}>
+      <div className="px-6 py-4 -mx-8 -mt-6 mb-0" style={{ backgroundColor: brand.navy }}>
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded" style={{ backgroundColor: brand.gold }}>
@@ -5077,15 +5075,17 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
                 <p style={{ color: brand.gold }}>{ROLES[currentUser?.systemRole]?.label || 'User'}</p>
               </div>
             </div>
-            <button onClick={onClose} className="p-2 rounded hover:bg-white/10 transition-colors" title="Close">
-              <X size={18} style={{ color: '#fff' }} />
-            </button>
+            {onClose && (
+              <button onClick={onClose} className="px-3 py-1.5 text-xs rounded hover:bg-white/10 transition-colors" style={{ color: '#fff', border: '1px solid rgba(255,255,255,0.2)' }} title="Back to Leasing">
+                ← Back
+              </button>
+            )}
           </div>
         </div>
       </div>
 
       {/* Action bar */}
-      <div className="sticky top-[72px] z-20 px-6 py-3" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
+      <div className="px-6 py-3 -mx-8" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
         <div className="flex items-center gap-2 flex-wrap">
           <Button size="sm" variant="ghost" icon={FileText} onClick={() => setDraftsModalOpen(true)}>Drafts ({drafts.length})</Button>
           <Button size="sm" variant="ghost" icon={History} onClick={() => setHistoryModalOpen(true)}>History</Button>
@@ -6001,7 +6001,10 @@ const computeLeaseSummary = (lease, allLeases) => {
   };
 };
 
-const LeasingSection = ({ leases, setLeases, properties, employees, debtors, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings }) => {
+const LeasingSection = ({ leases, setLeases, properties, employees, debtors, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
+  // Top-level tab: pipeline view vs Lease Learner. Lease Drafter now lives
+  // at its own nav target ('leaseDrafter') so the sidebar stays visible.
+  const [subTab, setSubTab] = useState('pipeline');
   const [activeCategory, setActiveCategory] = useState('all'); // 'all' | 'commercial' | 'residential'
   const [viewMode, setViewMode] = useState('pipeline'); // 'pipeline' | 'table'
   const [stageFilter, setStageFilter] = useState('All');
@@ -6396,21 +6399,69 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
 
   return (
     <div className="animate-fade-in-up">
-      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
+      <div className="flex items-end justify-between mb-4 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Tenants & Contracts</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Leasing</h1>
-          <p className="text-sm" style={{ color: brand.textMuted }}>Track leases from offer through DocuSign signing to active. Separate workflows for commercial and residential.</p>
+          <p className="text-sm" style={{ color: brand.textMuted }}>
+            {subTab === 'learner'
+              ? 'Feed in existing Word lease templates and Claude extracts the patterns. Learned patterns inform future drafts.'
+              : 'Track leases from offer through DocuSign signing to active. Separate workflows for commercial and residential.'}
+          </p>
         </div>
         <div className="flex gap-2">
-          <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${brand.border}` }}>
-            <button onClick={() => setViewMode('pipeline')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'pipeline' ? brand.navy : '#fff', color: viewMode === 'pipeline' ? '#fff' : brand.text }}>Pipeline</button>
-            <button onClick={() => setViewMode('table')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'table' ? brand.navy : '#fff', color: viewMode === 'table' ? '#fff' : brand.text }}>Table</button>
-          </div>
-          <Button variant="gold" icon={Sparkles} onClick={() => setLeaseDrafterOpen(true)}>Draft Lease</Button>
-          <Button variant="primary" icon={Plus} onClick={() => openCreate(activeCategory === 'residential' ? 'residential' : 'commercial')}>New Lease</Button>
+          {subTab === 'pipeline' && (
+            <>
+              <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${brand.border}` }}>
+                <button onClick={() => setViewMode('pipeline')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'pipeline' ? brand.navy : '#fff', color: viewMode === 'pipeline' ? '#fff' : brand.text }}>Pipeline</button>
+                <button onClick={() => setViewMode('table')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'table' ? brand.navy : '#fff', color: viewMode === 'table' ? '#fff' : brand.text }}>Table</button>
+              </div>
+              <Button variant="gold" icon={Sparkles} onClick={() => onNavigate?.('leaseDrafter')}>Draft Lease</Button>
+              <Button variant="primary" icon={Plus} onClick={() => openCreate(activeCategory === 'residential' ? 'residential' : 'commercial')}>New Lease</Button>
+            </>
+          )}
         </div>
       </div>
+
+      {/* Top-level sub-tab strip — Pipeline vs Lease Learner */}
+      <div className="flex gap-1 mb-5" style={{ borderBottom: `1px solid ${brand.border}` }}>
+        {[
+          { id: 'pipeline', label: 'Lease Pipeline', icon: FileSignature },
+          { id: 'learner', label: 'Lease Learner', icon: Sparkles },
+        ].map(t => {
+          const Icon = t.icon;
+          const active = subTab === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => setSubTab(t.id)}
+              className="px-4 py-2 text-sm font-medium tracking-wide transition-all flex items-center gap-2"
+              style={{
+                color: active ? brand.navy : brand.textMuted,
+                borderBottom: `2px solid ${active ? brand.gold : 'transparent'}`,
+                marginBottom: '-1px',
+              }}
+            >
+              <Icon size={14} />
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Lease Learner pane — reuses the standalone component */}
+      {subTab === 'learner' && (
+        <LeaseLearnerSection
+          integrations={integrations}
+          showToast={showToast}
+          logAction={logAction}
+          onNavigateToSettings={onNavigateToSettings}
+          onNavigateToLeasing={() => setSubTab('pipeline')}
+        />
+      )}
+
+      {subTab === 'pipeline' && (
+        <>
 
       {/* Category tabs */}
       <div className="flex gap-1 mb-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
@@ -6877,17 +6928,8 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
         )}
       </Modal>
 
-      {/* Automated Lease Drafting System overlay */}
-      <LeaseDrafter
-        open={leaseDrafterOpen}
-        onClose={() => setLeaseDrafterOpen(false)}
-        currentUser={currentUser}
-        showToast={showToast}
-        logAction={logAction}
-        integrations={integrations}
-        debtors={debtors}
-        onNavigateToSettings={onNavigateToSettings}
-      />
+        </>
+      )}
     </div>
   );
 };
@@ -11102,8 +11144,12 @@ const ChangePasswordModal = ({ currentUser, mustChange, onChanged, onCancel, sho
   const handleSubmit = async (e) => {
     e?.preventDefault?.();
     setError('');
-    if (!newPassword || newPassword.length < 8) {
-      setError('Password must be at least 8 characters');
+    if (!newPassword || newPassword.length < 10) {
+      setError('Password must be at least 10 characters');
+      return;
+    }
+    if (!/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword) || !/[^A-Za-z0-9]/.test(newPassword)) {
+      setError('Password must include letters, a digit, AND a symbol (e.g. !@#$%)');
       return;
     }
     if (newPassword !== confirmPassword) {
@@ -11138,7 +11184,7 @@ const ChangePasswordModal = ({ currentUser, mustChange, onChanged, onCancel, sho
           </h3>
           <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
             {mustChange
-              ? "You're signed in with a temporary password. Choose something only you'll know — at least 8 characters with letters and digits/symbols."
+              ? "You're signed in with a temporary password. Choose something only you'll know — at least 10 characters with letters, a digit, AND a symbol."
               : 'Enter your current password and choose a new one.'}
           </p>
         </div>
@@ -11148,7 +11194,7 @@ const ChangePasswordModal = ({ currentUser, mustChange, onChanged, onCancel, sho
               <Input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} autoFocus />
             </Field>
           )}
-          <Field label="New Password" hint="At least 8 chars · letters + at least one digit or symbol">
+          <Field label="New Password" hint="At least 10 chars · must include letters, a digit, AND a symbol (e.g. !@#$%)">
             <Input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoFocus={mustChange} />
           </Field>
           <Field label="Confirm New Password">
@@ -12354,7 +12400,8 @@ Return ONLY valid JSON. No prose before or after.`;
 // MAIN APP
 // ============================================================
 export default function ExceedProperties() {
-  const [activeNav, setActiveNav] = useState('dashboard');
+  // Persisted across refreshes so the user stays on whatever page they were on.
+  const [activeNav, setActiveNav] = useStoredState('ep:activeNav', 'dashboard');
 
   // Persistent state — all auto-saved to window.storage so data survives refresh
   const [employees, setEmployees] = useStoredState('ep:employees', seedEmployees);
@@ -12686,10 +12733,8 @@ export default function ExceedProperties() {
     { id: 'outages', label: 'Report Outage', icon: Siren, permission: PERMISSIONS.VIEW_OUTAGES },
     { id: 'tenancy', label: 'Move-Ins / Outs', icon: Home, permission: PERMISSIONS.VIEW_TENANCY },
     { id: 'leasing', label: 'Leasing', icon: FileSignature, permission: PERMISSIONS.VIEW_LEASING },
-    { id: 'leaseLearner', label: 'Lease Learner', icon: Sparkles, permission: PERMISSIONS.VIEW_LEASE_LEARNER },
     { id: 'debtors', label: 'Debtors', icon: DollarSign, permission: PERMISSIONS.VIEW_DEBTORS },
     { id: 'projections', label: 'Projections', icon: TrendingUp, permission: PERMISSIONS.VIEW_PROJECTIONS },
-    { id: 'reports', label: 'Reports', icon: BarChart3, permission: PERMISSIONS.VIEW_REPORTS },
     { id: 'users', label: 'Users & Roles', icon: Shield, permission: PERMISSIONS.MANAGE_USERS },
     { id: 'settings', label: 'Settings', icon: SettingsIcon, permission: PERMISSIONS.VIEW_SETTINGS },
   ];
@@ -12744,11 +12789,10 @@ export default function ExceedProperties() {
       case 'maintenance': return checkPerm(PERMISSIONS.VIEW_MAINTENANCE) || <MaintenanceSection maintenance={maintenance} setMaintenance={setMaintenance} properties={properties} employees={employees} showToast={showToast} logAction={logAction} />;
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'tenancy': return checkPerm(PERMISSIONS.VIEW_TENANCY) || <TenancyActivitySection inspections={inspections} integrations={integrations} onNavigateToSettings={() => setActiveNav('settings')} />;
-      case 'leaseLearner': return checkPerm(PERMISSIONS.VIEW_LEASE_LEARNER) || <LeaseLearnerSection integrations={integrations} showToast={showToast} logAction={logAction} onNavigateToSettings={() => setActiveNav('settings')} onNavigateToLeasing={() => setActiveNav('leasing')} />;
       case 'projections': return checkPerm(PERMISSIONS.VIEW_PROJECTIONS) || <ProjectionsSection showToast={showToast} logAction={logAction} />;
-      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection leases={leases} setLeases={setLeases} properties={properties} employees={employees} debtors={debtors} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} />;
+      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection leases={leases} setLeases={setLeases} properties={properties} employees={employees} debtors={debtors} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
+      case 'leaseDrafter': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeaseDrafter currentUser={currentUser} showToast={showToast} logAction={logAction} integrations={integrations} debtors={debtors} onNavigateToSettings={() => setActiveNav('settings')} onClose={() => setActiveNav('leasing')} />;
       case 'debtors': return checkPerm(PERMISSIONS.VIEW_DEBTORS) || <DebtorsSection debtors={debtors} setDebtors={setDebtors} debtorAccounts={debtorAccounts} setDebtorAccounts={setDebtorAccounts} debtorNotes={debtorNotes} setDebtorNotes={setDebtorNotes} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
-      case 'reports': return checkPerm(PERMISSIONS.VIEW_REPORTS) || <ReportsSection properties={properties} leases={leases} debtors={debtors} inspections={inspections} maintenance={maintenance} timeEntries={timeEntries} employees={employees} />;
       case 'users': return checkPerm(PERMISSIONS.MANAGE_USERS) || <UsersSection employees={employees} setEmployees={setEmployees} currentUser={currentUser} setCurrentUser={setCurrentUser} showToast={showToast} logAction={logAction} />;
       case 'settings': return checkPerm(PERMISSIONS.VIEW_SETTINGS) || (
         <SettingsSection
@@ -12946,15 +12990,6 @@ export default function ExceedProperties() {
             />
           </div>
           <div className="flex items-center gap-3 ml-4">
-            <button onClick={() => setNotifPanelOpen(!notifPanelOpen)} className="p-2 rounded hover:bg-black hover:bg-opacity-5 relative">
-              <Bell size={18} style={{ color: brand.textMuted }} />
-              {unreadCount > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] rounded-full text-[10px] font-bold flex items-center justify-center px-1" style={{ backgroundColor: brand.danger, color: '#fff' }}>
-                  {unreadCount}
-                </span>
-              )}
-            </button>
-            <div className="w-px h-6" style={{ backgroundColor: brand.border }} />
             <div className="relative">
               <button onClick={() => setUserMenuOpen(!userMenuOpen)} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-black hover:bg-opacity-5 btn-press">
                 <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold" style={{ backgroundColor: brand.goldPale, color: brand.gold }}>
@@ -13000,13 +13035,6 @@ export default function ExceedProperties() {
       </main>
 
       <Toast message={toast.message} type={toast.type} onClose={() => setToast({ message: '', type: 'success' })} />
-      <NotificationsPanel
-        open={notifPanelOpen}
-        onClose={() => setNotifPanelOpen(false)}
-        notifications={notifications}
-        setNotifications={setNotifications}
-        onNavigate={(nav) => setActiveNav(nav)}
-      />
     </div>
   );
 }
