@@ -236,7 +236,12 @@ router.get('/property-inspect/get', async (req, res) => {
   }
   const token = cfg.accessToken;
   const targetPath = String(req.query.path || '/inspections');
-  if (!/^\/[a-zA-Z0-9_\-./]+$/.test(targetPath) || targetPath.includes('..') || targetPath.startsWith('/oauth')) {
+  if (
+    !targetPath.startsWith('/') ||
+    targetPath.includes('..') ||
+    targetPath.startsWith('/oauth') ||
+    /[\x00-\x1f]/.test(targetPath)
+  ) {
     return res.status(400).json({ error: 'Invalid path' });
   }
   const base = cfg.baseUrl || 'https://api.propertyinspect.com';
@@ -313,12 +318,18 @@ router.post('/jibble/test', async (req, res) => {
   }
 });
 
-// Generic Jibble GET forwarder. Path is whitelisted — only workspace + time-tracking
-// resource endpoints are allowed.
+// Generic Jibble GET forwarder. Path validation is intentionally minimal —
+// must start with `/`, no path-traversal, no control chars. The path may
+// include query parameters with OData syntax ($top, $filter, etc.) which
+// involves spaces, `+`, `?`, `$`, `&` — too brittle to whitelist.
 router.get('/jibble/get', async (req, res) => {
   const targetPath = String(req.query.path || '/People');
   const which = String(req.query.svc || 'workspace'); // workspace | time
-  if (!/^\/[A-Za-z0-9_\-./()$=&,]+$/.test(targetPath) || targetPath.includes('..')) {
+  if (
+    !targetPath.startsWith('/') ||
+    targetPath.includes('..') ||
+    /[\x00-\x1f]/.test(targetPath)
+  ) {
     return res.status(400).json({ error: 'Invalid path' });
   }
   const base = which === 'time' ? JIBBLE_TIME : JIBBLE_API;
