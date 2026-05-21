@@ -3680,9 +3680,13 @@ const LeaseSection = ({ number, title, icon: Icon, color, children, subtitle, he
 // Loaded on demand to keep the main bundle small.
 const extractPdfText = async (file) => {
   const pdfjs = await import('pdfjs-dist');
-  // Configure the worker via CDN matching the installed version
+  // Bundle the worker via Vite (?url) so it serves from our own origin.
+  // Loading it from a CDN is blocked by helmet's default CSP in production
+  // (worker-src 'self'), which surfaces as "Setting up fake worker failed:
+  // Failed to fetch dynamically imported module".
   if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-    pdfjs.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+    const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
+    pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
   }
   const buf = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data: buf }).promise;
