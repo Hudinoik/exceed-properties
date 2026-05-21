@@ -12742,8 +12742,14 @@ export default function ExceedProperties() {
   // Filter nav by current user permissions
   const navItems = allNavItems.filter(item => hasPermission(currentUser, item.permission));
 
-  // If the user lost permission for the current page, send them home
+  // Valid routes that aren't in the sidebar (sub-pages reached by buttons).
+  // Without this allowlist, the redirect-to-home effect below would bounce
+  // away from them the moment they activate.
+  const HIDDEN_ROUTES = new Set(['leaseDrafter']);
+
+  // If the user lost permission for the current page, send them home.
   useEffect(() => {
+    if (HIDDEN_ROUTES.has(activeNav)) return;
     if (!navItems.find(n => n.id === activeNav)) {
       setActiveNav(navItems[0]?.id || 'dashboard');
     }
