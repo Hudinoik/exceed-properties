@@ -140,6 +140,12 @@ export const proxy = {
   async piGet(path) {
     return request(`/api/proxy/property-inspect/get?path=${encodeURIComponent(path)}`);
   },
+  async jibbleTest() {
+    return request('/api/proxy/jibble/test', { method: 'POST', body: {} });
+  },
+  async jibbleGet(path, svc = 'workspace') {
+    return request(`/api/proxy/jibble/get?path=${encodeURIComponent(path)}&svc=${encodeURIComponent(svc)}`);
+  },
 };
 
 // Convenience: flatten a secrets array into an object {key: {hasValue, last4, ...}}

@@ -1633,8 +1633,6 @@ const defaultIntegrations = {
     redirectUri: '',
     clientId: '',
     clientSecret: '',
-    authMethod: 'pat', // 'oauth' (authorization_code) or 'pat' (personal access token)
-    personalAccessToken: '',
     cachedAccessToken: '',
     cachedAccessTokenExpiry: null,
     cachedRefreshToken: '',
@@ -9040,99 +9038,94 @@ const UsersSection = ({ employees, setEmployees, currentUser, setCurrentUser, sh
 // ============================================================
 // JIBBLE INTEGRATION CARD
 // ============================================================
-const JibbleIntegrationCard = ({ integrations, setIntegrations, showToast, logAction }) => {
-  const jibble = integrations.jibble;
-  const [form, setForm] = useState({
-    apiBaseUrl: jibble.apiBaseUrl || jibbleAPI.defaultBaseUrl,
-    authMethod: jibble.authMethod || 'client_credentials',
-    personalAccessToken: jibble.personalAccessToken || '',
-    clientId: jibble.clientId || '',
-    clientSecret: jibble.clientSecret || '',
-    organizationId: jibble.organizationId || '',
-    syncFrequency: jibble.syncFrequency || 'every-15-min',
-    autoApprove: jibble.autoApprove || false,
-  });
+const JibbleIntegrationCard = ({ showToast, logAction }) => {
+  // Server-vault-backed. Credentials stored AES-256-GCM in the backend;
+  // browser only sees last-4. Token exchange + API calls happen
+  // server-side, sidestepping Jibble's browser CORS block.
+  const [metadata, setMetadata] = useState({}); // key → row
+  const [clientId, setClientId] = useState('');
+  const [clientSecret, setClientSecret] = useState('');
+  const [organizationId, setOrganizationId] = useState('');
   const [showSecret, setShowSecret] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [dirty, setDirty] = useState(false);
 
+  // Load current vault state on mount.
   useEffect(() => {
-    setForm({
-      apiBaseUrl: jibble.apiBaseUrl || jibbleAPI.defaultBaseUrl,
-      authMethod: jibble.authMethod || 'client_credentials',
-      personalAccessToken: jibble.personalAccessToken || '',
-      clientId: jibble.clientId || '',
-      clientSecret: jibble.clientSecret || '',
-      organizationId: jibble.organizationId || '',
-      syncFrequency: jibble.syncFrequency || 'every-15-min',
-      autoApprove: jibble.autoApprove || false,
-    });
-    setDirty(false);
-  }, [jibble]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await api.secrets.get('jibble');
+        if (cancelled) return;
+        const map = {};
+        rows.forEach(r => { map[r.key] = r; });
+        setMetadata(map);
+        if (map.organizationId?.value) setOrganizationId(map.organizationId.value);
+      } catch { /* not signed in */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
-  const updateField = (key, value) => {
-    setForm(f => ({ ...f, [key]: value }));
-    setDirty(true);
-    setTestResult(null);
-  };
+  const hasStoredCreds = !!metadata.clientId?.hasValue && !!metadata.clientSecret?.hasValue;
+  const hasAccessToken = !!metadata.accessToken?.hasValue;
 
-  const saveCredentials = () => {
-    setIntegrations({ ...integrations, jibble: { ...jibble, ...form } });
-    logAction('Updated Jibble integration credentials');
-    showToast('Jibble credentials saved', 'success');
-    setDirty(false);
+  const saveCredentials = async () => {
+    try {
+      const values = { organizationId };
+      if (clientId) values.clientId = clientId.trim();
+      if (clientSecret) values.clientSecret = clientSecret.trim();
+      const rows = await api.secrets.set('jibble', values);
+      const map = {};
+      rows.forEach(r => { map[r.key] = r; });
+      setMetadata(map);
+      setClientId(''); setClientSecret('');
+      setDirty(false);
+      logAction('Updated Jibble integration credentials (server vault)');
+      showToast('Jibble credentials saved (encrypted server-side)', 'success');
+    } catch (err) {
+      showToast('Save failed: ' + err.message, 'error');
+    }
   };
 
   const handleTest = async () => {
-    if (form.authMethod === 'pat' && !form.personalAccessToken) {
-      setTestResult({ ok: false, error: 'Personal Access Token is required' });
+    if (!hasStoredCreds && (!clientId || !clientSecret)) {
+      setTestResult({ ok: false, error: 'Both Client ID and Client Secret are required' });
       return;
     }
-    if (form.authMethod === 'client_credentials' && (!form.clientId || !form.clientSecret)) {
-      setTestResult({ ok: false, error: 'Both API Key ID and API Key Secret are required' });
-      return;
+    if (dirty && (clientId || clientSecret)) {
+      await saveCredentials();
     }
-
     setTesting(true);
     setTestResult(null);
     try {
-      const result = await jibbleAPI.testConnection(form);
-      const peopleCount = result.data?.value?.length ?? result.data?.['@odata.count'] ?? 0;
-      setTestResult({ ok: true, peopleCount, tokenObtained: form.authMethod === 'client_credentials' });
-      setIntegrations({
-        ...integrations,
-        jibble: {
-          ...jibble,
-          ...form,
-          connected: true,
-          lastSync: new Date().toISOString(),
-          lastSyncStatus: 'success',
-          lastSyncError: null,
-        },
-      });
-      logAction('Connected to Jibble successfully');
+      const result = await api.proxy.jibbleTest();
+      setTestResult({ ok: true, peopleCount: result.peopleCount || 0 });
+      logAction('Connected to Jibble (server-side OAuth)');
       showToast('Connected to Jibble', 'success');
-      setDirty(false);
+      // refresh metadata to pick up the new accessToken row
+      const rows = await api.secrets.get('jibble');
+      const map = {};
+      rows.forEach(r => { map[r.key] = r; });
+      setMetadata(map);
     } catch (err) {
-      setTestResult({ ok: false, error: err.message, isOAuthExchange: form.authMethod === 'client_credentials' && err.message.includes('token exchange') });
-      setIntegrations({
-        ...integrations,
-        jibble: { ...jibble, ...form, connected: false, lastSyncStatus: 'error', lastSyncError: err.message },
-      });
+      setTestResult({ ok: false, error: err.message });
     } finally {
       setTesting(false);
     }
   };
 
-  const handleDisconnect = () => {
-    setIntegrations({
-      ...integrations,
-      jibble: { ...jibble, connected: false, personalAccessToken: '', clientId: '', clientSecret: '', cachedAccessToken: '' },
-    });
-    setForm({ ...form, personalAccessToken: '', clientId: '', clientSecret: '' });
-    logAction('Disconnected from Jibble');
-    showToast('Disconnected from Jibble', 'success');
+  const handleDisconnect = async () => {
+    try {
+      await api.secrets.clear('jibble');
+      setMetadata({});
+      setClientId(''); setClientSecret(''); setOrganizationId('');
+      setTestResult(null);
+      logAction('Disconnected Jibble (server vault cleared)');
+      showToast('Disconnected from Jibble', 'success');
+    } catch (err) {
+      showToast('Disconnect failed: ' + err.message, 'error');
+    }
   };
 
   return (
@@ -9142,132 +9135,73 @@ const JibbleIntegrationCard = ({ integrations, setIntegrations, showToast, logAc
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
             <h3 className="text-base font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>Jibble</h3>
-            <StatusBadge status={jibble.connected ? 'Active' : 'Inactive'} />
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase rounded" style={{ backgroundColor: brand.successLight, color: brand.success, border: `1px solid ${brand.success}` }}>
+                <Shield size={10} /> Server vault
+              </span>
+              <StatusBadge status={hasStoredCreds && hasAccessToken ? 'Active' : 'Inactive'} />
+            </div>
           </div>
           <p className="text-xs mb-4" style={{ color: brand.textMuted }}>
-            Time tracking and attendance. Get credentials from{' '}
+            Time tracking and attendance. Get an API Key from{' '}
             <a href="https://web.jibble.io/settings/organization/api-keys" target="_blank" rel="noopener noreferrer" className="underline" style={{ color: brand.gold }}>
               Jibble &rsaquo; Organization Settings &rsaquo; API Keys
             </a>.
           </p>
 
-          {/* Auth Method Toggle */}
-          <div className="mb-4">
-            <p className="text-xs font-medium tracking-wider uppercase mb-2" style={{ color: brand.textMuted }}>Authentication Method</p>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => updateField('authMethod', 'client_credentials')}
-                className="text-left p-3 rounded transition-all btn-press"
-                style={{
-                  backgroundColor: form.authMethod === 'client_credentials' ? brand.cream : '#fff',
-                  border: `${form.authMethod === 'client_credentials' ? '2px' : '1px'} solid ${form.authMethod === 'client_credentials' ? brand.gold : brand.border}`,
-                  margin: form.authMethod === 'client_credentials' ? '0' : '1px',
-                }}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <Shield size={14} style={{ color: brand.gold }} />
-                  <p className="text-sm font-semibold" style={{ color: brand.text }}>API Key (Recommended)</p>
-                </div>
-                <p className="text-xs" style={{ color: brand.textMuted }}>Use API Key ID + Secret. Auto-refreshes tokens. <strong>This matches what Jibble gives you.</strong></p>
-              </button>
-              <button
-                type="button"
-                onClick={() => updateField('authMethod', 'pat')}
-                className="text-left p-3 rounded transition-all btn-press"
-                style={{
-                  backgroundColor: form.authMethod === 'pat' ? brand.cream : '#fff',
-                  border: `${form.authMethod === 'pat' ? '2px' : '1px'} solid ${form.authMethod === 'pat' ? brand.gold : brand.border}`,
-                  margin: form.authMethod === 'pat' ? '0' : '1px',
-                }}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <FileText size={14} style={{ color: brand.gold }} />
-                  <p className="text-sm font-semibold" style={{ color: brand.text }}>Personal Access Token</p>
-                </div>
-                <p className="text-xs" style={{ color: brand.textMuted }}>Single bearer token. Simpler but expires manually.</p>
-              </button>
-            </div>
+          <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.successLight, color: brand.success }}>
+            <Shield size={14} className="flex-shrink-0 mt-0.5" />
+            <span>
+              <strong>Encrypted server-side.</strong> Your Client ID + Secret are AES-256-GCM encrypted at rest. Token exchange and API calls happen on the server, so Jibble's CORS policy doesn't block anything.
+            </span>
           </div>
 
-          {/* Credentials */}
+          {/* Credentials — Client Credentials only */}
           <div className="space-y-3 mb-4">
-            <Field label="API Base URL" hint="Leave as default unless using a private deployment">
-              <Input value={form.apiBaseUrl} onChange={(e) => updateField('apiBaseUrl', e.target.value)} placeholder={jibbleAPI.defaultBaseUrl} />
+            <Field
+              label="API Key ID (Client ID)"
+              required={!metadata.clientId?.hasValue}
+              hint={metadata.clientId?.hasValue ? `Currently stored: •••• ${metadata.clientId.last4}` : 'The first value Jibble shows you (UUID format)'}
+            >
+              <Input
+                value={clientId}
+                onChange={(e) => { setClientId(e.target.value); setDirty(true); }}
+                placeholder={metadata.clientId?.hasValue ? 'Leave blank to keep existing' : 'e.g. af43a10a-c4f8-4c7a-a083-...'}
+                autoComplete="off"
+              />
             </Field>
-
-            {form.authMethod === 'client_credentials' ? (
-              <>
-                <Field label="API Key ID (Client ID)" required hint="The first value Jibble shows you (UUID format)">
-                  <Input value={form.clientId} onChange={(e) => updateField('clientId', e.target.value)} placeholder="e.g. af43a10a-c4f8-4c7a-a083-..." autoComplete="off" />
-                </Field>
-                <Field label="API Key Secret (Client Secret)" required hint="The longer secret string. Stored persistently — treat it like a password.">
-                  <div className="flex gap-2">
-                    <input
-                      type={showSecret ? 'text' : 'password'}
-                      value={form.clientSecret}
-                      onChange={(e) => updateField('clientSecret', e.target.value)}
-                      placeholder="Paste your API Key Secret here..."
-                      className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                      style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
-                      autoComplete="off" spellCheck="false"
-                    />
-                    <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
-                      {showSecret ? 'Hide' : 'Show'}
-                    </button>
-                  </div>
-                </Field>
-              </>
-            ) : (
-              <Field label="Personal Access Token" required hint="A single bearer token from API Keys page.">
-                <div className="flex gap-2">
-                  <input
-                    type={showSecret ? 'text' : 'password'}
-                    value={form.personalAccessToken}
-                    onChange={(e) => updateField('personalAccessToken', e.target.value)}
-                    placeholder="Paste your token here..."
-                    className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
-                    autoComplete="off" spellCheck="false"
-                  />
-                  <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
-                    {showSecret ? 'Hide' : 'Show'}
-                  </button>
-                </div>
-              </Field>
-            )}
-
+            <Field
+              label="API Key Secret"
+              required={!metadata.clientSecret?.hasValue}
+              hint={metadata.clientSecret?.hasValue ? `Currently stored: •••• ${metadata.clientSecret.last4}` : 'The longer secret string. Treat like a password.'}
+            >
+              <div className="flex gap-2">
+                <input
+                  type={showSecret ? 'text' : 'password'}
+                  value={clientSecret}
+                  onChange={(e) => { setClientSecret(e.target.value); setDirty(true); }}
+                  placeholder={metadata.clientSecret?.hasValue ? 'Leave blank to keep existing' : 'Paste your API Key Secret here...'}
+                  className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
+                  style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                  autoComplete="off" spellCheck="false"
+                />
+                <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
+                  {showSecret ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </Field>
             <Field label="Organization ID" hint="Optional — only required for some endpoints">
-              <Input value={form.organizationId} onChange={(e) => updateField('organizationId', e.target.value)} placeholder="Optional" />
+              <Input
+                value={organizationId}
+                onChange={(e) => { setOrganizationId(e.target.value); setDirty(true); }}
+                placeholder="Optional"
+              />
             </Field>
           </div>
-
-          {/* Sync Settings */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 mb-2">
-            <Field label="Sync Frequency">
-              <Select value={form.syncFrequency} onChange={(e) => updateField('syncFrequency', e.target.value)}>
-                <option value="real-time">Real-time (via webhook)</option>
-                <option value="every-15-min">Every 15 minutes</option>
-                <option value="hourly">Hourly</option>
-                <option value="daily">Daily</option>
-                <option value="manual">Manual only</option>
-              </Select>
-            </Field>
-            <Field label="Last Sync">
-              <Input value={jibble.lastSync ? `${formatDate(jibble.lastSync)} (${timeAgo(jibble.lastSync)})` : 'Never'} disabled />
-            </Field>
-          </div>
-
-          <Toggle
-            checked={form.autoApprove}
-            onChange={(v) => updateField('autoApprove', v)}
-            label="Auto-approve standard entries"
-            description="Approve time entries automatically when within normal working hours"
-          />
 
           {/* Test result banner */}
           {testResult && (
-            <div className="mt-4 p-3 rounded text-xs animate-fade-in-up" style={{
+            <div className="mt-2 mb-3 p-3 rounded text-xs animate-fade-in-up" style={{
               backgroundColor: testResult.ok ? brand.successLight : brand.dangerLight,
               color: testResult.ok ? brand.success : brand.danger,
               border: `1px solid ${testResult.ok ? brand.success : brand.danger}`,
@@ -9280,25 +9214,10 @@ const JibbleIntegrationCard = ({ integrations, setIntegrations, showToast, logAc
                   </p>
                   {testResult.ok ? (
                     <p className="mt-1">
-                      {testResult.tokenObtained && 'Token exchange succeeded. '}
-                      Found {testResult.peopleCount} {testResult.peopleCount === 1 ? 'person' : 'people'} in your Jibble workspace. Credentials saved.
+                      Token issued server-side. Found {testResult.peopleCount} {testResult.peopleCount === 1 ? 'person' : 'people'} in your Jibble workspace.
                     </p>
                   ) : (
-                    <>
-                      <p className="mt-1" style={{ color: brand.text }}>{testResult.error}</p>
-                      {(testResult.error.includes('CORS') || testResult.error.includes('Failed to fetch')) && (
-                        <div className="mt-3 p-3 rounded" style={{ backgroundColor: '#fff', color: brand.text }}>
-                          <p className="font-semibold mb-1" style={{ color: brand.navy }}>This is expected in the browser preview.</p>
-                          <p className="text-xs mb-2">Your credentials are correct — Jibble's API doesn't accept direct browser calls (CORS policy). To actually fetch data you need a tiny backend proxy. Quick options:</p>
-                          <ul className="text-xs list-disc list-inside space-y-1" style={{ color: brand.textMuted }}>
-                            <li>Deploy the Node.js proxy snippet (in <code>JIBBLE-PROXY.md</code>) to Vercel/Railway</li>
-                            <li>Use Cloudflare Workers (~10 lines of code)</li>
-                            <li>Use Supabase Edge Functions if you're already on Supabase</li>
-                          </ul>
-                          <p className="text-xs mt-2">Once the proxy is live, change the API Base URL above to your proxy's URL — the rest of this code is unchanged.</p>
-                        </div>
-                      )}
-                    </>
+                    <p className="mt-1" style={{ color: brand.text }}>{testResult.error}</p>
                   )}
                 </div>
               </div>
@@ -9306,18 +9225,15 @@ const JibbleIntegrationCard = ({ integrations, setIntegrations, showToast, logAc
           )}
 
           {/* Actions */}
-          <div className="flex gap-2 mt-4 flex-wrap">
-            <Button
-              variant="primary"
-              icon={testing ? RefreshCw : Zap}
-              onClick={handleTest}
-              disabled={testing || (form.authMethod === 'pat' ? !form.personalAccessToken : (!form.clientId || !form.clientSecret))}
-            >
-              {testing ? 'Testing...' : 'Test Connection'}
+          <div className="flex gap-2 flex-wrap">
+            <Button size="sm" variant="primary" icon={Save} onClick={saveCredentials} disabled={!dirty}>Save</Button>
+            <Button size="sm" variant="gold" icon={Zap} onClick={handleTest} disabled={testing || (!hasStoredCreds && (!clientId || !clientSecret))}>
+              {testing ? 'Testing…' : 'Test Connection'}
             </Button>
-            {dirty && <Button variant="ghost" icon={Save} onClick={saveCredentials}>Save Without Testing</Button>}
-            {jibble.connected && <Button variant="danger" onClick={handleDisconnect}>Disconnect</Button>}
-            <Button variant="ghost" icon={ExternalLink} onClick={() => window.open('https://docs.api.jibble.io/', '_blank')}>API Docs</Button>
+            {hasStoredCreds && (
+              <Button size="sm" variant="danger" icon={X} onClick={handleDisconnect}>Disconnect</Button>
+            )}
+            <Button size="sm" variant="ghost" icon={ExternalLink} onClick={() => window.open('https://docs.api.jibble.io/', '_blank')}>API Docs</Button>
           </div>
         </div>
       </div>
@@ -9812,8 +9728,6 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
     clientId: pi.clientId || '',
     clientSecret: pi.clientSecret || '',
-    authMethod: pi.authMethod || 'pat',
-    personalAccessToken: pi.personalAccessToken || '',
   });
   const [showSecret, setShowSecret] = useState(false);
   const [fetching, setFetching] = useState(false);
@@ -9830,11 +9744,9 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
       clientId: pi.clientId || '',
       clientSecret: pi.clientSecret || '',
-      authMethod: pi.authMethod || 'pat',
-      personalAccessToken: pi.personalAccessToken || '',
     });
     setDirty(false);
-  }, [pi.baseUrl, pi.tokenUrl, pi.authorizeUrl, pi.redirectUri, pi.clientId, pi.clientSecret, pi.authMethod, pi.personalAccessToken]);
+  }, [pi.baseUrl, pi.tokenUrl, pi.authorizeUrl, pi.redirectUri, pi.clientId, pi.clientSecret]);
 
   const updateField = (key, value) => {
     setForm(f => ({ ...f, [key]: value }));
@@ -9848,25 +9760,19 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       Object.entries(form).map(([k, v]) => [k, typeof v === 'string' ? v.trim() : v])
     );
     setForm(cleaned);
-    // For PAT mode, the saved token IS the auth — mark connected immediately.
-    // For OAuth mode, connection happens after the redirect callback.
-    const isPat = cleaned.authMethod === 'pat' && cleaned.personalAccessToken;
     setIntegrations({
       ...integrations,
       propertyInspect: {
         ...pi,
         ...cleaned,
-        connected: isPat ? true : pi.connected,
-        // Clear cached OAuth tokens whenever credentials change.
-        cachedAccessToken: isPat ? '' : '',
+        // Connection happens after the OAuth redirect callback.
+        cachedAccessToken: '',
         cachedAccessTokenExpiry: null,
         cachedRefreshToken: '',
-        lastSyncStatus: isPat ? null : pi.lastSyncStatus,
-        lastSyncError: isPat ? null : pi.lastSyncError,
       },
     });
-    logAction(`Updated Property Inspect integration credentials (${cleaned.authMethod})`);
-    showToast(isPat ? 'Personal Access Token saved' : 'Property Inspect credentials saved', 'success');
+    logAction('Updated Property Inspect integration credentials');
+    showToast('Property Inspect credentials saved', 'success');
     setDirty(false);
   };
 
@@ -9989,26 +9895,18 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   const handleFetch = async () => {
     setFetching(true);
     try {
-      let accessToken;
-      let updates = null;
-      if (pi.authMethod === 'pat') {
-        if (!pi.personalAccessToken) {
-          throw new Error('Paste a Personal Access Token first, then click Save.');
-        }
-        accessToken = pi.personalAccessToken.trim();
-      } else {
-        if (!pi.clientId || !pi.clientSecret) {
-          throw new Error('Save credentials first');
-        }
-        const result = await propertyInspectAPI.ensureAccessToken({
-          ...pi,
-          clientId: pi.clientId,
-          clientSecret: pi.clientSecret,
-          tokenUrl: pi.tokenUrl,
-        });
-        accessToken = result.accessToken;
-        updates = result.updates;
+      // OAuth authorization_code flow — token comes from the post-OAuth callback.
+      if (!pi.clientId || !pi.clientSecret) {
+        throw new Error('Save credentials first');
       }
+      const tokenResult = await propertyInspectAPI.ensureAccessToken({
+        ...pi,
+        clientId: pi.clientId,
+        clientSecret: pi.clientSecret,
+        tokenUrl: pi.tokenUrl,
+      });
+      const accessToken = tokenResult.accessToken;
+      const updates = tokenResult.updates;
       const result = await propertyInspectAPI.listInspections({
         accessToken,
         baseUrl: pi.baseUrl,
@@ -10066,9 +9964,9 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   const [diagRunning, setDiagRunning] = useState(false);
 
   const runDiagnostic = async () => {
-    const token = pi.authMethod === 'pat' ? (pi.personalAccessToken || '').trim() : (pi.cachedAccessToken || '').trim();
+    const token = (pi.cachedAccessToken || '').trim();
     if (!token) {
-      setDiagResult({ error: 'No token available. Save a PAT or run OAuth Connect first.' });
+      setDiagResult({ error: 'No token available. Run OAuth Connect first.' });
       return;
     }
     setDiagRunning(true);
@@ -10110,7 +10008,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   // ignored, or stripped.
   const [tokenInspectorOpen, setTokenInspectorOpen] = useState(false);
   const tokenClaims = (() => {
-    const token = pi.authMethod === 'pat' ? pi.personalAccessToken : pi.cachedAccessToken;
+    const token = pi.cachedAccessToken;
     if (!token) return null;
     const parts = token.split('.');
     if (parts.length !== 3) return { _notJwt: true, raw: token.slice(0, 80) + '…' };
@@ -10131,7 +10029,6 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
         connected: false,
         clientId: '',
         clientSecret: '',
-        personalAccessToken: '',
         cachedAccessToken: '',
         cachedAccessTokenExpiry: null,
         cachedRefreshToken: '',
@@ -10139,7 +10036,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
         lastSyncError: null,
       },
     });
-    setForm({ ...form, clientId: '', clientSecret: '', personalAccessToken: '' });
+    setForm({ ...form, clientId: '', clientSecret: '' });
     logAction('Disconnected Property Inspect');
     showToast('Disconnected from Property Inspect', 'success');
   };
@@ -10173,72 +10070,6 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
             </span>
           </div>
 
-          {/* Auth Method Picker */}
-          <div className="mb-4">
-            <p className="text-xs font-medium tracking-wider uppercase mb-2" style={{ color: brand.textMuted }}>Authentication Method</p>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => updateField('authMethod', 'pat')}
-                className="text-left p-3 rounded transition-all btn-press"
-                style={{
-                  backgroundColor: form.authMethod === 'pat' ? brand.cream : '#fff',
-                  border: `${form.authMethod === 'pat' ? '2px' : '1px'} solid ${form.authMethod === 'pat' ? brand.gold : brand.border}`,
-                  margin: form.authMethod === 'pat' ? '0' : '1px',
-                }}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <Shield size={14} style={{ color: brand.gold }} />
-                  <p className="text-sm font-semibold" style={{ color: brand.text }}>Personal Access Token (Recommended)</p>
-                </div>
-                <p className="text-xs" style={{ color: brand.textMuted }}>Generate a PAT in PI's developer console — bypasses OAuth scopes entirely.</p>
-              </button>
-              <button
-                type="button"
-                onClick={() => updateField('authMethod', 'oauth')}
-                className="text-left p-3 rounded transition-all btn-press"
-                style={{
-                  backgroundColor: form.authMethod === 'oauth' ? brand.cream : '#fff',
-                  border: `${form.authMethod === 'oauth' ? '2px' : '1px'} solid ${form.authMethod === 'oauth' ? brand.gold : brand.border}`,
-                  margin: form.authMethod === 'oauth' ? '0' : '1px',
-                }}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <ExternalLink size={14} style={{ color: brand.gold }} />
-                  <p className="text-sm font-semibold" style={{ color: brand.text }}>OAuth 2 (Authorization Code)</p>
-                </div>
-                <p className="text-xs" style={{ color: brand.textMuted }}>Browser-based flow. Currently blocked by PI's scope check.</p>
-              </button>
-            </div>
-          </div>
-
-          {form.authMethod === 'pat' ? (
-            <>
-              <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
-                <Info size={14} className="flex-shrink-0 mt-0.5" />
-                <span>
-                  <strong style={{ color: brand.text }}>How to get a PAT:</strong> log in to your Property Inspect account in this browser, then go to your account settings or developer console and look for a "Personal Access Token" / "API Token" generator. Paste the token below. Personal Access Tokens carry all your account's scopes by default, so they sidestep the OAuth scope issue.
-                </span>
-              </div>
-              <Field label="Personal Access Token" required hint="Long opaque string — treat like a password">
-                <div className="flex gap-2">
-                  <input
-                    type={showSecret ? 'text' : 'password'}
-                    value={form.personalAccessToken}
-                    onChange={(e) => updateField('personalAccessToken', e.target.value)}
-                    placeholder="Paste your PAT here..."
-                    className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
-                    autoComplete="off" spellCheck="false"
-                  />
-                  <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
-                    {showSecret ? 'Hide' : 'Show'}
-                  </button>
-                </div>
-              </Field>
-            </>
-          ) : (
-            <>
           <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
             <Info size={14} className="flex-shrink-0 mt-0.5" />
             <span>
@@ -10308,8 +10139,6 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
               </div>
             )}
           </div>
-            </>
-          )}
 
           {/* Pre-flight check failures (shown only when handleConnect refuses to redirect) */}
           {testResult && !testResult.ok && (
@@ -10370,7 +10199,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
               variant="ghost"
               icon={Download}
               onClick={handleFetch}
-              disabled={fetching || dirty || (pi.authMethod === 'pat' ? !pi.personalAccessToken : !pi.connected)}
+              disabled={fetching || dirty || !pi.connected}
             >
               {fetching ? 'Pulling…' : 'Pull Inspections'}
             </Button>
@@ -10388,7 +10217,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                 Preview ({imported.length})
               </Button>
             )}
-            {(pi.connected || (pi.authMethod === 'pat' && pi.personalAccessToken)) && (
+            {pi.connected && (
               <>
                 <Button size="sm" variant="ghost" icon={Eye} onClick={() => setTokenInspectorOpen(true)}>Inspect Token</Button>
                 <Button size="sm" variant="ghost" icon={Activity} onClick={() => { setDiagOpen(true); setDiagResult(null); }}>Diagnose Request</Button>
@@ -10871,8 +10700,6 @@ const SettingsSection = ({
           {activeTab === 'integrations' && (
             <div className="space-y-4">
               <JibbleIntegrationCard
-                integrations={integrations}
-                setIntegrations={setIntegrations}
                 showToast={showToast}
                 logAction={logAction}
               />

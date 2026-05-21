@@ -26,11 +26,12 @@ export const INTEGRATIONS = {
   docusign: ['integrationKey', 'clientSecret', 'redirectUri', 'environment',
              'accessToken', 'refreshToken', 'tokenExpiry',
              'accountId', 'baseUri', 'userId', 'userEmail'],
+  // Property Inspect — OAuth (authorization_code) only. PAT mode removed.
   propertyInspect: ['clientId', 'clientSecret', 'redirectUri', 'baseUrl',
-                    'tokenUrl', 'authorizeUrl', 'authMethod', 'personalAccessToken',
+                    'tokenUrl', 'authorizeUrl',
                     'accessToken', 'refreshToken', 'tokenExpiry'],
-  jibble: ['authMethod', 'personalAccessToken', 'clientId', 'clientSecret',
-           'apiBaseUrl', 'organizationId',
+  // Jibble — Client Credentials only. PAT mode removed.
+  jibble: ['clientId', 'clientSecret', 'organizationId',
            'accessToken', 'tokenExpiry'],
 };
 

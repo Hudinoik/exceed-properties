@@ -231,10 +231,10 @@ router.post('/property-inspect/exchange-code', async (req, res) => {
 // access to non-/data endpoints (no `/oauth/*`, no traversal).
 router.get('/property-inspect/get', async (req, res) => {
   const cfg = readIntegration(req.session.userId, 'propertyInspect');
-  if (!cfg.accessToken && !cfg.personalAccessToken) {
+  if (!cfg.accessToken) {
     return res.status(400).json({ error: 'No PI token available' });
   }
-  const token = cfg.personalAccessToken || cfg.accessToken;
+  const token = cfg.accessToken;
   const targetPath = String(req.query.path || '/inspections');
   if (!/^\/[a-zA-Z0-9_\-./]+$/.test(targetPath) || targetPath.includes('..') || targetPath.startsWith('/oauth')) {
     return res.status(400).json({ error: 'Invalid path' });
@@ -243,6 +243,89 @@ router.get('/property-inspect/get', async (req, res) => {
   try {
     const upstream = await fetch(`${base}${targetPath}`, {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    const text = await upstream.text();
+    res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(text);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------
+// Jibble — OAuth 2 Client Credentials.
+// The token endpoint refuses browser-origin requests (CORS), so the
+// browser MUST go through this proxy. Stored secrets stay in the vault.
+// ----------------------------------------------------------------
+const JIBBLE_IDENTITY = 'https://identity.prod.jibble.io/connect/token';
+const JIBBLE_API = 'https://workspace.prod.jibble.io/v1';
+const JIBBLE_TIME = 'https://time-tracking.prod.jibble.io/v1';
+
+const ensureJibbleToken = async (userId) => {
+  const cfg = readIntegration(userId, 'jibble');
+  const now = Date.now();
+  if (cfg.accessToken && cfg.tokenExpiry && now < Number(cfg.tokenExpiry)) {
+    return cfg.accessToken;
+  }
+  if (!cfg.clientId || !cfg.clientSecret) {
+    throw new Error('Jibble Client ID + Secret are not configured');
+  }
+  const r = await fetch(JIBBLE_IDENTITY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: cfg.clientId,
+      client_secret: cfg.clientSecret,
+    }).toString(),
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`Jibble token exchange failed (HTTP ${r.status}): ${text || r.statusText}`);
+  }
+  const tokens = await r.json();
+  if (!tokens.access_token) throw new Error('Jibble returned no access_token');
+  await writeSecret(userId, 'jibble', 'accessToken', tokens.access_token);
+  const expiry = String(Date.now() + Math.max(60, (tokens.expires_in || 3600) - 30) * 1000);
+  await writeSecret(userId, 'jibble', 'tokenExpiry', expiry);
+  return tokens.access_token;
+};
+
+// Test connection: exchange creds + probe /People with $top=1.
+router.post('/jibble/test', async (req, res) => {
+  try {
+    const accessToken = await ensureJibbleToken(req.session.userId);
+    const url = `${JIBBLE_API}/People?$top=1`;
+    const upstream = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    });
+    const data = await upstream.json().catch(() => null);
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ error: data?.message || `Jibble /People returned HTTP ${upstream.status}` });
+    }
+    const peopleCount = Array.isArray(data?.value) ? data.value.length : (data?.['@odata.count'] || 0);
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'proxy.jibble.test', details: { ok: true }, ip: req.ip,
+    });
+    res.json({ ok: true, peopleCount });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Generic Jibble GET forwarder. Path is whitelisted — only workspace + time-tracking
+// resource endpoints are allowed.
+router.get('/jibble/get', async (req, res) => {
+  const targetPath = String(req.query.path || '/People');
+  const which = String(req.query.svc || 'workspace'); // workspace | time
+  if (!/^\/[A-Za-z0-9_\-./()$=&,]+$/.test(targetPath) || targetPath.includes('..')) {
+    return res.status(400).json({ error: 'Invalid path' });
+  }
+  const base = which === 'time' ? JIBBLE_TIME : JIBBLE_API;
+  try {
+    const accessToken = await ensureJibbleToken(req.session.userId);
+    const upstream = await fetch(`${base}${targetPath}`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
     });
     const text = await upstream.text();
     res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(text);
