@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* PDF auto-fill flash: highlights inputs whose data-field-path matches a
+   path in the flashPaths Set for ~2s after auto-population. */
+@keyframes lease-flash {
+  0% { box-shadow: 0 0 0 3px rgba(46, 125, 50, 0); background-color: #D8E8DE; }
+  20% { box-shadow: 0 0 0 3px rgba(46, 125, 50, 0.6); background-color: #D8E8DE; }
+  100% { box-shadow: 0 0 0 3px rgba(46, 125, 50, 0); background-color: #ffffff; }
+}
+.lease-flash input,
+.lease-flash select,
+.lease-flash textarea,
+input.lease-flash,
+select.lease-flash,
+textarea.lease-flash {
+  animation: lease-flash 1.8s ease-out;
+}
+
+td.calc-year-cell::before {
+  content: 'Year ' attr(data-year);
+}
