@@ -10066,12 +10066,28 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     setTestResult(null);
   };
 
-  const saveCredentials = () => {
+  const saveCredentials = async () => {
     // Trim each value — stray whitespace in OAuth params breaks PI auth.
     const cleaned = Object.fromEntries(
       Object.entries(form).map(([k, v]) => [k, typeof v === 'string' ? v.trim() : v])
     );
     setForm(cleaned);
+    try {
+      // Persist to the server vault so the backend's exchange-code and
+      // /property-inspect/get endpoints can read the creds. localStorage is
+      // a UI-only mirror; the server has no access to it.
+      await api.secrets.set('propertyInspect', {
+        clientId: cleaned.clientId,
+        clientSecret: cleaned.clientSecret,
+        redirectUri: cleaned.redirectUri,
+        baseUrl: cleaned.baseUrl,
+        tokenUrl: cleaned.tokenUrl,
+        authorizeUrl: cleaned.authorizeUrl,
+      });
+    } catch (err) {
+      showToast(`Failed to save credentials: ${err.message}`, 'error');
+      return;
+    }
     setIntegrations({
       ...integrations,
       propertyInspect: {
@@ -10093,7 +10109,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   // the PI login), then redirect the browser to PI's authorize URL. The
   // resulting access_token is bound to the logged-in PI user — which is
   // what every data endpoint requires (client_credentials tokens get 500'd).
-  const handleConnect = () => {
+  const handleConnect = async () => {
     // Trim every field — a stray trailing space in Client ID encodes as `+`
     // in the URL and Property Inspect rejects it as "invalid_client".
     const cleaned = {
@@ -10116,6 +10132,22 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
 
     // Persist the trimmed values so subsequent calls don't re-introduce whitespace.
     setForm(f => ({ ...f, ...cleaned }));
+    try {
+      // The server's exchange-code route reads creds from the vault — push
+      // them up BEFORE we hand off to PI's authorize page, otherwise the
+      // callback returns "Property Inspect integration is not configured".
+      await api.secrets.set('propertyInspect', {
+        clientId: cleaned.clientId,
+        clientSecret: cleaned.clientSecret,
+        redirectUri: cleaned.redirectUri,
+        baseUrl: cleaned.baseUrl,
+        tokenUrl: cleaned.tokenUrl,
+        authorizeUrl: cleaned.authorizeUrl,
+      });
+    } catch (err) {
+      setTestResult({ ok: false, error: `Could not persist credentials: ${err.message}` });
+      return;
+    }
     setIntegrations({
       ...integrations,
       propertyInspect: {
@@ -10318,7 +10350,15 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     }
   })();
 
-  const handleDisconnect = () => {
+  const handleDisconnect = async () => {
+    try {
+      // Wipe the server vault too — otherwise stale tokens linger and the
+      // next handleConnect can resume with old credentials.
+      await api.secrets.clear('propertyInspect');
+    } catch (err) {
+      showToast(`Failed to clear server credentials: ${err.message}`, 'error');
+      return;
+    }
     setIntegrations({
       ...integrations,
       propertyInspect: {
@@ -10334,7 +10374,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       },
     });
     setForm({ ...form, clientId: '', clientSecret: '' });
-    logAction('Disconnected Property Inspect');
+    logAction('Disconnected Property Inspect (server vault cleared)');
     showToast('Disconnected from Property Inspect', 'success');
   };
 
@@ -12809,13 +12849,11 @@ export default function ExceedProperties() {
 
     (async () => {
       try {
-        const tokens = await propertyInspectAPI.exchangeAuthorizationCode({
-          clientId: pending.clientId,
-          clientSecret: pending.clientSecret,
-          code,
-          redirectUri: pending.redirectUri,
-          tokenUrl: pending.tokenUrl,
-        });
+        // Exchange the code through our backend, not the browser. Property
+        // Inspect's token endpoint doesn't accept browser-origin CORS, and
+        // even if it did, the client_secret has no business being in the
+        // SPA — it's already stored in the server vault from the Save step.
+        await api.proxy.piExchangeCode(code);
         setIntegrations(prev => ({
           ...prev,
           propertyInspect: {
@@ -12826,9 +12864,6 @@ export default function ExceedProperties() {
             redirectUri: pending.redirectUri,
             baseUrl: pending.baseUrl,
             connected: true,
-            cachedAccessToken: tokens.accessToken,
-            cachedAccessTokenExpiry: tokens.expiresAt,
-            cachedRefreshToken: tokens.refreshToken,
             lastSync: new Date().toISOString(),
             lastSyncStatus: 'success',
             lastSyncError: null,
