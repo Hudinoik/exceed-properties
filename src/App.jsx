@@ -10433,16 +10433,14 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
           {/* Actions */}
           <div className="flex gap-2 flex-wrap">
             <Button size="sm" variant="primary" icon={Save} onClick={saveCredentials} disabled={!dirty}>Save</Button>
-            {form.authMethod === 'oauth' && (
-              !pi.connected ? (
-                <Button size="sm" variant="gold" icon={ExternalLink} onClick={handleConnect} disabled={!form.clientId || !form.clientSecret || !form.redirectUri || dirty}>
-                  Connect with Property Inspect
-                </Button>
-              ) : (
-                <Button size="sm" variant="gold" icon={RefreshCw} onClick={handleConnect} disabled={!form.clientId || !form.clientSecret || !form.redirectUri || dirty}>
-                  Re-Connect
-                </Button>
-              )
+            {!pi.connected ? (
+              <Button size="sm" variant="gold" icon={ExternalLink} onClick={handleConnect} disabled={!form.clientId || !form.clientSecret || !form.redirectUri || dirty}>
+                Connect with Property Inspect
+              </Button>
+            ) : (
+              <Button size="sm" variant="gold" icon={RefreshCw} onClick={handleConnect} disabled={!form.clientId || !form.clientSecret || !form.redirectUri || dirty}>
+                Re-Connect
+              </Button>
             )}
             <Button
               size="sm"
