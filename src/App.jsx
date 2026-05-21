@@ -8,7 +8,7 @@ import {
   Wrench, BarChart3, Shield, Database, Sliders, Briefcase, Inbox,
   AlertTriangle, Undo2, Save, Info, Coffee, UserPlus, Layers, MoreVertical,
   Zap, Play, Pause, Lock, Calculator, Sparkles, Upload, Eye, FileCheck, History,
-  Droplets, Siren, Send
+  Droplets, Siren, Send, Menu
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import * as api from './lib/api.js';
@@ -2256,7 +2256,7 @@ const EmployeesSection = ({ employees, setEmployees, showToast, logAction }) => 
 
   return (
     <div>
-      <div className="flex items-end justify-between mb-6">
+      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>People</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Employees</h1>
@@ -3313,7 +3313,7 @@ const InspectionsSection = ({ inspections, setInspections, employees, properties
 
   return (
     <div>
-      <div className="flex items-end justify-between mb-6">
+      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Quality Assurance</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Property Inspections</h1>
@@ -5235,7 +5235,7 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   return (
     <div className="animate-fade-in-up">
       {/* Header banner — matches the app's navy + gold theme */}
-      <div className="px-6 py-4 -mx-8 -mt-6 mb-0" style={{ backgroundColor: brand.navy }}>
+      <div className="px-4 md:px-6 py-4 -mx-4 md:-mx-8 -mt-4 md:-mt-6 mb-0" style={{ backgroundColor: brand.navy }}>
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded" style={{ backgroundColor: brand.gold }}>
@@ -5266,7 +5266,7 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
       </div>
 
       {/* Action bar */}
-      <div className="px-6 py-3 -mx-8" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
+      <div className="px-4 md:px-6 py-3 -mx-4 md:-mx-8" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
         <div className="flex items-center gap-2 flex-wrap">
           <Button size="sm" variant="ghost" icon={FileText} onClick={() => setDraftsModalOpen(true)}>Drafts ({drafts.length})</Button>
           <Button size="sm" variant="ghost" icon={History} onClick={() => setHistoryModalOpen(true)}>History</Button>
@@ -5299,7 +5299,7 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4 p-6">
+      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4 p-4 md:p-6">
         {/* Quick-start sidebar */}
         <aside className="space-y-4">
           <Card className="p-4">
@@ -7241,7 +7241,7 @@ const MaintenanceSection = ({ maintenance, setMaintenance, properties, employees
 
   return (
     <div>
-      <div className="flex items-end justify-between mb-6">
+      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Operations</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Maintenance Requests</h1>
@@ -7460,7 +7460,7 @@ const ReportsSection = ({ properties, leases, debtors, inspections, maintenance,
 
   return (
     <div>
-      <div className="flex items-end justify-between mb-6">
+      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Analytics</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Reports</h1>
@@ -9134,7 +9134,7 @@ const UsersSection = ({ employees, setEmployees, currentUser, setCurrentUser, sh
 
   return (
     <div className="animate-fade-in-up">
-      <div className="flex items-end justify-between mb-6">
+      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Access Control</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Users & Roles</h1>
@@ -11555,7 +11555,7 @@ const OutagesSection = ({ outages, setOutages, properties, currentUser, showToas
 
   return (
     <div>
-      <div className="flex items-end justify-between mb-6">
+      <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
         <div>
           <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Operations</p>
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Report Outage</h1>
@@ -12688,6 +12688,10 @@ export default function ExceedProperties() {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [notifPanelOpen, setNotifPanelOpen] = useState(false);
   const [globalSearch, setGlobalSearch] = useState('');
+  // Mobile drawer for the sidebar. md:+ ignores this and keeps the sidebar
+  // permanently visible; phones get a slide-in drawer triggered by the
+  // hamburger button in the top bar.
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   const showToast = useCallback((message, type = 'success') => {
     setToast({ message, type });
@@ -13133,10 +13137,24 @@ export default function ExceedProperties() {
         ::-webkit-scrollbar-thumb:hover { background: #B8924A; }
       `}</style>
 
-      {/* Sidebar */}
-      <aside className="w-64 flex-shrink-0 flex flex-col" style={{ backgroundColor: brand.navy }}>
+      {/* Mobile-only backdrop. Renders under the drawer when open so taps
+          outside the nav close it. md:+ never sees it. */}
+      {mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-30 md:hidden"
+          style={{ backgroundColor: 'rgba(15, 30, 46, 0.5)' }}
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Sidebar — fixed-position slide-in drawer on mobile, in-flow on md:+ */}
+      <aside
+        className={`w-64 flex-shrink-0 flex flex-col fixed md:static inset-y-0 left-0 z-40 transform transition-transform duration-200 ease-out ${mobileNavOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}
+        style={{ backgroundColor: brand.navy }}
+      >
         {/* Logo */}
-        <div className="px-6 py-6" style={{ borderBottom: `1px solid ${brand.navyLight}` }}>
+        <div className="px-6 py-6 flex items-center justify-between" style={{ borderBottom: `1px solid ${brand.navyLight}` }}>
           <div className="flex items-center gap-3">
             <div
               className="w-9 h-9 rounded flex items-center justify-center font-bold"
@@ -13149,6 +13167,15 @@ export default function ExceedProperties() {
               <p className="text-xs tracking-[0.2em] uppercase" style={{ color: brand.goldLight }}>Properties</p>
             </div>
           </div>
+          {/* Close button — only visible inside the mobile drawer */}
+          <button
+            type="button"
+            onClick={() => setMobileNavOpen(false)}
+            className="md:hidden p-1 rounded hover:bg-white/10"
+            aria-label="Close menu"
+          >
+            <X size={18} style={{ color: 'rgba(255,255,255,0.7)' }} />
+          </button>
         </div>
 
         {/* Nav */}
@@ -13159,7 +13186,7 @@ export default function ExceedProperties() {
             return (
               <button
                 key={item.id}
-                onClick={() => setActiveNav(item.id)}
+                onClick={() => { setActiveNav(item.id); setMobileNavOpen(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm nav-item btn-press animate-slide-in-left stagger-${Math.min(idx + 1, 8)}`}
                 style={{
                   backgroundColor: isActive ? brand.navyLight : 'transparent',
@@ -13186,18 +13213,29 @@ export default function ExceedProperties() {
       {/* Main */}
       <main className="flex-1 flex flex-col min-w-0">
         {/* Topbar */}
-        <header className="px-8 py-4 flex items-center justify-between" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
-          <div className="flex-1 max-w-md relative">
-            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: brand.textMuted }} />
-            <input
-              type="text"
-              placeholder="Search properties, tenants, employees... (press Enter)"
-              value={globalSearch}
-              onChange={(e) => setGlobalSearch(e.target.value)}
-              onKeyDown={handleGlobalSearch}
-              className="w-full pl-9 pr-3 py-2 text-sm rounded outline-none"
-              style={{ backgroundColor: brand.cream, border: `1px solid ${brand.border}` }}
-            />
+        <header className="px-4 md:px-8 py-4 flex items-center justify-between gap-3" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
+          <div className="flex items-center gap-3 flex-1 min-w-0 max-w-md">
+            {/* Hamburger — opens the mobile drawer. Hidden on md:+. */}
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              className="md:hidden p-2 -ml-2 rounded hover:bg-black hover:bg-opacity-5 btn-press"
+              aria-label="Open menu"
+            >
+              <Menu size={20} style={{ color: brand.text }} />
+            </button>
+            <div className="flex-1 relative">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: brand.textMuted }} />
+              <input
+                type="text"
+                placeholder="Search properties, tenants, employees..."
+                value={globalSearch}
+                onChange={(e) => setGlobalSearch(e.target.value)}
+                onKeyDown={handleGlobalSearch}
+                className="w-full pl-9 pr-3 py-2 text-sm rounded outline-none"
+                style={{ backgroundColor: brand.cream, border: `1px solid ${brand.border}` }}
+              />
+            </div>
           </div>
           <div className="flex items-center gap-3 ml-4">
             <div className="relative">
@@ -13237,7 +13275,7 @@ export default function ExceedProperties() {
         </header>
 
         {/* Content */}
-        <div className="flex-1 p-8 overflow-y-auto">
+        <div className="flex-1 p-4 md:p-8 overflow-y-auto">
           <div key={activeNav} className="animate-fade-in-up">
             {renderContent()}
           </div>
