@@ -3618,8 +3618,9 @@ const blankLeaseForm = () => ({
   leaseFees: { amount: '750.00' },
   annexures: ['A', 'B', 'C', 'D'],
   annexureSelected: { A: true, B: true, C: true, D: true },
-  documents: { landlordCIPC: null, tenantCIPC: null, tenantID: null, suretyID: null },
-  meta: { createdAt: null, updatedAt: null, draftId: null },
+  // leaseType is chosen by the user on first load via a chooser modal —
+  // null means "not yet chosen", which keeps the chooser blocking the form.
+  meta: { createdAt: null, updatedAt: null, draftId: null, leaseType: null },
 });
 
 // Date helpers
@@ -3694,7 +3695,25 @@ const extractPdfText = async (file) => {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items.map(it => ('str' in it ? it.str : '')).join(' ');
+    // Group items by their Y coordinate so multi-column layouts (e.g. an
+    // invoice with "Bill To" on the left and the landlord block on the
+    // right) keep their lines intact instead of being flattened into a
+    // single space-joined blob. Within each line, sort by X so columns
+    // read left-to-right. This makes it much easier for Claude to spot
+    // the BANKING DETAILS block on a typical SA tax invoice.
+    const items = (content.items || []).filter(it => 'str' in it && it.str);
+    const lines = new Map();
+    for (const it of items) {
+      const y = Math.round((it.transform?.[5] ?? 0));
+      const x = it.transform?.[4] ?? 0;
+      if (!lines.has(y)) lines.set(y, []);
+      lines.get(y).push({ x, s: it.str });
+    }
+    const sortedY = [...lines.keys()].sort((a, b) => b - a); // top of page first
+    const pageText = sortedY
+      .map(y => lines.get(y).sort((a, b) => a.x - b.x).map(p => p.s).join(' ').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
     text += pageText + '\n\n';
   }
   return text;
@@ -4030,16 +4049,19 @@ const parseInvoicePdf = async (pdfText, model) => callClaudeTool({
     '',
     'INVOICE LAYOUT FOR THIS USER:',
     '  • The LANDLORD\'s identity (company name, address, phone, registration number, VAT number) is printed in the TOP-RIGHT of the page.',
-    '  • The LANDLORD\'s banking details are printed in a separate banking block lower on the page (labelled BANKING DETAILS / EFT DETAILS / PAYMENT DETAILS).',
+    '  • The LANDLORD\'s banking details are printed in a separate banking block lower on the page (labelled BANKING DETAILS / EFT DETAILS / PAYMENT DETAILS / BANK DETAILS).',
     '  • The TENANT is the "Bill To" / "Invoice To" / "Customer" block (usually middle-left). You must NOT extract any tenant information. The schema you are calling has NO tenant fields — only landlord, deposit, and utilities.',
     '',
     'RULES:',
     '  1. ONLY extract landlord identity from the TOP-RIGHT region of the page.',
-    '  2. ONLY extract landlord banking details from the BANKING/EFT/PAYMENT block.',
-    '  3. Treat the "Bill To" / "Invoice To" / "Customer" block as if it does not exist. Never extract any field from there.',
-    '  4. If you cannot confidently identify the landlord in the top-right, OMIT the landlord block entirely. Do not fall back to the "Bill To" company.',
-    '  5. Deposit: amount in Rands from a line item labelled DEPOSIT / SECURITY DEPOSIT / REFUNDABLE DEPOSIT.',
-    '  6. Utilities: electricity, sewerage/water, refuse, rates if shown as separate line items.',
+    '  2. The BANKING block is REQUIRED — every SA commercial invoice has one. Look for any of these labels: BANKING DETAILS, EFT DETAILS, PAYMENT DETAILS, BANK DETAILS, BANK INFO, FOR PAYMENT, EFT BANKING. It is usually at the FOOTER of the invoice, below the line-items.',
+    '  3. From the banking block ALWAYS try to populate ALL FOUR fields: bankName, bankBranch, accountNumber, branchCode. Common SA banks: FNB / First National Bank, Standard Bank, Absa, Nedbank, Capitec, Investec.',
+    '  4. branchCode is usually a 6-digit number labelled "Branch Code" / "Sort Code" / "Universal Branch Code". If the invoice gives only one number under "Branch", that is the branch CODE (digits) — leave bankBranch (name) blank if only the code is shown.',
+    '  5. accountNumber: digits only, no spaces or hyphens. Strip any "A/C No:" or "Acc:" prefix.',
+    '  6. Treat the "Bill To" / "Invoice To" / "Customer" block as if it does not exist. Never extract any field from there.',
+    '  7. If you cannot confidently identify the landlord in the top-right, OMIT the landlord identity fields entirely. Do not fall back to the "Bill To" company. (But still try to extract the banking block — it stands alone.)',
+    '  8. Deposit: amount in Rands from a line item labelled DEPOSIT / SECURITY DEPOSIT / REFUNDABLE DEPOSIT.',
+    '  9. Utilities: electricity, sewerage/water, refuse, rates if shown as separate line items.',
     '',
     'FORMATTING:',
     '  • Money: plain numbers, no R, no commas, no thousand separators (e.g. 12345.67).',
@@ -4047,9 +4069,9 @@ const parseInvoicePdf = async (pdfText, model) => callClaudeTool({
     '  • Multi-line addresses: join with comma+space.',
     '  • Account numbers and branch codes: digits only, no spaces or hyphens.',
     '',
-    'Return ONLY fields you can read with high confidence. Omit any field that is ambiguous or absent.',
+    'Return ONLY fields you can read with high confidence — but treat banking-block fields as high-priority and do not omit them just because the layout is messy. Lines from a multi-column PDF may interleave; reconstruct the banking block from any labelled fragments you can identify.',
   ].join('\n'),
-  userText: `Extract landlord identity, landlord banking details, deposit, and utility line items from this invoice.\n\nReminder: The landlord is in the TOP-RIGHT of the page. The "Bill To" / "Customer" block is the tenant — IGNORE it completely. Do not place tenant details in landlord fields.\n\n${pdfText}`,
+  userText: `Extract landlord identity, landlord banking details, deposit, and utility line items from this invoice.\n\nReminder: The landlord is in the TOP-RIGHT. The "Bill To" / "Customer" block is the tenant — IGNORE it completely.\n\nThe BANKING DETAILS block is mandatory on SA commercial invoices — look in the footer. Extract bankName, bankBranch, accountNumber AND branchCode whenever any of them are present.\n\n${pdfText}`,
 });
 
 // ----- Merge parsed JSON into form, skipping dirty fields -----
@@ -5199,20 +5221,6 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
     }
   };
 
-  // Document file uploads
-  const onUploadDoc = (key, file) => {
-    if (!file) return upd(`documents.${key}`, null);
-    if (file.size > 10 * 1024 * 1024) {
-      showToast(`${file.name} exceeds 10MB`, 'error');
-      return;
-    }
-    if (!/\.(pdf|jpg|jpeg|png)$/i.test(file.name)) {
-      showToast(`${file.name} — only PDF, JPG, PNG allowed`, 'error');
-      return;
-    }
-    upd(`documents.${key}`, { name: file.name, size: file.size });
-  };
-
   // Annexures
   const toggleAnnexure = (letter) => {
     setForm(f => ({ ...f, annexureSelected: { ...f.annexureSelected, [letter]: !f.annexureSelected[letter] } }));
@@ -5236,8 +5244,64 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   // so the sidebar stays visible. `open` is kept as a no-op prop for backwards
   // compatibility with the old call site that mounted this in a Modal-style way.
 
+  // Lease-type chooser — blocks the form until the user picks one. Triggered
+  // on first load (blank form) and again whenever the user clicks the pill
+  // in the header to change their mind. We intentionally do not let the
+  // user dismiss the chooser without picking, because every downstream
+  // section (escalation defaults, addendum-only sections, etc.) depends on it.
+  const leaseTypeOptions = [
+    { id: 'New Lease', label: 'New Lease', desc: 'A brand-new agreement between landlord and tenant for a previously un-leased premises (or with a new tenant).', icon: Sparkles },
+    { id: 'Renewal',   label: 'Renewal',   desc: 'The current tenant is staying on. Carries forward most landlord/premises details — only term, rent and escalation typically change.', icon: RefreshCw },
+    { id: 'Addendum',  label: 'Addendum',  desc: 'A short amendment to an existing lease (e.g. variation of rent, change in premises area, deposit top-up). Not a full lease document.', icon: FileText },
+  ];
+  const pickLeaseType = (id) => {
+    upd('meta.leaseType', id);
+    logAction(`Lease type selected: ${id}`);
+    showToast(`Drafting as ${id}`, 'success');
+  };
+
   return (
     <div className="animate-fade-in-up">
+      {/* Lease-type chooser — appears whenever meta.leaseType is null. */}
+      {!form.meta.leaseType && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: 'rgba(15, 30, 46, 0.7)' }}
+        >
+          <div className="w-full max-w-2xl rounded-lg" style={{ backgroundColor: brand.ivory, border: `1px solid ${brand.borderDark}` }}>
+            <div className="px-6 py-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
+              <p className="text-xs tracking-[0.2em] uppercase mb-1" style={{ color: brand.gold }}>Before we start</p>
+              <h3 className="text-lg font-semibold tracking-tight" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>
+                What are you drafting today?
+              </h3>
+              <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
+                Pick one so we can show the right defaults and the right document template.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 p-6">
+              {leaseTypeOptions.map(opt => {
+                const Icon = opt.icon;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => pickLeaseType(opt.id)}
+                    className="text-left rounded p-4 transition-all hover:-translate-y-0.5"
+                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, boxShadow: '0 1px 2px rgba(15,30,46,0.04)' }}
+                  >
+                    <div className="w-9 h-9 rounded flex items-center justify-center mb-2" style={{ backgroundColor: brand.goldPale, color: brand.gold }}>
+                      <Icon size={18} />
+                    </div>
+                    <p className="font-semibold text-sm mb-1" style={{ color: brand.navy }}>{opt.label}</p>
+                    <p className="text-[11px] leading-snug" style={{ color: brand.textMuted }}>{opt.desc}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header banner — matches the app's navy + gold theme */}
       <div className="px-4 md:px-6 py-4 -mx-4 md:-mx-8 -mt-4 md:-mt-6 mb-0" style={{ backgroundColor: brand.navy }}>
         <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -5249,6 +5313,17 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
               <p className="text-xs tracking-[0.2em] uppercase" style={{ color: brand.gold }}>Tools</p>
               <h1 className="text-xl" style={{ color: '#fff', fontFamily: 'Georgia, serif', fontWeight: 600 }}>Automated Lease Drafting</h1>
             </div>
+            {form.meta.leaseType && (
+              <button
+                type="button"
+                onClick={() => upd('meta.leaseType', null)}
+                className="text-[11px] px-2 py-1 rounded uppercase tracking-wider hover:opacity-80"
+                style={{ backgroundColor: brand.gold, color: brand.navy, fontWeight: 600 }}
+                title="Change lease type"
+              >
+                {form.meta.leaseType}
+              </button>
+            )}
           </div>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 px-3 py-1.5 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }}>
@@ -5375,38 +5450,6 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
             />
           </Card>
 
-          <Card className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <p className="text-xs font-semibold tracking-wider uppercase" style={{ color: brand.navy }}>Upload Documents</p>
-              <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: brand.cream, color: brand.navy }}>
-                {Object.values(form.documents).filter(Boolean).length} files
-              </span>
-            </div>
-            {[
-              { key: 'landlordCIPC', label: 'Landlord CIPC', required: false },
-              { key: 'tenantCIPC', label: 'Tenant CIPC', required: true },
-              { key: 'tenantID', label: 'Tenant ID', required: false },
-              { key: 'suretyID', label: 'Surety ID', required: true },
-            ].map(d => (
-              <div key={d.key} className="mb-2">
-                <label className="block text-[11px] mb-1" style={{ color: brand.textMuted }}>
-                  {d.label} {d.required && <span style={{ color: brand.danger }}>*</span>}
-                </label>
-                <input
-                  type="file"
-                  accept=".pdf,.jpg,.jpeg,.png"
-                  onChange={(e) => onUploadDoc(d.key, e.target.files?.[0])}
-                  className="block w-full text-[11px]"
-                  style={{ color: brand.text }}
-                />
-                {form.documents[d.key] && (
-                  <p className="text-[10px] mt-1 flex items-center gap-1" style={{ color: brand.success }}>
-                    <CheckCircle2 size={10} /> {form.documents[d.key].name}
-                  </p>
-                )}
-              </div>
-            ))}
-          </Card>
         </aside>
 
         {/* Main form */}
