@@ -10324,39 +10324,36 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   const [diagRunning, setDiagRunning] = useState(false);
 
   const runDiagnostic = async () => {
-    const token = (pi.cachedAccessToken || '').trim();
-    if (!token) {
-      setDiagResult({ error: 'No token available. Run OAuth Connect first.' });
-      return;
-    }
     setDiagRunning(true);
-    const trimmedToken = token;
+    const path = diagPath.startsWith('/') ? diagPath : `/${diagPath}`;
     const base = (pi.baseUrl || propertyInspectAPI.defaultBaseUrl).replace(/\/+$/, '');
-    const fullUrl = `${base}${diagPath.startsWith('/') ? '' : '/'}${diagPath}`;
-    const fetchedUrl = localizePIForDev(fullUrl);
+    const fullUrl = `${base}${path}`;
     const reqHeaders = {
-      'Authorization': `Bearer ${trimmedToken.slice(0, 12)}…${trimmedToken.slice(-8)}`,
+      'Authorization': 'Bearer <stored server-side>',
       'Accept': 'application/json',
     };
     try {
-      const res = await fetch(fetchedUrl, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${trimmedToken}`,
-          'Accept': 'application/json',
-        },
-      });
-      const respHeaders = {};
-      res.headers.forEach((v, k) => { respHeaders[k] = v; });
-      const text = await res.text().catch(() => '');
+      // Route through the backend proxy. Browser-direct fetches to
+      // api.propertyinspect.com are blocked in production by both CSP
+      // (connect-src 'self') and PI's CORS policy, AND the access token
+      // is held in the server vault — not the browser. The proxy attaches
+      // the token server-side and returns PI's response verbatim.
+      const body = await api.proxy.piGet(path);
       setDiagResult({
-        request: { url: fullUrl, fetchedAs: fetchedUrl, method: 'GET', headers: reqHeaders },
-        response: { status: res.status, statusText: res.statusText, headers: respHeaders, body: text.slice(0, 2000) },
+        request: { url: fullUrl, fetchedAs: `/api/proxy/property-inspect/get?path=${path}`, method: 'GET', headers: reqHeaders },
+        response: { status: 200, statusText: 'OK', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body, null, 2).slice(0, 2000) },
       });
     } catch (err) {
+      // ApiError carries the upstream status + body so we can show the
+      // real PI response, not just "fetch failed".
+      const status = err?.status || 0;
+      const upstreamMessage = err?.body?.message || err?.body?.error || err?.message || String(err);
+      const upstreamBody = err?.body ? JSON.stringify(err.body, null, 2) : (err?.message || String(err));
       setDiagResult({
-        request: { url: fullUrl, fetchedAs: fetchedUrl, method: 'GET', headers: reqHeaders },
-        response: { error: err.message },
+        request: { url: fullUrl, fetchedAs: `/api/proxy/property-inspect/get?path=${path}`, method: 'GET', headers: reqHeaders },
+        response: status
+          ? { status, statusText: upstreamMessage, headers: {}, body: upstreamBody.slice(0, 2000) }
+          : { error: upstreamMessage },
       });
     } finally {
       setDiagRunning(false);
