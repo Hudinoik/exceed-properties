@@ -376,7 +376,15 @@ const localizePIForDev = (url) => {
 const propertyInspectAPI = {
   defaultBaseUrl: 'https://api.propertyinspect.com',
   defaultTokenUrl: 'https://api.propertyinspect.com/oauth/token',
-  defaultAuthorizeUrl: 'https://api.propertyinspect.com/oauth/authorize',
+  // PI uses Laravel Passport: the user-facing authorize page is on the
+  // 'my.' host (their app shell). Pointing this at api.propertyinspect.com
+  // hits a JSON-only endpoint that returns {"message":"Unauthenticated."}
+  // when there's no Bearer token — the symptom users saw when connecting.
+  defaultAuthorizeUrl: 'https://my.propertyinspect.com/oauth/authorize',
+  // The OLD bad default — if a user has this saved in their integration
+  // state from a previous version, we silently rewrite it to the right
+  // host below in the PI card's form init.
+  legacyBadAuthorizeUrl: 'https://api.propertyinspect.com/oauth/authorize',
   defaultRedirectUri: typeof window !== 'undefined'
     ? `${window.location.origin}/oauth/pi-callback`
     : 'http://localhost:5173/oauth/pi-callback',
@@ -10033,10 +10041,19 @@ const PI_SAMPLE_INSPECTIONS = {
 // ============================================================
 const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToast, logAction }) => {
   const pi = integrations.propertyInspect || {};
+  // Auto-migrate the old bad authorize URL — anyone who connected on a
+  // previous build still has 'api.propertyinspect.com/oauth/authorize' in
+  // their integration state and would keep getting Unauthenticated.
+  const resolveAuthorizeUrl = (stored) => {
+    if (!stored || stored === propertyInspectAPI.legacyBadAuthorizeUrl) {
+      return propertyInspectAPI.defaultAuthorizeUrl;
+    }
+    return stored;
+  };
   const [form, setForm] = useState({
     baseUrl: pi.baseUrl || propertyInspectAPI.defaultBaseUrl,
     tokenUrl: pi.tokenUrl || propertyInspectAPI.defaultTokenUrl,
-    authorizeUrl: pi.authorizeUrl || propertyInspectAPI.defaultAuthorizeUrl,
+    authorizeUrl: resolveAuthorizeUrl(pi.authorizeUrl),
     redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
     clientId: pi.clientId || '',
     clientSecret: pi.clientSecret || '',
@@ -10052,12 +10069,13 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     setForm({
       baseUrl: pi.baseUrl || propertyInspectAPI.defaultBaseUrl,
       tokenUrl: pi.tokenUrl || propertyInspectAPI.defaultTokenUrl,
-      authorizeUrl: pi.authorizeUrl || propertyInspectAPI.defaultAuthorizeUrl,
+      authorizeUrl: resolveAuthorizeUrl(pi.authorizeUrl),
       redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
       clientId: pi.clientId || '',
       clientSecret: pi.clientSecret || '',
     });
     setDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pi.baseUrl, pi.tokenUrl, pi.authorizeUrl, pi.redirectUri, pi.clientId, pi.clientSecret]);
 
   const updateField = (key, value) => {
