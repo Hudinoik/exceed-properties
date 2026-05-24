@@ -59,7 +59,10 @@ const request = async (path, { method = 'GET', body, headers = {} } = {}) => {
     catch { /* non-JSON response */ }
   }
   if (!res.ok) {
-    const msg = json?.error || `HTTP ${res.status}`;
+    // Laravel-style upstream responses (Property Inspect etc.) use `message`,
+    // not `error`. Surface whichever is present so callers can show the
+    // actual reason instead of a generic "HTTP 401".
+    const msg = json?.error || json?.message || `HTTP ${res.status}`;
     throw new ApiError(msg, res.status, json);
   }
   return json;

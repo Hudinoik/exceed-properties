@@ -10281,23 +10281,24 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       logAction(`Pulled ${normalized.length} inspection(s) from Property Inspect`);
       showToast(`Pulled ${normalized.length} inspection${normalized.length === 1 ? '' : 's'} from Property Inspect`, 'success');
     } catch (err) {
-      // Live API failed (most commonly: PI's scope middleware on /inspections).
-      // Fall back to PI-shaped sample data so the integration pipeline still
-      // produces a verifiable result downstream. No PI data was sent or modified.
-      const sampleList = PI_SAMPLE_INSPECTIONS.data.map(normalizePI).filter(Boolean);
+      // Surface the real reason instead of silently swapping in sample data.
+      // The user clicked "Pull Inspections" — they want to know what failed
+      // (token scope, account permissions, wrong endpoint, etc.) so they
+      // can fix it. The "Load Sample Data" button remains available for
+      // anyone who explicitly wants the PI-shaped demo records.
+      const detail = err.message || String(err);
+      const status = err.status ? ` (HTTP ${err.status})` : '';
       setIntegrations({
         ...integrations,
         propertyInspect: {
           ...pi,
-          importedInspections: sampleList,
-          importedCount: sampleList.length,
           lastSync: new Date().toISOString(),
-          lastSyncStatus: 'fallback',
-          lastSyncError: `Live API blocked (${err.message.slice(0, 200)}). Loaded sample data so downstream pages still work.`,
+          lastSyncStatus: 'error',
+          lastSyncError: `Live pull failed${status}: ${detail}`,
         },
       });
-      logAction(`Live PI pull failed (${err.message.split('\n')[0].slice(0, 100)}); loaded sample data`);
-      showToast('Live API blocked — loaded PI-shaped sample data', 'error');
+      logAction(`Live PI pull failed${status}: ${detail.split('\n')[0].slice(0, 120)}`);
+      showToast(`Live pull failed${status}: ${detail.slice(0, 120)}`, 'error');
     } finally {
       setFetching(false);
     }
