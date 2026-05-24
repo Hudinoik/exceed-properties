@@ -1880,19 +1880,26 @@ const Field = ({ label, error, required, children, hint }) => (
   </div>
 );
 
-const Input = ({ error, ...props }) => (
-  <input
-    {...props}
-    className="w-full px-3 py-2 text-sm rounded outline-none transition-all"
-    style={{
-      backgroundColor: '#fff',
-      border: `1px solid ${error ? brand.danger : brand.border}`,
-      color: brand.text,
-    }}
-    onFocus={(e) => { if (!error) e.target.style.borderColor = brand.gold; }}
-    onBlur={(e) => { e.target.style.borderColor = error ? brand.danger : brand.border; }}
-  />
-);
+const Input = ({ error, style, disabled, readOnly, ...props }) => {
+  const locked = disabled || readOnly;
+  return (
+    <input
+      {...props}
+      disabled={disabled}
+      readOnly={readOnly}
+      className="w-full px-3 py-2 text-sm rounded outline-none transition-all"
+      style={{
+        backgroundColor: locked ? brand.cream : '#fff',
+        border: `1px solid ${error ? brand.danger : brand.border}`,
+        color: brand.text,
+        cursor: locked ? 'not-allowed' : 'text',
+        ...style,
+      }}
+      onFocus={(e) => { if (!error && !locked) e.target.style.borderColor = brand.gold; }}
+      onBlur={(e) => { e.target.style.borderColor = error ? brand.danger : brand.border; }}
+    />
+  );
+};
 
 const Select = ({ error, children, ...props }) => (
   <select
@@ -9650,19 +9657,20 @@ const JibbleIntegrationCard = ({ showToast, logAction }) => {
             <Field
               label="API Key ID (Client ID)"
               required={!metadata.clientId?.hasValue}
-              hint={metadata.clientId?.hasValue ? `Currently stored: •••• ${metadata.clientId.last4}` : 'The first value Jibble shows you (UUID format)'}
+              hint={metadata.clientId?.hasValue ? `Currently stored: •••• ${metadata.clientId.last4}${hasStoredCreds ? ' — Disconnect to edit' : ''}` : 'The first value Jibble shows you (UUID format)'}
             >
               <Input
                 value={clientId}
                 onChange={(e) => { setClientId(e.target.value); setDirty(true); }}
                 placeholder={metadata.clientId?.hasValue ? 'Leave blank to keep existing' : 'e.g. af43a10a-c4f8-4c7a-a083-...'}
                 autoComplete="off"
+                disabled={hasStoredCreds}
               />
             </Field>
             <Field
               label="API Key Secret"
               required={!metadata.clientSecret?.hasValue}
-              hint={metadata.clientSecret?.hasValue ? `Currently stored: •••• ${metadata.clientSecret.last4}` : 'The longer secret string. Treat like a password.'}
+              hint={metadata.clientSecret?.hasValue ? `Currently stored: •••• ${metadata.clientSecret.last4}${hasStoredCreds ? ' — Disconnect to edit' : ''}` : 'The longer secret string. Treat like a password.'}
             >
               <div className="flex gap-2">
                 <input
@@ -9671,19 +9679,21 @@ const JibbleIntegrationCard = ({ showToast, logAction }) => {
                   onChange={(e) => { setClientSecret(e.target.value); setDirty(true); }}
                   placeholder={metadata.clientSecret?.hasValue ? 'Leave blank to keep existing' : 'Paste your API Key Secret here...'}
                   className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                  style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                  style={{ backgroundColor: hasStoredCreds ? brand.cream : '#fff', border: `1px solid ${brand.border}`, color: brand.text, cursor: hasStoredCreds ? 'not-allowed' : 'text' }}
                   autoComplete="off" spellCheck="false"
+                  disabled={hasStoredCreds}
                 />
                 <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
                   {showSecret ? 'Hide' : 'Show'}
                 </button>
               </div>
             </Field>
-            <Field label="Organization ID" hint="Optional — only required for some endpoints">
+            <Field label="Organization ID" hint={hasStoredCreds ? 'Optional — Disconnect to edit' : 'Optional — only required for some endpoints'}>
               <Input
                 value={organizationId}
                 onChange={(e) => { setOrganizationId(e.target.value); setDirty(true); }}
                 placeholder="Optional"
+                disabled={hasStoredCreds}
               />
             </Field>
           </div>
@@ -9870,10 +9880,10 @@ const DocuSignIntegrationCard = ({ integrations, setIntegrations, showToast, log
                 <option value="prod">{DOCUSIGN_ENVIRONMENTS.prod.label}</option>
               </Select>
             </Field>
-            <Field label="Integration Key (Client ID)" required hint="UUID — from Apps & Keys → your app">
-              <Input value={form.integrationKey} onChange={(e) => updateField('integrationKey', e.target.value)} placeholder="e.g. 1d4a2b8e-..." autoComplete="off" />
+            <Field label="Integration Key (Client ID)" required hint={ds.connected ? 'UUID from Apps & Keys → your app — Disconnect to edit' : 'UUID — from Apps & Keys → your app'}>
+              <Input value={form.integrationKey} onChange={(e) => updateField('integrationKey', e.target.value)} placeholder="e.g. 1d4a2b8e-..." autoComplete="off" disabled={ds.connected} />
             </Field>
-            <Field label="Client Secret" required hint="Generate a secret key in your DocuSign app. Stored in this browser.">
+            <Field label="Client Secret" required hint={ds.connected ? 'Stored in this browser — Disconnect to edit' : 'Generate a secret key in your DocuSign app. Stored in this browser.'}>
               <div className="flex gap-2">
                 <input
                   type={showSecret ? 'text' : 'password'}
@@ -9881,16 +9891,17 @@ const DocuSignIntegrationCard = ({ integrations, setIntegrations, showToast, log
                   onChange={(e) => updateField('clientSecret', e.target.value)}
                   placeholder="Paste your secret here..."
                   className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                  style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                  style={{ backgroundColor: ds.connected ? brand.cream : '#fff', border: `1px solid ${brand.border}`, color: brand.text, cursor: ds.connected ? 'not-allowed' : 'text' }}
                   autoComplete="off" spellCheck="false"
+                  disabled={ds.connected}
                 />
                 <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
                   {showSecret ? 'Hide' : 'Show'}
                 </button>
               </div>
             </Field>
-            <Field label="Redirect URI" required hint="MUST be added to your DocuSign app's Redirect URIs list">
-              <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={defaultRedirect} />
+            <Field label="Redirect URI" required hint={ds.connected ? "Disconnect to edit — must remain registered in your DocuSign app's Redirect URIs list" : "MUST be added to your DocuSign app's Redirect URIs list"}>
+              <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={defaultRedirect} disabled={ds.connected} />
             </Field>
           </div>
 
@@ -10060,16 +10071,17 @@ const AnthropicIntegrationCard = ({ showToast, logAction }) => {
             </span>
           </div>
 
-          <Field label="API Key" required={!hasStoredKey} hint={hasStoredKey ? `Currently stored: •••• ${metadata.apiKey.last4} (${metadata.apiKey.length} chars). Paste a new key to replace.` : 'Starts with sk-ant-api03-...'}>
+          <Field label="API Key" required={!hasStoredKey} hint={hasStoredKey ? `Currently stored: •••• ${metadata.apiKey.last4} (${metadata.apiKey.length} chars) — Disconnect to replace.` : 'Starts with sk-ant-api03-...'}>
             <div className="flex gap-2">
               <input
                 type={showKey ? 'text' : 'password'}
                 value={apiKey}
                 onChange={(e) => { setApiKey(e.target.value); setDirty(true); }}
-                placeholder={hasStoredKey ? 'Leave blank to keep the existing key' : 'Paste your Anthropic API key here...'}
+                placeholder={hasStoredKey ? 'Disconnect to enter a new key' : 'Paste your Anthropic API key here...'}
                 autoComplete="off"
                 className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                style={{ backgroundColor: hasStoredKey ? brand.cream : '#fff', border: `1px solid ${brand.border}`, color: brand.text, cursor: hasStoredKey ? 'not-allowed' : 'text' }}
+                disabled={hasStoredKey}
               />
               <button type="button" onClick={() => setShowKey(s => !s)} className="px-3 py-2 text-xs rounded" style={{ border: `1px solid ${brand.border}`, color: brand.text }}>
                 {showKey ? 'Hide' : 'Show'}
@@ -10740,10 +10752,10 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
 
           {/* Credentials */}
           <div className="space-y-3 mb-4">
-            <Field label="Client ID" required hint="From your Property Inspect API Application">
-              <Input value={form.clientId} onChange={(e) => updateField('clientId', e.target.value)} placeholder="e.g. 1d4a2b8e-..." autoComplete="off" />
+            <Field label="Client ID" required hint={pi.connected ? 'From your Property Inspect API Application — Disconnect to edit' : 'From your Property Inspect API Application'}>
+              <Input value={form.clientId} onChange={(e) => updateField('clientId', e.target.value)} placeholder="e.g. 1d4a2b8e-..." autoComplete="off" disabled={pi.connected} />
             </Field>
-            <Field label="Client Secret" required hint="Stored in this browser. Treat it like a password.">
+            <Field label="Client Secret" required hint={pi.connected ? 'Stored in this browser — Disconnect to edit' : 'Stored in this browser. Treat it like a password.'}>
               <div className="flex gap-2">
                 <input
                   type={showSecret ? 'text' : 'password'}
@@ -10751,8 +10763,9 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                   onChange={(e) => updateField('clientSecret', e.target.value)}
                   placeholder="Paste your Client Secret here..."
                   className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                  style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                  style={{ backgroundColor: pi.connected ? brand.cream : '#fff', border: `1px solid ${brand.border}`, color: brand.text, cursor: pi.connected ? 'not-allowed' : 'text' }}
                   autoComplete="off" spellCheck="false"
+                  disabled={pi.connected}
                 />
                 <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
                   {showSecret ? 'Hide' : 'Show'}
@@ -10771,8 +10784,9 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                   setDirty(true);
                   setTestResult(null);
                 }}
+                disabled={pi.connected}
                 className="text-xs underline"
-                style={{ color: brand.gold }}
+                style={{ color: pi.connected ? brand.textMuted : brand.gold, cursor: pi.connected ? 'not-allowed' : 'pointer', opacity: pi.connected ? 0.5 : 1 }}
               >
                 Reset URLs to defaults
               </button>
@@ -10785,20 +10799,20 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
             )}
             {showAdvanced && (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
-                <Field label="API Base URL" hint="The host that serves data endpoints">
-                  <Input value={form.baseUrl} onChange={(e) => updateField('baseUrl', e.target.value)} placeholder={propertyInspectAPI.defaultBaseUrl} />
+                <Field label="API Base URL" hint={pi.connected ? 'The host that serves data endpoints — Disconnect to edit' : 'The host that serves data endpoints'}>
+                  <Input value={form.baseUrl} onChange={(e) => updateField('baseUrl', e.target.value)} placeholder={propertyInspectAPI.defaultBaseUrl} disabled={pi.connected} />
                 </Field>
-                <Field label="Authorize URL" hint="Where the user is redirected to approve access">
-                  <Input value={form.authorizeUrl} onChange={(e) => updateField('authorizeUrl', e.target.value)} placeholder={propertyInspectAPI.defaultAuthorizeUrl} />
+                <Field label="Authorize URL" hint={pi.connected ? 'Where the user is redirected to approve access — Disconnect to edit' : 'Where the user is redirected to approve access'}>
+                  <Input value={form.authorizeUrl} onChange={(e) => updateField('authorizeUrl', e.target.value)} placeholder={propertyInspectAPI.defaultAuthorizeUrl} disabled={pi.connected} />
                 </Field>
-                <Field label="OAuth Token URL" hint="Exchanges the authorization code for tokens">
-                  <Input value={form.tokenUrl} onChange={(e) => updateField('tokenUrl', e.target.value)} placeholder={propertyInspectAPI.defaultTokenUrl} />
+                <Field label="OAuth Token URL" hint={pi.connected ? 'Exchanges the authorization code for tokens — Disconnect to edit' : 'Exchanges the authorization code for tokens'}>
+                  <Input value={form.tokenUrl} onChange={(e) => updateField('tokenUrl', e.target.value)} placeholder={propertyInspectAPI.defaultTokenUrl} disabled={pi.connected} />
                 </Field>
-                <Field label="Redirect URI" required hint="MUST exactly match a Redirect URL registered in your PI API app">
-                  <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={propertyInspectAPI.defaultRedirectUri} />
+                <Field label="Redirect URI" required hint={pi.connected ? "Disconnect to edit — must still match a Redirect URL registered in your PI API app" : "MUST exactly match a Redirect URL registered in your PI API app"}>
+                  <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={propertyInspectAPI.defaultRedirectUri} disabled={pi.connected} />
                 </Field>
-                <Field label="OAuth Scope" hint="'*' = all scopes the app has been granted (Passport wildcard). If PI rejects, try a specific name like 'inspections.read' or leave blank.">
-                  <Input value={form.scope} onChange={(e) => updateField('scope', e.target.value)} placeholder="*" />
+                <Field label="OAuth Scope" hint={pi.connected ? "Disconnect to edit. '*' = all scopes (Passport wildcard)" : "'*' = all scopes the app has been granted (Passport wildcard). If PI rejects, try a specific name like 'inspections.read' or leave blank."}>
+                  <Input value={form.scope} onChange={(e) => updateField('scope', e.target.value)} placeholder="*" disabled={pi.connected} />
                 </Field>
               </div>
             )}
