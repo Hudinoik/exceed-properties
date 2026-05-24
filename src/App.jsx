@@ -10057,6 +10057,11 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
     clientId: pi.clientId || '',
     clientSecret: pi.clientSecret || '',
+    // Default to '*' — Laravel Passport wildcard. PI's authorize page
+    // will show the user the actual scopes available for our app; they
+    // approve which ones to grant. Without a scope param, PI issues a
+    // token with NO scopes and /inspections returns "Invalid scope(s)".
+    scope: pi.scope ?? '*',
   });
   const [showSecret, setShowSecret] = useState(false);
   const [fetching, setFetching] = useState(false);
@@ -10073,10 +10078,11 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
       clientId: pi.clientId || '',
       clientSecret: pi.clientSecret || '',
+      scope: pi.scope ?? '*',
     });
     setDirty(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pi.baseUrl, pi.tokenUrl, pi.authorizeUrl, pi.redirectUri, pi.clientId, pi.clientSecret]);
+  }, [pi.baseUrl, pi.tokenUrl, pi.authorizeUrl, pi.redirectUri, pi.clientId, pi.clientSecret, pi.scope]);
 
   const updateField = (key, value) => {
     setForm(f => ({ ...f, [key]: value }));
@@ -10137,6 +10143,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       redirectUri: (form.redirectUri || '').trim(),
       authorizeUrl: (form.authorizeUrl || '').trim(),
       baseUrl: (form.baseUrl || '').trim(),
+      scope: (form.scope || '').trim(),
     };
 
     if (!cleaned.clientId || !cleaned.clientSecret) {
@@ -10190,15 +10197,20 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       return;
     }
 
-    // No scope param — PI's docs don't reference scopes; the user's app
-    // permissions are controlled in PI's admin, not in the OAuth request.
+    // Request a scope. Without this, PI (Laravel Passport) issues a token
+    // with no scopes attached, and scope-protected endpoints like
+    // /inspections respond with 403 "Invalid scope(s) provided". '*' is the
+    // Passport wildcard convention — the consent screen lists whatever the
+    // PI admin has configured for our app and the user approves.
+    const scope = (form.scope || '').trim();
     const authUrl = propertyInspectAPI.buildAuthorizeUrl({
       clientId: cleaned.clientId,
       redirectUri: cleaned.redirectUri,
       state,
+      scope: scope || undefined,
       authorizeUrl: cleaned.authorizeUrl,
     });
-    logAction('Initiated Property Inspect OAuth flow');
+    logAction(`Initiated Property Inspect OAuth flow (scope: ${scope || '<none>'})`);
     window.location.href = authUrl;
   };
 
@@ -10491,6 +10503,9 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                 </Field>
                 <Field label="Redirect URI" required hint="MUST exactly match a Redirect URL registered in your PI API app">
                   <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={propertyInspectAPI.defaultRedirectUri} />
+                </Field>
+                <Field label="OAuth Scope" hint="'*' = all scopes the app has been granted (Passport wildcard). If PI rejects, try a specific name like 'inspections.read' or leave blank.">
+                  <Input value={form.scope} onChange={(e) => updateField('scope', e.target.value)} placeholder="*" />
                 </Field>
               </div>
             )}
