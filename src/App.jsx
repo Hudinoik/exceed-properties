@@ -10307,26 +10307,32 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     setFetching(true);
     const report = {}; // path -> { ok, count, status, message, sample }
     let inspections = [];
-    for (const { path, label } of PI_ENDPOINTS) {
-      try {
-        const result = await api.proxy.piGet(path);
-        const list = extractList(result);
-        report[path] = {
-          ok: true,
-          label,
-          count: list.length,
-          sample: list.slice(0, 3),
-        };
-        if (path === '/inspections') {
-          inspections = list.map(normalizePI).filter(Boolean);
+    let probeError = null;
+    try {
+      // One server round-trip — the backend fans out to PI in parallel,
+      // collects per-path { ok, status, body|message } and returns a map.
+      // The old client-side serial loop hit Render's request timeout on
+      // endpoint 5+ and returned generic 502s with no body.
+      const { report: serverReport } = await api.proxy.piProbe(PI_ENDPOINTS.map(e => e.path));
+      for (const { path, label } of PI_ENDPOINTS) {
+        const r = serverReport[path] || { ok: false, status: 0, message: 'no result' };
+        if (r.ok) {
+          const list = extractList(r.body);
+          report[path] = { ok: true, label, count: list.length, sample: list.slice(0, 3) };
+          if (path === '/inspections') {
+            inspections = list.map(normalizePI).filter(Boolean);
+          }
+        } else {
+          const message = r.message || r.body?.message || r.body?.error || (r.body?.raw ? String(r.body.raw).slice(0, 200) : `HTTP ${r.status}`);
+          report[path] = { ok: false, label, status: r.status, message };
         }
-      } catch (err) {
-        report[path] = {
-          ok: false,
-          label,
-          status: err?.status || 0,
-          message: err?.body?.message || err?.body?.error || err?.message || String(err),
-        };
+      }
+    } catch (err) {
+      probeError = err?.body?.message || err?.body?.error || err?.message || String(err);
+      // Fall back to per-endpoint failure rows so the UI still shows the
+      // same shape (otherwise the report panel just disappears).
+      for (const { path, label } of PI_ENDPOINTS) {
+        report[path] = { ok: false, label, status: err?.status || 0, message: probeError };
       }
     }
 

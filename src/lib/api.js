@@ -143,6 +143,12 @@ export const proxy = {
   async piGet(path) {
     return request(`/api/proxy/property-inspect/get?path=${encodeURIComponent(path)}`);
   },
+  async piProbe(paths) {
+    return request('/api/proxy/property-inspect/probe', {
+      method: 'POST',
+      body: { paths },
+    });
+  },
   async jibbleTest() {
     return request('/api/proxy/jibble/test', { method: 'POST', body: {} });
   },

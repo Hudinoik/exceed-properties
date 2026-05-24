@@ -227,8 +227,16 @@ router.post('/property-inspect/exchange-code', async (req, res) => {
   }
 });
 
-// Generic GET-only forwarder for PI. Path is sanitized to prevent
-// access to non-/data endpoints (no `/oauth/*`, no traversal).
+// Path validation — used by both /get and /probe.
+const isValidPIPath = (p) =>
+  typeof p === 'string' &&
+  p.startsWith('/') &&
+  !p.includes('..') &&
+  !p.startsWith('/oauth') &&
+  !/[\x00-\x1f]/.test(p);
+
+// Single-path GET forwarder. Path is sanitized to prevent access to
+// non-data endpoints (no `/oauth/*`, no traversal).
 router.get('/property-inspect/get', async (req, res) => {
   const cfg = readIntegration(req.session.userId, 'propertyInspect');
   if (!cfg.accessToken) {
@@ -236,12 +244,7 @@ router.get('/property-inspect/get', async (req, res) => {
   }
   const token = cfg.accessToken;
   const targetPath = String(req.query.path || '/inspections');
-  if (
-    !targetPath.startsWith('/') ||
-    targetPath.includes('..') ||
-    targetPath.startsWith('/oauth') ||
-    /[\x00-\x1f]/.test(targetPath)
-  ) {
+  if (!isValidPIPath(targetPath)) {
     return res.status(400).json({ error: 'Invalid path' });
   }
   const base = cfg.baseUrl || 'https://api.propertyinspect.com';
@@ -254,6 +257,60 @@ router.get('/property-inspect/get', async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
+});
+
+// Batch probe — accepts a list of paths, fires them in parallel against
+// PI, and returns a per-path report ({ ok, status, body|message }). Used
+// by the integration card's Pull Inspections so 9 separate browser→Render
+// round-trips collapse into one, and the underlying PI calls run in
+// parallel server-side instead of being serialized by client awaits.
+router.post('/property-inspect/probe', async (req, res) => {
+  const cfg = readIntegration(req.session.userId, 'propertyInspect');
+  if (!cfg.accessToken) {
+    return res.status(400).json({ error: 'No PI token available' });
+  }
+  const token = cfg.accessToken;
+  const base = cfg.baseUrl || 'https://api.propertyinspect.com';
+  const paths = Array.isArray(req.body?.paths) ? req.body.paths : [];
+  if (paths.length === 0) return res.status(400).json({ error: 'paths[] required' });
+  if (paths.length > 20) return res.status(400).json({ error: 'too many paths (max 20)' });
+  const invalid = paths.filter(p => !isValidPIPath(p));
+  if (invalid.length) return res.status(400).json({ error: `invalid path(s): ${invalid.join(', ')}` });
+
+  // Fire all PI requests concurrently. Each is independent; we don't want
+  // a slow endpoint to delay the rest. 25s budget per request is generous
+  // — if PI hangs longer than that we'd rather see a clean timeout in the
+  // report than have Render's HTTP layer kill the whole probe with a 502.
+  const probeOne = async (p) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    try {
+      const upstream = await fetch(`${base}${p}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        signal: ctrl.signal,
+      });
+      const text = await upstream.text();
+      let json = null;
+      try { json = text ? JSON.parse(text) : null; } catch { /* keep text */ }
+      return {
+        ok: upstream.status >= 200 && upstream.status < 300,
+        status: upstream.status,
+        body: json !== null ? json : { raw: text.slice(0, 2000) },
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 0,
+        message: err.name === 'AbortError' ? 'timeout (>25s)' : err.message,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const results = await Promise.all(paths.map(probeOne));
+  const report = {};
+  paths.forEach((p, i) => { report[p] = results[i]; });
+  res.json({ report });
 });
 
 // ----------------------------------------------------------------
