@@ -10050,6 +10050,14 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     }
     return stored;
   };
+  const DEFAULT_PI_SCOPES = 'read-inspections read-properties read-clients read-staff read-templates read-contacts';
+  // PI silently ignores the '*' wildcard — every endpoint then 403s with
+  // "Invalid scope(s) provided." If a previous build stored '*', swap it
+  // for the explicit-name default so the next Connect issues a real token.
+  const resolveScope = (stored) => {
+    if (!stored || stored === '*') return DEFAULT_PI_SCOPES;
+    return stored;
+  };
   const [form, setForm] = useState({
     baseUrl: pi.baseUrl || propertyInspectAPI.defaultBaseUrl,
     tokenUrl: pi.tokenUrl || propertyInspectAPI.defaultTokenUrl,
@@ -10057,11 +10065,13 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
     clientId: pi.clientId || '',
     clientSecret: pi.clientSecret || '',
-    // Default to '*' — Laravel Passport wildcard. PI's authorize page
-    // will show the user the actual scopes available for our app; they
-    // approve which ones to grant. Without a scope param, PI issues a
-    // token with NO scopes and /inspections returns "Invalid scope(s)".
-    scope: pi.scope ?? '*',
+    // PI silently ignores '*' (Passport wildcard), so we instead ask for
+    // a space-separated list of explicit read-* scopes that match the
+    // resources in PI's API docs sidebar (Clients, Properties, etc.).
+    // PI's authorize page accepts whichever it recognizes and drops the
+    // unknown ones. If the user finds the canonical names in PI's docs,
+    // they can override this list in the Scope field.
+    scope: resolveScope(pi.scope),
   });
   const [showSecret, setShowSecret] = useState(false);
   const [fetching, setFetching] = useState(false);
@@ -10078,7 +10088,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
       clientId: pi.clientId || '',
       clientSecret: pi.clientSecret || '',
-      scope: pi.scope ?? '*',
+      scope: resolveScope(pi.scope),
     });
     setDirty(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
