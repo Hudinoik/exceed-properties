@@ -2683,6 +2683,23 @@ const fmtTime = (iso) => iso
   ? new Date(iso).toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit', hour12: false })
   : '—';
 
+// Same as fmtTime but includes seconds (used in the per-person Daily Work Report)
+const fmtTimeSec = (iso) => iso
+  ? new Date(iso).toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+  : '—';
+
+// Format a decimal-hours value as "Xh Ym" (e.g., 1.05 → "1h 3m"). Negative
+// values keep the sign on the hours component, matching how a "balance left"
+// reads when someone has clocked more than the target ("-0h 12m").
+const fmtHoursMin = (hours) => {
+  if (hours === null || hours === undefined || Number.isNaN(hours)) return '—';
+  const negative = hours < 0;
+  const totalMin = Math.round(Math.abs(hours) * 60);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${negative ? '-' : ''}${h}h ${m}m`;
+};
+
 const resolveLocation = (entry, projectsMap) => {
   const projectName = entry?.projectId && projectsMap?.[entry.projectId];
   return projectName || entry?.address || entry?.location?.name || entry?.locationName || '—';
@@ -2699,6 +2716,8 @@ const pairClockEvents = (rawEntries, projectsMap = {}) => {
       date: entry.belongsToDate || entry.date || (entry.in ? String(entry.in).split('T')[0] : ''),
       clockIn: fmtTime(entry.in),
       clockOut: fmtTime(entry.out),
+      inIso: entry.in || null,
+      outIso: entry.out || null,
       hours: entry.duration ? entry.duration / 3600
         : (entry.in && entry.out ? (new Date(entry.out) - new Date(entry.in)) / 3600000 : 0),
       location: resolveLocation(entry, projectsMap),
@@ -2756,6 +2775,8 @@ const makePaired = (inEv, outEv, idx, projectsMap = {}) => {
     date: inEv?.belongsToDate || inEv?.date || (inTime ? String(inTime).split('T')[0] : ''),
     clockIn: fmtTime(inTime),
     clockOut: fmtTime(outTime),
+    inIso: inTime || null,
+    outIso: outTime || null,
     hours: inTime && outTime ? (new Date(outTime) - new Date(inTime)) / 3600000 : 0,
     location: resolveLocation(inEv, projectsMap) !== '—'
       ? resolveLocation(inEv, projectsMap)
@@ -3140,6 +3161,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         {[
           { id: 'overview', label: 'Overview' },
           { id: 'entries', label: 'Entries' },
+          { id: 'daily', label: 'Daily Report' },
           { id: 'byemployee', label: 'By Employee' },
         ].map(t => (
           <button
@@ -3214,6 +3236,97 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           </div>
         </Card>
       )}
+
+      {/* Tab: Daily Report — one table per (person, date) styled like the
+          paper sign-in sheet: Property / Time In / Time Out / Total, then
+          Total Worked and Balance (8 - total) at the bottom. */}
+      {activeTab === 'daily' && (() => {
+        const TARGET_HOURS = 8;
+        // Group filtered entries by person → date → [entries]
+        const byPersonDate = new Map();
+        filteredEntries.forEach(e => {
+          if (!e.date) return;
+          if (!byPersonDate.has(e.employee)) byPersonDate.set(e.employee, new Map());
+          const dateMap = byPersonDate.get(e.employee);
+          if (!dateMap.has(e.date)) dateMap.set(e.date, []);
+          dateMap.get(e.date).push(e);
+        });
+
+        // Flatten to a list of report cards, sorted by date desc then name asc
+        const reports = [];
+        byPersonDate.forEach((dateMap, person) => {
+          dateMap.forEach((rows, date) => {
+            const sorted = [...rows].sort((a, b) => {
+              const ai = a.inIso ? new Date(a.inIso).getTime() : 0;
+              const bi = b.inIso ? new Date(b.inIso).getTime() : 0;
+              return ai - bi;
+            });
+            const total = sorted.reduce((s, r) => s + (r.hours || 0), 0);
+            reports.push({ person, date, rows: sorted, total });
+          });
+        });
+        reports.sort((a, b) => {
+          if (a.date !== b.date) return b.date.localeCompare(a.date);
+          return a.person.localeCompare(b.person);
+        });
+
+        if (reports.length === 0) {
+          return (
+            <Card className="p-8">
+              <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                {loading ? 'Loading…' : 'No entries match your filters.'}
+              </p>
+            </Card>
+          );
+        }
+
+        return (
+          <div className="space-y-6">
+            {reports.map(r => {
+              const balance = TARGET_HOURS - r.total;
+              return (
+                <Card key={`${r.person}|${r.date}`} className="p-5">
+                  <h2 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                    {r.person} - Daily Work Report ({r.date})
+                  </h2>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr style={{ backgroundColor: brand.navy }}>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {r.rows.map((row, idx) => (
+                          <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+                          </tr>
+                        ))}
+                        <tr style={{ backgroundColor: '#f8f8f8' }}>
+                          <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
+                        </tr>
+                        <tr style={{ backgroundColor: '#f8f8f8' }}>
+                          <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        );
+      })()}
 
       {/* Tab: By Employee */}
       {activeTab === 'byemployee' && (
