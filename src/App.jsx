@@ -2831,7 +2831,8 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [filterLocation, setFilterLocation] = useState('All');
   const [search, setSearch] = useState('');
 
-  const [activeTab, setActiveTab] = useState('overview');
+  const [activeTab, setActiveTab] = useState('daily');
+  const [reportGranularity, setReportGranularity] = useState('day');
 
   const [rawEntries, setRawEntries] = useState([]);
   const [rawLiveEntries, setRawLiveEntries] = useState([]);
@@ -3166,9 +3167,9 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       {/* Tab bar */}
       <div className="flex gap-1 mb-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
         {[
+          { id: 'daily', label: 'Work Report' },
           { id: 'overview', label: 'Overview' },
           { id: 'entries', label: 'Entries' },
-          { id: 'daily', label: 'Daily Report' },
           { id: 'byemployee', label: 'By Employee' },
         ].map(t => (
           <button
@@ -3249,89 +3250,195 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           Total Worked and Balance (8 - total) at the bottom. */}
       {activeTab === 'daily' && (() => {
         const TARGET_HOURS = 8;
-        // Group filtered entries by person → date → [entries]
-        const byPersonDate = new Map();
+
+        // Helpers to bucket an entry's date into a period key
+        const mondayOf = (dateISO) => {
+          const d = new Date(dateISO);
+          const day = d.getDay() || 7; // Sun → 7
+          if (day !== 1) d.setDate(d.getDate() - (day - 1));
+          return d.toISOString().split('T')[0];
+        };
+        const sundayOf = (mondayISO) => {
+          const d = new Date(mondayISO);
+          d.setDate(d.getDate() + 6);
+          return d.toISOString().split('T')[0];
+        };
+        const monthLabelOf = (key) => {
+          const [y, m] = key.split('-').map(Number);
+          return new Date(y, m - 1, 1).toLocaleDateString('en-ZA', { month: 'long', year: 'numeric' });
+        };
+
+        const keyFor = (dateISO) => {
+          if (reportGranularity === 'week') return mondayOf(dateISO);
+          if (reportGranularity === 'month') return dateISO.slice(0, 7);
+          return dateISO;
+        };
+        const periodLabel = (key) => {
+          if (reportGranularity === 'week') return `${key} → ${sundayOf(key)}`;
+          if (reportGranularity === 'month') return monthLabelOf(key);
+          return key;
+        };
+        const reportTitle = reportGranularity === 'week' ? 'Weekly' : reportGranularity === 'month' ? 'Monthly' : 'Daily';
+
+        // Group filtered entries by person → period key → [entries]
+        const byPersonKey = new Map();
         filteredEntries.forEach(e => {
           if (!e.date) return;
-          if (!byPersonDate.has(e.employee)) byPersonDate.set(e.employee, new Map());
-          const dateMap = byPersonDate.get(e.employee);
-          if (!dateMap.has(e.date)) dateMap.set(e.date, []);
-          dateMap.get(e.date).push(e);
+          const k = keyFor(e.date);
+          if (!byPersonKey.has(e.employee)) byPersonKey.set(e.employee, new Map());
+          const keyMap = byPersonKey.get(e.employee);
+          if (!keyMap.has(k)) keyMap.set(k, []);
+          keyMap.get(k).push(e);
         });
 
-        // Flatten to a list of report cards, sorted by date desc then name asc
+        // Flatten to report cards. For week/month also compute visits-by-centre.
         const reports = [];
-        byPersonDate.forEach((dateMap, person) => {
-          dateMap.forEach((rows, date) => {
+        byPersonKey.forEach((keyMap, person) => {
+          keyMap.forEach((rows, key) => {
             const sorted = [...rows].sort((a, b) => {
               const ai = a.inIso ? new Date(a.inIso).getTime() : 0;
               const bi = b.inIso ? new Date(b.inIso).getTime() : 0;
               return ai - bi;
             });
             const total = sorted.reduce((s, r) => s + (r.hours || 0), 0);
-            reports.push({ person, date, rows: sorted, total });
+            // Visits by centre — one paired clock-in/out = one visit.
+            const visits = new Map();
+            sorted.forEach(row => {
+              const centre = row.location || '—';
+              const prev = visits.get(centre) || { count: 0, hours: 0 };
+              visits.set(centre, { count: prev.count + 1, hours: prev.hours + (row.hours || 0) });
+            });
+            const visitList = Array.from(visits.entries())
+              .map(([centre, v]) => ({ centre, count: v.count, hours: v.hours }))
+              .sort((a, b) => b.count - a.count || b.hours - a.hours);
+            reports.push({ person, key, rows: sorted, total, visits: visitList });
           });
         });
         reports.sort((a, b) => {
-          if (a.date !== b.date) return b.date.localeCompare(a.date);
+          if (a.key !== b.key) return b.key.localeCompare(a.key);
           return a.person.localeCompare(b.person);
         });
 
+        const granularityChips = (
+          <Card className="mb-4 p-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-xs font-medium tracking-wider uppercase" style={{ color: brand.textMuted }}>Granularity</p>
+              {[
+                { key: 'day', label: 'Day' },
+                { key: 'week', label: 'Week' },
+                { key: 'month', label: 'Month' },
+              ].map(g => (
+                <button
+                  key={g.key}
+                  onClick={() => setReportGranularity(g.key)}
+                  className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                  style={{
+                    backgroundColor: reportGranularity === g.key ? brand.navy : 'transparent',
+                    color: reportGranularity === g.key ? '#fff' : brand.text,
+                    border: `1px solid ${reportGranularity === g.key ? brand.navy : brand.border}`,
+                  }}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
+          </Card>
+        );
+
         if (reports.length === 0) {
           return (
-            <Card className="p-8">
-              <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
-                {loading ? 'Loading…' : 'No entries match your filters.'}
-              </p>
-            </Card>
+            <>
+              {granularityChips}
+              <Card className="p-8">
+                <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                  {loading ? 'Loading…' : 'No entries match your filters.'}
+                </p>
+              </Card>
+            </>
           );
         }
 
+        const showBalance = reportGranularity === 'day';
+        const showVisitsByCentre = reportGranularity !== 'day';
+
         return (
-          <div className="space-y-6">
-            {reports.map(r => {
-              const balance = TARGET_HOURS - r.total;
-              return (
-                <Card key={`${r.person}|${r.date}`} className="p-5">
-                  <h2 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
-                    {r.person} - Daily Work Report ({r.date})
-                  </h2>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
-                      <thead>
-                        <tr style={{ backgroundColor: brand.navy }}>
-                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
-                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
-                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
-                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {r.rows.map((row, idx) => (
-                          <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+          <>
+            {granularityChips}
+            <div className="space-y-6">
+              {reports.map(r => {
+                const balance = TARGET_HOURS - r.total;
+                return (
+                  <Card key={`${r.person}|${r.key}`} className="p-5">
+                    <h2 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                      {r.person} - {reportTitle} Work Report ({periodLabel(r.key)})
+                    </h2>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                        <thead>
+                          <tr style={{ backgroundColor: brand.navy }}>
+                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
+                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
+                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
+                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
                           </tr>
-                        ))}
-                        <tr style={{ backgroundColor: '#f8f8f8' }}>
-                          <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
-                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
-                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
-                        </tr>
-                        <tr style={{ backgroundColor: '#f8f8f8' }}>
-                          <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
-                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
-                          <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                </Card>
-              );
-            })}
-          </div>
+                        </thead>
+                        <tbody>
+                          {r.rows.map((row, idx) => (
+                            <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+                            </tr>
+                          ))}
+                          <tr style={{ backgroundColor: '#f8f8f8' }}>
+                            <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                            <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
+                            <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
+                          </tr>
+                          {showBalance && (
+                            <tr style={{ backgroundColor: '#f8f8f8' }}>
+                              <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                              <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
+                              <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {showVisitsByCentre && r.visits.length > 0 && (
+                      <div className="mt-5">
+                        <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>
+                          Visits by Centre · {r.visits.reduce((s, v) => s + v.count, 0)} total
+                        </p>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                            <thead>
+                              <tr style={{ backgroundColor: brand.cream }}>
+                                <th className="px-4 py-2 text-left text-xs font-semibold tracking-wider" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>Centre</th>
+                                <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: brand.navy, border: `1px solid ${brand.border}`, width: '120px' }}>Visits</th>
+                                <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: brand.navy, border: `1px solid ${brand.border}`, width: '140px' }}>Hours</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {r.visits.map((v, idx) => (
+                                <tr key={v.centre} style={{ backgroundColor: idx % 2 === 0 ? '#fff' : '#f8f8f8' }}>
+                                  <td className="px-4 py-2" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.centre}</td>
+                                  <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.count}</td>
+                                  <td className="px-4 py-2 text-center" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>{fmtHoursMin(v.hours)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </Card>
+                );
+              })}
+            </div>
+          </>
         );
       })()}
 
