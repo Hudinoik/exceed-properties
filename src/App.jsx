@@ -9356,6 +9356,62 @@ const UsersSection = ({ employees, setEmployees, currentUser, setCurrentUser, sh
 };
 
 // ============================================================
+// PEOPLE (Employees + Users & Roles, merged under one tab)
+// ============================================================
+const PeopleSection = ({ employees, setEmployees, currentUser, setCurrentUser, showToast, logAction }) => {
+  const canManageUsers = hasPermission(currentUser, PERMISSIONS.MANAGE_USERS);
+  const [activeTab, setActiveTab] = useState('employees');
+
+  // If MANAGE_USERS is revoked mid-session, fall back to Employees.
+  const effectiveTab = activeTab === 'users' && !canManageUsers ? 'employees' : activeTab;
+
+  const tabs = [
+    { id: 'employees', label: 'Employees' },
+    ...(canManageUsers ? [{ id: 'users', label: 'Users & Roles' }] : []),
+  ];
+
+  return (
+    <div>
+      <div className="flex gap-1 mb-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setActiveTab(t.id)}
+            className="px-4 py-2 text-sm font-medium transition-all relative btn-press"
+            style={{
+              color: effectiveTab === t.id ? brand.gold : brand.textMuted,
+              fontWeight: effectiveTab === t.id ? 600 : 500,
+            }}
+          >
+            {t.label}
+            {effectiveTab === t.id && <div className="absolute bottom-0 left-0 right-0 h-0.5" style={{ backgroundColor: brand.gold }} />}
+          </button>
+        ))}
+      </div>
+
+      {effectiveTab === 'employees' && (
+        <EmployeesSection
+          employees={employees}
+          setEmployees={setEmployees}
+          showToast={showToast}
+          logAction={logAction}
+        />
+      )}
+      {effectiveTab === 'users' && (
+        <UsersSection
+          employees={employees}
+          setEmployees={setEmployees}
+          currentUser={currentUser}
+          setCurrentUser={setCurrentUser}
+          showToast={showToast}
+          logAction={logAction}
+        />
+      )}
+    </div>
+  );
+};
+
+// ============================================================
 // JIBBLE INTEGRATION CARD
 // ============================================================
 const JibbleIntegrationCard = ({ showToast, logAction }) => {
@@ -13277,7 +13333,6 @@ export default function ExceedProperties() {
     { id: 'leasing', label: 'Leasing', icon: FileSignature, permission: PERMISSIONS.VIEW_LEASING },
     { id: 'debtors', label: 'Debtors', icon: DollarSign, permission: PERMISSIONS.VIEW_DEBTORS },
     { id: 'projections', label: 'Projections', icon: TrendingUp, permission: PERMISSIONS.VIEW_PROJECTIONS },
-    { id: 'users', label: 'Users & Roles', icon: Shield, permission: PERMISSIONS.MANAGE_USERS },
     { id: 'settings', label: 'Settings', icon: SettingsIcon, permission: PERMISSIONS.VIEW_SETTINGS },
   ];
 
@@ -13331,7 +13386,7 @@ export default function ExceedProperties() {
       case 'dashboard': return checkPerm(PERMISSIONS.VIEW_DASHBOARD) || <Dashboard employees={employees} properties={properties} inspections={inspections} leases={leases} debtors={debtors} activityLog={activityLog} currentUser={currentUser} onNavigate={setActiveNav} />;
       case 'ondesk': return checkPerm(PERMISSIONS.VIEW_ONDESK) || <OnDeskSection employees={employees} deskStatuses={deskStatuses} setDeskStatuses={setDeskStatuses} activityLog={activityLog} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'properties': return checkPerm(PERMISSIONS.VIEW_PROPERTIES) || <PropertiesSection properties={properties} setProperties={setProperties} tenancies={tenancies} setTenancies={setTenancies} showToast={showToast} logAction={logAction} />;
-      case 'employees': return checkPerm(PERMISSIONS.VIEW_EMPLOYEES) || <EmployeesSection employees={employees} setEmployees={setEmployees} showToast={showToast} logAction={logAction} />;
+      case 'employees': return checkPerm(PERMISSIONS.VIEW_EMPLOYEES) || <PeopleSection employees={employees} setEmployees={setEmployees} currentUser={currentUser} setCurrentUser={setCurrentUser} showToast={showToast} logAction={logAction} />;
       case 'time': return checkPerm(PERMISSIONS.VIEW_TIME) || <TimeTrackingSection employees={employees} showToast={showToast} integrations={integrations} setIntegrations={setIntegrations} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'maintenance': return checkPerm(PERMISSIONS.VIEW_MAINTENANCE) || <MaintenanceSection maintenance={maintenance} setMaintenance={setMaintenance} properties={properties} employees={employees} showToast={showToast} logAction={logAction} />;
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
@@ -13340,7 +13395,6 @@ export default function ExceedProperties() {
       case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection leases={leases} setLeases={setLeases} properties={properties} employees={employees} debtors={debtors} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
       case 'leaseDrafter': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeaseDrafter currentUser={currentUser} showToast={showToast} logAction={logAction} integrations={integrations} debtors={debtors} onNavigateToSettings={() => setActiveNav('settings')} onClose={() => setActiveNav('leasing')} />;
       case 'debtors': return checkPerm(PERMISSIONS.VIEW_DEBTORS) || <DebtorsSection debtors={debtors} setDebtors={setDebtors} debtorAccounts={debtorAccounts} setDebtorAccounts={setDebtorAccounts} debtorNotes={debtorNotes} setDebtorNotes={setDebtorNotes} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
-      case 'users': return checkPerm(PERMISSIONS.MANAGE_USERS) || <UsersSection employees={employees} setEmployees={setEmployees} currentUser={currentUser} setCurrentUser={setCurrentUser} showToast={showToast} logAction={logAction} />;
       case 'settings': return checkPerm(PERMISSIONS.VIEW_SETTINGS) || (
         <SettingsSection
           companyProfile={companyProfile} setCompanyProfile={setCompanyProfile}
