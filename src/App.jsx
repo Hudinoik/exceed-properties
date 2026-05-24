@@ -10266,54 +10266,93 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     showToast(`Loaded ${normalized.length} sample inspections — see Move-Ins / Outs page`, 'success');
   };
 
+  // Endpoints we know exist from PI's API docs sidebar. Each is tried in
+  // sequence; whatever returns 2xx is kept. Scope-protected endpoints that
+  // 403 are recorded but don't abort the pull — the user still gets data
+  // from anything their token DOES have scopes for. /me and /account are
+  // typically scope-less on Laravel Passport and are useful even when
+  // every other endpoint rejects the token.
+  const PI_ENDPOINTS = [
+    { path: '/me',          label: 'My user',     itemType: 'user' },
+    { path: '/account',     label: 'Account',     itemType: 'account' },
+    { path: '/user',        label: 'User info',   itemType: 'user' },
+    { path: '/staff',       label: 'Staff',       itemType: 'staff' },
+    { path: '/clients',     label: 'Clients',     itemType: 'client' },
+    { path: '/contacts',    label: 'Contacts',    itemType: 'contact' },
+    { path: '/properties',  label: 'Properties',  itemType: 'property' },
+    { path: '/templates',   label: 'Templates',   itemType: 'template' },
+    { path: '/inspections', label: 'Inspections', itemType: 'inspection' },
+  ];
+
+  const extractList = (payload) => {
+    if (Array.isArray(payload?.data)) return payload.data;
+    if (Array.isArray(payload?.items)) return payload.items;
+    if (Array.isArray(payload)) return payload;
+    // Single-object endpoints like /me or /account.
+    if (payload && typeof payload === 'object') return [payload];
+    return [];
+  };
+
   const handleFetch = async () => {
     setFetching(true);
-    try {
-      // Route through the backend proxy. The server holds the access token
-      // (stored in the vault) and forwards the call to PI — browser never
-      // touches PI directly, so no CORS issues in production.
-      const result = await api.proxy.piGet('/inspections?page=1&perPage=50');
-      const list = Array.isArray(result?.data) ? result.data
-        : Array.isArray(result?.items) ? result.items
-        : Array.isArray(result) ? result
-        : [];
-      const normalized = list.map(normalizePI).filter(Boolean);
-      setIntegrations({
-        ...integrations,
-        propertyInspect: {
-          ...pi,
-          connected: true,
-          importedInspections: normalized,
-          importedCount: normalized.length,
-          lastSync: new Date().toISOString(),
-          lastSyncStatus: 'success',
-          lastSyncError: null,
-        },
-      });
-      logAction(`Pulled ${normalized.length} inspection(s) from Property Inspect`);
-      showToast(`Pulled ${normalized.length} inspection${normalized.length === 1 ? '' : 's'} from Property Inspect`, 'success');
-    } catch (err) {
-      // Surface the real reason instead of silently swapping in sample data.
-      // The user clicked "Pull Inspections" — they want to know what failed
-      // (token scope, account permissions, wrong endpoint, etc.) so they
-      // can fix it. The "Load Sample Data" button remains available for
-      // anyone who explicitly wants the PI-shaped demo records.
-      const detail = err.message || String(err);
-      const status = err.status ? ` (HTTP ${err.status})` : '';
-      setIntegrations({
-        ...integrations,
-        propertyInspect: {
-          ...pi,
-          lastSync: new Date().toISOString(),
-          lastSyncStatus: 'error',
-          lastSyncError: `Live pull failed${status}: ${detail}`,
-        },
-      });
-      logAction(`Live PI pull failed${status}: ${detail.split('\n')[0].slice(0, 120)}`);
-      showToast(`Live pull failed${status}: ${detail.slice(0, 120)}`, 'error');
-    } finally {
-      setFetching(false);
+    const report = {}; // path -> { ok, count, status, message, sample }
+    let inspections = [];
+    for (const { path, label } of PI_ENDPOINTS) {
+      try {
+        const result = await api.proxy.piGet(path);
+        const list = extractList(result);
+        report[path] = {
+          ok: true,
+          label,
+          count: list.length,
+          sample: list.slice(0, 3),
+        };
+        if (path === '/inspections') {
+          inspections = list.map(normalizePI).filter(Boolean);
+        }
+      } catch (err) {
+        report[path] = {
+          ok: false,
+          label,
+          status: err?.status || 0,
+          message: err?.body?.message || err?.body?.error || err?.message || String(err),
+        };
+      }
     }
+
+    const successCount = Object.values(report).filter(r => r.ok).length;
+    const failCount = Object.values(report).filter(r => !r.ok).length;
+    const totalItems = Object.values(report).filter(r => r.ok).reduce((sum, r) => sum + (r.count || 0), 0);
+
+    setIntegrations({
+      ...integrations,
+      propertyInspect: {
+        ...pi,
+        connected: true,
+        importedInspections: inspections,
+        importedCount: inspections.length,
+        endpointReport: report,
+        lastSync: new Date().toISOString(),
+        lastSyncStatus: successCount > 0 ? 'success' : 'error',
+        lastSyncError: successCount > 0
+          ? null
+          : `Every endpoint rejected the token. Most likely your PI OAuth app has no scopes assigned — needs to be enabled in your PI dev portal or via PI support.`,
+      },
+    });
+
+    if (successCount > 0) {
+      logAction(`PI pull: ${successCount} endpoint(s) OK (${totalItems} items), ${failCount} blocked`);
+      showToast(
+        inspections.length > 0
+          ? `Pulled ${inspections.length} inspection${inspections.length === 1 ? '' : 's'} (+ ${totalItems - inspections.length} other PI records)`
+          : `Pulled ${totalItems} item(s) from PI — but /inspections is blocked. See endpoint report below.`,
+        inspections.length > 0 ? 'success' : 'error',
+      );
+    } else {
+      logAction(`PI pull: 0 endpoints accessible — token has no usable scopes`);
+      showToast('Live pull failed: every PI endpoint rejected the token. See report below.', 'error');
+    }
+    setFetching(false);
   };
 
   // Run a single GET against PI and capture the exact request + response
@@ -10547,6 +10586,31 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
               <Input value={String(pi.importedCount || 0)} disabled />
             </Field>
           </div>
+
+          {/* Per-endpoint pull report — shows which PI endpoints your token
+              can actually reach. Anything red is being rejected by PI's scope
+              middleware; anything green returned data. Updated on every Pull. */}
+          {pi.endpointReport && (
+            <div className="mb-4">
+              <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>Endpoint report (last pull)</p>
+              <div className="rounded overflow-hidden" style={{ border: `1px solid ${brand.border}` }}>
+                {Object.entries(pi.endpointReport).map(([path, r]) => (
+                  <div key={path} className="px-3 py-2 flex items-center gap-2 text-xs" style={{ borderTop: `1px solid ${brand.border}`, backgroundColor: r.ok ? brand.successLight : brand.dangerLight }}>
+                    {r.ok
+                      ? <CheckCircle2 size={14} style={{ color: brand.success, flexShrink: 0 }} />
+                      : <AlertCircle size={14} style={{ color: brand.danger, flexShrink: 0 }} />}
+                    <code className="font-mono" style={{ color: brand.text, minWidth: '120px' }}>{path}</code>
+                    {r.ok
+                      ? <span style={{ color: brand.success }}>{r.count} item{r.count === 1 ? '' : 's'}</span>
+                      : <span style={{ color: brand.danger }}>HTTP {r.status || '?'} · {r.message}</span>}
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] mt-2" style={{ color: brand.textMuted }}>
+                Green rows are endpoints your token reached. Red rows were rejected — usually scope-protected endpoints your PI OAuth app hasn't been granted access to.
+              </p>
+            </div>
+          )}
 
           {/* Actions */}
           <div className="flex gap-2 flex-wrap">
