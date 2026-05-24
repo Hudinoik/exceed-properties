@@ -23,7 +23,10 @@ const DEFAULT_DATA = {
   secrets: [],   // { id, userId, integration, key, ciphertext, iv, authTag, updatedAt }
   auditLog: [],  // { id, userId, userEmail, action, details, ip, createdAt }
   sessions: [],  // { sid, sess (JSON), expires (ms) }
-  nextId: { user: 1, secret: 1, audit: 1 },
+  // Incoming webhook events from external services (Property Inspect, etc).
+  // { id, userId, integration, receivedAt, headers (JSON), body (JSON or string), ip }
+  webhookEvents: [],
+  nextId: { user: 1, secret: 1, audit: 1, webhook: 1 },
 };
 
 let db;
@@ -153,6 +156,47 @@ export const audit = {
   },
   recent(limit = 100) {
     return db.data.auditLog.slice(0, limit);
+  },
+};
+
+// ----- Webhook events ---------------------------------------------------
+// Inbound POSTs from external services. Keyed by userId so each user
+// only sees their own events. Bounded list — we keep the most recent
+// 500 events per user to avoid unbounded growth on the JSON file.
+
+export const webhookEvents = {
+  list(userId, integration, limit = 100) {
+    return db.data.webhookEvents
+      .filter(e => e.userId === userId && (!integration || e.integration === integration))
+      .slice(0, limit);
+  },
+  async record({ userId, integration, headers, body, ip }) {
+    const event = {
+      id: nextId('webhook'),
+      userId,
+      integration,
+      receivedAt: new Date().toISOString(),
+      headers: headers ? JSON.stringify(headers).slice(0, 4000) : null,
+      body: body ? JSON.stringify(body).slice(0, 20000) : null,
+      ip: ip || null,
+    };
+    db.data.webhookEvents.unshift(event);
+    // Keep at most 500 events per user across all integrations.
+    const userEventCount = db.data.webhookEvents.filter(e => e.userId === userId).length;
+    if (userEventCount > 500) {
+      // Find indexes of this user's oldest events and drop them.
+      const userEvents = db.data.webhookEvents.filter(e => e.userId === userId);
+      const keep = new Set(userEvents.slice(0, 500).map(e => e.id));
+      db.data.webhookEvents = db.data.webhookEvents.filter(e => e.userId !== userId || keep.has(e.id));
+    }
+    await persist();
+    return event;
+  },
+  async clear(userId, integration) {
+    const before = db.data.webhookEvents.length;
+    db.data.webhookEvents = db.data.webhookEvents.filter(e => !(e.userId === userId && (!integration || e.integration === integration)));
+    if (db.data.webhookEvents.length !== before) await persist();
+    return before - db.data.webhookEvents.length;
   },
 };
 

@@ -10415,6 +10415,78 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     }
   };
 
+  // ----- Webhooks -------------------------------------------------------
+  // PI can push events to a public URL when something happens server-side.
+  // The URL embeds a per-user random token; receipt of a POST with the
+  // matching token both authenticates the request and identifies whose
+  // events these are. Useful as an alternative ingestion path when OAuth
+  // scopes are gated by PI's admin config.
+  const [webhookEvents, setWebhookEvents] = useState([]);
+  const [webhookLoading, setWebhookLoading] = useState(false);
+  const webhookToken = pi.webhookToken || '';
+  const webhookUrl = webhookToken && typeof window !== 'undefined'
+    ? `${window.location.origin}/api/webhooks/property-inspect/${webhookToken}`
+    : '';
+
+  const generateWebhookToken = async () => {
+    // 32-byte URL-safe token via Web Crypto. Long enough that brute-force
+    // is impractical; short enough to paste comfortably.
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const token = btoa(String.fromCharCode(...bytes))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    try {
+      await api.secrets.set('propertyInspect', { webhookToken: token });
+      setIntegrations(prev => ({
+        ...prev,
+        propertyInspect: { ...(prev.propertyInspect || {}), webhookToken: token },
+      }));
+      logAction('Generated new PI webhook URL');
+      showToast('Webhook URL generated — paste it into PI', 'success');
+    } catch (err) {
+      showToast(`Failed to generate token: ${err.message}`, 'error');
+    }
+  };
+
+  const refreshWebhookEvents = async () => {
+    setWebhookLoading(true);
+    try {
+      const events = await api.proxy.piWebhookEvents(100);
+      setWebhookEvents(events);
+    } catch (err) {
+      showToast(`Failed to load events: ${err.message}`, 'error');
+    } finally {
+      setWebhookLoading(false);
+    }
+  };
+
+  const clearWebhookEvents = async () => {
+    try {
+      await api.proxy.piWebhookClear();
+      setWebhookEvents([]);
+      showToast('Webhook event log cleared', 'success');
+    } catch (err) {
+      showToast(`Failed to clear: ${err.message}`, 'error');
+    }
+  };
+
+  const copyToClipboard = (text) => {
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(text).then(
+      () => showToast('Copied to clipboard', 'success'),
+      () => showToast('Could not copy — select and copy manually', 'error'),
+    );
+  };
+
+  // Auto-load events on mount + every 30s while card is visible.
+  useEffect(() => {
+    if (!webhookToken) return;
+    refreshWebhookEvents();
+    const id = setInterval(refreshWebhookEvents, 30000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webhookToken]);
+
   // Decode the current access token (if it's a JWT) to see what scopes PI
   // actually granted. Tells us whether our requested scope was accepted,
   // ignored, or stripped.
@@ -10601,6 +10673,74 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
             <Field label="Inspections Imported">
               <Input value={String(pi.importedCount || 0)} disabled />
             </Field>
+          </div>
+
+          {/* Webhooks (optional) — alternative ingestion path. PI POSTs
+              events to a public URL on our server; the URL embeds a per-user
+              random token. Works without OAuth scopes, so it's useful when
+              the live API is gated. Whatever PI sends arrives in the event
+              log below — the body shape will tell us if it's enough on its
+              own or if we'd still need the API. */}
+          <div className="mb-4 rounded p-4" style={{ backgroundColor: brand.cream, border: `1px solid ${brand.border}` }}>
+            <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+              <div>
+                <p className="text-xs font-semibold tracking-wider uppercase" style={{ color: brand.navy }}>Webhooks (optional)</p>
+                <p className="text-[11px]" style={{ color: brand.textMuted }}>Receive events pushed by PI. Independent of OAuth scopes.</p>
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {!webhookToken ? (
+                  <Button size="sm" variant="primary" icon={Zap} onClick={generateWebhookToken}>Generate URL</Button>
+                ) : (
+                  <>
+                    <Button size="sm" variant="ghost" icon={RefreshCw} onClick={refreshWebhookEvents} disabled={webhookLoading}>
+                      {webhookLoading ? 'Loading…' : 'Refresh'}
+                    </Button>
+                    <Button size="sm" variant="ghost" icon={RefreshCw} onClick={generateWebhookToken}>Rotate URL</Button>
+                    {webhookEvents.length > 0 && (
+                      <Button size="sm" variant="danger" icon={Trash2} onClick={clearWebhookEvents}>Clear log</Button>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+
+            {webhookToken && (
+              <div className="mb-3">
+                <p className="text-[11px] mb-1" style={{ color: brand.textMuted }}>Webhook URL — paste this into PI's webhook config:</p>
+                <div className="flex gap-2">
+                  <Input value={webhookUrl} readOnly onFocus={(e) => e.target.select()} />
+                  <Button size="sm" variant="ghost" onClick={() => copyToClipboard(webhookUrl)}>Copy</Button>
+                </div>
+              </div>
+            )}
+
+            {webhookToken && (
+              <div>
+                <p className="text-[11px] font-semibold mb-1" style={{ color: brand.text }}>
+                  Received events ({webhookEvents.length})
+                </p>
+                {webhookEvents.length === 0 ? (
+                  <p className="text-[11px] italic" style={{ color: brand.textMuted }}>
+                    No events yet. Configure the URL above in your PI account → Webhooks, trigger an event in PI, then click Refresh.
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-72 overflow-y-auto">
+                    {webhookEvents.map(ev => (
+                      <details key={ev.id} className="rounded text-xs" style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}>
+                        <summary className="px-2 py-1.5 cursor-pointer flex items-center gap-2" style={{ color: brand.text }}>
+                          <span style={{ color: brand.textMuted }}>{new Date(ev.receivedAt).toLocaleString('en-ZA')}</span>
+                          <code className="font-mono" style={{ color: brand.gold }}>{ev.body?.event || ev.body?.type || '(no event field)'}</code>
+                          <span className="ml-auto" style={{ color: brand.textMuted }}>from {ev.ip || '?'}</span>
+                        </summary>
+                        <pre className="px-2 py-1.5 text-[10px] overflow-auto" style={{ backgroundColor: brand.cream, color: brand.text, fontFamily: 'monospace', maxHeight: '200px' }}>
+{JSON.stringify(ev.body, null, 2)}
+                        </pre>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Per-endpoint pull report — shows which PI endpoints your token

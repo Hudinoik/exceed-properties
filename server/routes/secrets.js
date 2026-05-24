@@ -27,8 +27,12 @@ export const INTEGRATIONS = {
              'accessToken', 'refreshToken', 'tokenExpiry',
              'accountId', 'baseUri', 'userId', 'userEmail'],
   // Property Inspect — OAuth (authorization_code) only. PAT mode removed.
+  // webhookToken is a per-user random string embedded in the public webhook
+  // URL — receipt of a POST with a matching token identifies whose data
+  // it is and authenticates the request (PI never authenticates with us
+  // via OAuth — the URL itself is the credential).
   propertyInspect: ['clientId', 'clientSecret', 'redirectUri', 'baseUrl',
-                    'tokenUrl', 'authorizeUrl',
+                    'tokenUrl', 'authorizeUrl', 'webhookToken',
                     'accessToken', 'refreshToken', 'tokenExpiry'],
   // Jibble — Client Credentials only. PAT mode removed.
   jibble: ['clientId', 'clientSecret', 'organizationId',
@@ -42,6 +46,7 @@ export const PLAINTEXT_KEYS = new Set([
   'model', 'environment', 'redirectUri', 'baseUri', 'baseUrl',
   'tokenUrl', 'authorizeUrl', 'authMethod', 'apiBaseUrl', 'userId',
   'userEmail', 'accountId', 'organizationId', 'tokenExpiry',
+  'webhookToken',
 ]);
 
 const isValidKey = (integration, key) =>

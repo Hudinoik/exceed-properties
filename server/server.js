@@ -26,6 +26,7 @@ import { csrfMiddleware } from './middleware/csrf.js';
 import authRouter from './routes/auth.js';
 import secretsRouter from './routes/secrets.js';
 import proxyRouter from './routes/proxy.js';
+import { publicRouter as webhookPublicRouter, apiRouter as webhookApiRouter } from './routes/webhooks.js';
 import { seedIfEmpty } from './seed.js';
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -72,6 +73,12 @@ app.use(cors({
 app.use(express.json({ limit: '20mb' })); // lease DOCX base64 can be large
 app.use(cookieParser());
 
+// --- public webhook receiver — mounted BEFORE rate limit / CSRF / session
+//     so external services (PI etc.) can POST without our auth cookie. The
+//     URL itself contains a per-user random token that authenticates and
+//     identifies which user the event belongs to.
+app.use('/api/webhooks', webhookPublicRouter);
+
 // --- sessions ---
 app.use(session({
   name: 'ep.sid',
@@ -104,6 +111,9 @@ app.use('/api/', csrfMiddleware);
 app.use('/api/auth', authRouter);
 app.use('/api/secrets', secretsRouter);
 app.use('/api/proxy', proxyRouter);
+// Authenticated mgmt endpoints for webhooks (list events, clear, etc.).
+// The public receiver is mounted earlier, before CSRF/session.
+app.use('/api/webhooks', webhookApiRouter);
 
 // Health probe (un-authed; used by hosting platforms)
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));

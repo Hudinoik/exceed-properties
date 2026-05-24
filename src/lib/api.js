@@ -149,6 +149,13 @@ export const proxy = {
       body: { paths },
     });
   },
+  async piWebhookEvents(limit = 100) {
+    const r = await request(`/api/webhooks/property-inspect/events?limit=${limit}`);
+    return r.events || [];
+  },
+  async piWebhookClear() {
+    return request('/api/webhooks/property-inspect/events', { method: 'DELETE' });
+  },
   async jibbleTest() {
     return request('/api/proxy/jibble/test', { method: 'POST', body: {} });
   },
