@@ -2831,7 +2831,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [filterLocation, setFilterLocation] = useState('All');
   const [search, setSearch] = useState('');
 
-  const [activeTab, setActiveTab] = useState('daily');
+  const [activeTab, setActiveTab] = useState('bycentre');
   const [reportGranularity, setReportGranularity] = useState('day');
 
   const [rawEntries, setRawEntries] = useState([]);
@@ -3167,6 +3167,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       {/* Tab bar */}
       <div className="flex gap-1 mb-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
         {[
+          { id: 'bycentre', label: 'By Centre' },
           { id: 'daily', label: 'Work Report' },
           { id: 'overview', label: 'Overview' },
           { id: 'entries', label: 'Entries' },
@@ -3186,6 +3187,79 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           </button>
         ))}
       </div>
+
+      {/* Tab: By Centre — universal overview of every centre in the filter range */}
+      {activeTab === 'bycentre' && (() => {
+        const byCentre = new Map();
+        filteredEntries.forEach(e => {
+          const centre = e.location || '—';
+          if (!byCentre.has(centre)) byCentre.set(centre, { centre, visits: 0, hours: 0, people: new Set() });
+          const row = byCentre.get(centre);
+          row.visits += 1;
+          row.hours += e.hours || 0;
+          if (e.employee) row.people.add(e.employee);
+        });
+        const rows = Array.from(byCentre.values())
+          .map(r => ({ centre: r.centre, visits: r.visits, hours: r.hours, peopleCount: r.people.size }))
+          .sort((a, b) => b.hours - a.hours || b.visits - a.visits);
+
+        if (rows.length === 0) {
+          return (
+            <Card className="p-8">
+              <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                {loading ? 'Loading…' : 'No entries match your filters.'}
+              </p>
+            </Card>
+          );
+        }
+
+        const totalVisits = rows.reduce((s, r) => s + r.visits, 0);
+        const totalHours = rows.reduce((s, r) => s + r.hours, 0);
+
+        return (
+          <Card className="p-5">
+            <div className="mb-4 flex items-end justify-between flex-wrap gap-2">
+              <div>
+                <p className="text-xs tracking-wider uppercase" style={{ color: brand.gold }}>Time by Property</p>
+                <h2 className="text-xl" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                  Centres in this range
+                </h2>
+                <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
+                  {rows.length} {rows.length === 1 ? 'centre' : 'centres'} · {dateRange.from} to {dateRange.to}
+                </p>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ backgroundColor: brand.navy }}>
+                    <th className="px-4 py-2 text-left text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Centre</th>
+                    <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '120px' }}>Visits</th>
+                    <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '140px' }}>Total Time</th>
+                    <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '120px' }}>People</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, idx) => (
+                    <tr key={r.centre} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                      <td className="px-4 py-2" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{r.centre}</td>
+                      <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{r.visits}</td>
+                      <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.hours)}</td>
+                      <td className="px-4 py-2 text-center" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>{r.peopleCount}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ backgroundColor: brand.cream }}>
+                    <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>Total</td>
+                    <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>{totalVisits}</td>
+                    <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>{fmtHoursMin(totalHours)}</td>
+                    <td className="px-4 py-2" style={{ border: `1px solid ${brand.border}` }} />
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        );
+      })()}
 
       {/* Tab: Overview */}
       {activeTab === 'overview' && (
