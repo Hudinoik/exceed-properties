@@ -6397,86 +6397,12 @@ const LeasePreviewBody = ({ form }) => {
 };
 
 // Compute a financial + renewal summary for a single lease.
-// Pure function. Looks at the whole leases array to detect renewals — defined
-// as a prior lease that ended within 90 days before THIS lease started AND
-// either shares the same tenant name OR the same property+unit.
-const computeLeaseSummary = (lease, allLeases) => {
-  if (!lease) return null;
-  const monthlyRent = Number(lease.monthlyRent) || 0;
-  const start = lease.startDate ? new Date(lease.startDate) : null;
-  const end = lease.endDate ? new Date(lease.endDate) : null;
-  const escalation = Number(lease.escalationPercent) || 0; // optional annual %
-
-  // Term length in whole months
-  let monthsTotal = 0;
-  if (start && end && end > start) {
-    monthsTotal = (end.getFullYear() - start.getFullYear()) * 12
-                + (end.getMonth() - start.getMonth())
-                + (end.getDate() >= start.getDate() ? 0 : -1)
-                + 1;
-    monthsTotal = Math.max(0, monthsTotal);
-  }
-
-  // Total revenue without escalation: rent × months
-  const totalRevenueFlat = monthlyRent * monthsTotal;
-
-  // Total revenue with annual escalation applied on each anniversary
-  let totalRevenueEscalated = 0;
-  if (monthsTotal > 0) {
-    for (let i = 0; i < monthsTotal; i++) {
-      const yearIdx = Math.floor(i / 12);
-      totalRevenueEscalated += monthlyRent * Math.pow(1 + escalation / 100, yearIdx);
-    }
-  }
-
-  // Renewal detection: prior lease ending shortly before this one starts,
-  // matching tenant OR property+unit.
-  const normName = (s) => String(s || '').toLowerCase().replace(/\s*\(renewal\)\s*$/i, '').replace(/\s+/g, ' ').trim();
-  let priorLease = null;
-  if (start) {
-    const candidates = allLeases.filter(l => {
-      if (l.id === lease.id) return false;
-      if (!l.endDate) return false;
-      const lEnd = new Date(l.endDate);
-      const daysGap = (start - lEnd) / 86400000;
-      if (daysGap < -30 || daysGap > 90) return false; // within 90 days (or 30 overlap)
-      const sameTenant = normName(l.tenant) === normName(lease.tenant);
-      const sameSpace = normName(l.property) === normName(lease.property) && normName(l.unit) === normName(lease.unit);
-      return sameTenant || sameSpace;
-    });
-    // Pick the most recently-ended prior lease.
-    candidates.sort((a, b) => new Date(b.endDate) - new Date(a.endDate));
-    priorLease = candidates[0] || null;
-  }
-
-  let rentChangePercent = null;
-  let rentChangeDirection = null;
-  let rentChangeAbsolute = null;
-  if (priorLease) {
-    const priorRent = Number(priorLease.monthlyRent) || 0;
-    if (priorRent > 0) {
-      rentChangeAbsolute = monthlyRent - priorRent;
-      rentChangePercent = (rentChangeAbsolute / priorRent) * 100;
-      rentChangeDirection = rentChangeAbsolute > 0.5 ? 'up' : rentChangeAbsolute < -0.5 ? 'down' : 'flat';
-    }
-  }
-
-  return {
-    monthlyRent,
-    monthsTotal,
-    yearsTotal: monthsTotal / 12,
-    totalRevenueFlat,
-    totalRevenueEscalated,
-    escalation,
-    deposit: Number(lease.deposit) || 0,
-    start, end,
-    isRenewal: !!priorLease,
-    priorLease,
-    rentChangePercent,
-    rentChangeDirection,
-    rentChangeAbsolute,
-  };
-};
+// computeLeaseSummary() removed in commit (h/8) -- its only caller
+// was the Lease Summary modal which was deleted in the same commit
+// (unreachable after the pack pipeline rebuild dropped the
+// setSummaryLease caller). Renewal detection + escalation maths
+// belong on the pack detail page when that lands; the calculation
+// can be ported then.
 
 const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employees, debtors, landlords = {}, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
   // Pack -> lease-shape compatibility shim. The pipeline rebuild
@@ -6635,13 +6561,11 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
   const [errors, setErrors] = useState({});
   const [touched, setTouched] = useState({});
 
-  // DocuSign-related state
-  const [docusignModalOpen, setDocusignModalOpen] = useState(false);
-  const [docusignLease, setDocusignLease] = useState(null);
-  const [docusignEmail, setDocusignEmail] = useState('');
-  const [docusignDocFile, setDocusignDocFile] = useState(null);
-  const [summaryLease, setSummaryLease] = useState(null);
-  const [docusignSending, setDocusignSending] = useState(false);
+  // Legacy state for the deleted "Send Lease to DocuSign" modal +
+  // the unreachable summary modal removed in commit (h/8). The pack
+  // pipeline replaces that flow -- DocuSign send is now driven by
+  // the "Approve & Send to DocuSign" button on lease_checking-stage
+  // cards, and pack detail will get its own view in a follow-up.
 
   // DocuSign now uses a JWT service account — there's no per-user
   // "connected" flag. Poll /api/docusign/status on mount to gate the
@@ -6701,55 +6625,33 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
     return () => { alive = false; clearInterval(t); };
   }, [docusignConnected]);
 
-  // Best-effort: extract a friendly badge label for a lease whose
-  // envelope status we know.
+  // Friendly badge label for a pack's envelope state. Reads
+  // pack.envelopeStatus first (authoritative -- updated by the
+  // webhook handler) and falls back to the DocuSign-poll cache
+  // for envelopes that DocuSign returns in /api/docusign/envelopes
+  // but the webhook hasn't propagated to the pack yet (e.g. between
+  // a Connect outage and recovery).
   const leaseSigningBadge = (lease) => {
     if (!lease?.docusignEnvelopeId) return null;
-    const s = envelopeStatuses[lease.docusignEnvelopeId];
-    if (!s) {
-      // We know an envelope was sent but haven't heard back yet.
-      return lease.docusignSentAt ? 'Awaiting Signature' : null;
-    }
-    switch (s.status) {
-      case 'sent':       return 'Awaiting Signature';
-      case 'delivered':  return 'Opened';
-      case 'completed':  return 'Signed';
-      case 'declined':   return 'Declined';
-      case 'voided':     return 'Voided';
-      default:           return s.status;
-    }
-  };
-
-  const downloadSignedLease = async (lease) => {
-    if (!lease?.docusignEnvelopeId) return;
-    try {
-      const blob = await api.proxy.docusignDownloadEnvelopeDocument(lease.docusignEnvelopeId, 'combined');
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `lease-${lease.tenant.replace(/\s+/g, '-')}-${lease.docusignEnvelopeId.slice(0, 8)}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      logAction(`Downloaded signed lease "${lease.tenant}"`);
-    } catch (err) {
-      showToast(`Download failed: ${err.message}`, 'error');
+    const fromPack = lease.envelopeStatus;
+    const fromPoll = envelopeStatuses[lease.docusignEnvelopeId]?.status;
+    const status = fromPack || fromPoll;
+    if (!status) return lease.docusignSentAt ? 'Awaiting Signature' : null;
+    switch (status) {
+      case 'sent':              return 'Awaiting Signature';
+      case 'delivered':         return 'Opened';
+      case 'partially_signed':  return 'Partially Signed';
+      case 'completed':         return 'Signed';
+      case 'declined':          return 'Declined';
+      case 'voided':            return 'Voided';
+      default:                  return status;
     }
   };
-
-  const remindLeaseSigner = async (lease) => {
-    if (!lease?.docusignEnvelopeId) return;
-    try {
-      const r = await api.proxy.docusignRemindEnvelope(lease.docusignEnvelopeId);
-      logAction(`Sent reminder for lease "${lease.tenant}" (${r.resent || 0} recipient(s))`);
-      showToast(r.resent > 0
-        ? `Reminder sent to ${r.resent} recipient(s)`
-        : 'No pending signers to remind', 'success');
-    } catch (err) {
-      showToast(`Reminder failed: ${err.message}`, 'error');
-    }
-  };
+  // downloadSignedLease + remindLeaseSigner removed -- replaced by
+  // downloadPackPdf + remindPackSigner at the top of LeasingSection,
+  // which go through the pack routes (/api/packs/:id/files/signed.pdf
+  // and /api/packs/:id/resend-reminder) instead of hitting DocuSign
+  // directly from the SPA.
 
   const schema = {
     tenant: [validators.required],
@@ -7537,144 +7439,7 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
       </Modal>
 
       {/* DocuSign Send Modal */}
-      {/* Lease Summary Modal — full financial breakdown + renewal comparison */}
-      <Modal open={!!summaryLease} onClose={() => setSummaryLease(null)} title="Lease Summary" size="md">
-        {summaryLease && (() => {
-          const s = computeLeaseSummary(summaryLease, leases);
-          const fmtR = (n) => `R ${Math.round(n || 0).toLocaleString('en-ZA')}`;
-          const totalRevenue = s.escalation > 0 ? s.totalRevenueEscalated : s.totalRevenueFlat;
-          return (
-            <>
-              <div className="mb-4 p-3 rounded" style={{ backgroundColor: brand.cream }}>
-                <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                  <p className="text-sm font-semibold" style={{ color: brand.navy, fontFamily: 'Georgia, serif' }}>{summaryLease.tenant}</p>
-                  <span className="text-xs px-2 py-0.5 rounded" style={{
-                    backgroundColor: summaryLease.type === 'commercial' ? brand.goldPale : '#D8E8DE',
-                    color: summaryLease.type === 'commercial' ? brand.gold : brand.success,
-                  }}>
-                    {summaryLease.type === 'commercial' ? 'Commercial' : 'Residential'}
-                  </span>
-                </div>
-                <p className="text-xs" style={{ color: brand.textMuted }}>{summaryLease.property} · {summaryLease.unit}</p>
-                <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
-                  {s.start ? formatDate(s.start) : '—'} → {s.end ? formatDate(s.end) : '—'} · {s.monthsTotal} months ({s.yearsTotal.toFixed(1)} yrs)
-                </p>
-              </div>
-
-              {/* Headline numbers */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-                <div className="p-3 rounded" style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}>
-                  <p className="text-[10px] tracking-wider uppercase" style={{ color: brand.textMuted }}>Monthly rent</p>
-                  <p className="text-lg font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{fmtR(s.monthlyRent)}</p>
-                </div>
-                <div className="p-3 rounded" style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}>
-                  <p className="text-[10px] tracking-wider uppercase" style={{ color: brand.textMuted }}>Deposit held</p>
-                  <p className="text-lg font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{fmtR(s.deposit)}</p>
-                </div>
-                <div className="p-3 rounded" style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}>
-                  <p className="text-[10px] tracking-wider uppercase" style={{ color: brand.textMuted }}>Total revenue</p>
-                  <p className="text-lg font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.success }}>{fmtR(totalRevenue)}</p>
-                </div>
-                <div className="p-3 rounded" style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}>
-                  <p className="text-[10px] tracking-wider uppercase" style={{ color: brand.textMuted }}>Escalation</p>
-                  <p className="text-lg font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{s.escalation > 0 ? `${s.escalation}% / yr` : '—'}</p>
-                </div>
-              </div>
-
-              {s.escalation > 0 && (
-                <div className="p-3 rounded mb-4 text-xs" style={{ backgroundColor: brand.goldPale, color: brand.text }}>
-                  <p>
-                    Without escalation, this lease would generate <strong>{fmtR(s.totalRevenueFlat)}</strong>.
-                    With {s.escalation}% annual increases applied on each anniversary, the projected total is <strong>{fmtR(s.totalRevenueEscalated)}</strong> —
-                    an uplift of <strong>{fmtR(s.totalRevenueEscalated - s.totalRevenueFlat)}</strong>.
-                  </p>
-                </div>
-              )}
-
-              {/* Renewal section */}
-              {s.isRenewal ? (
-                <div className="mb-4 p-4 rounded" style={{
-                  backgroundColor: s.rentChangeDirection === 'up' ? brand.successLight
-                                 : s.rentChangeDirection === 'down' ? brand.dangerLight
-                                 : brand.cream,
-                  border: `1px solid ${s.rentChangeDirection === 'up' ? brand.success
-                                     : s.rentChangeDirection === 'down' ? brand.danger
-                                     : brand.border}`,
-                }}>
-                  <div className="flex items-center justify-between mb-2">
-                    <p className="text-sm font-semibold" style={{
-                      color: s.rentChangeDirection === 'up' ? brand.success
-                           : s.rentChangeDirection === 'down' ? brand.danger
-                           : brand.text,
-                    }}>
-                      {s.rentChangeDirection === 'up' && <>↑ Renewal escalation</>}
-                      {s.rentChangeDirection === 'down' && <>↓ Renewal at lower rent</>}
-                      {s.rentChangeDirection === 'flat' && <>Renewal at same rent</>}
-                    </p>
-                    <p className="text-lg font-semibold" style={{
-                      color: s.rentChangeDirection === 'up' ? brand.success
-                           : s.rentChangeDirection === 'down' ? brand.danger
-                           : brand.text,
-                      fontFamily: 'Georgia, serif',
-                    }}>
-                      {s.rentChangePercent > 0 ? '+' : ''}{s.rentChangePercent.toFixed(1)}%
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3 text-xs">
-                    <div>
-                      <p style={{ color: brand.textMuted }} className="mb-1">Prior lease</p>
-                      <p style={{ color: brand.text }}><strong>{s.priorLease.tenant}</strong></p>
-                      <p style={{ color: brand.textMuted }}>{fmtR(s.priorLease.monthlyRent)}/mo</p>
-                      <p style={{ color: brand.textMuted }}>{formatDate(s.priorLease.startDate)} → {formatDate(s.priorLease.endDate)}</p>
-                    </div>
-                    <div>
-                      <p style={{ color: brand.textMuted }} className="mb-1">Current lease</p>
-                      <p style={{ color: brand.text }}><strong>{summaryLease.tenant}</strong></p>
-                      <p style={{ color: brand.textMuted }}>{fmtR(s.monthlyRent)}/mo</p>
-                      <p style={{ color: brand.textMuted }}>{formatDate(summaryLease.startDate)} → {formatDate(summaryLease.endDate)}</p>
-                    </div>
-                  </div>
-                  <p className="text-xs mt-3" style={{ color: brand.textMuted }}>
-                    Monthly difference: <strong style={{ color: brand.text }}>{s.rentChangeAbsolute > 0 ? '+' : ''}{fmtR(s.rentChangeAbsolute)}</strong>
-                    {' · '}
-                    Over the new term: <strong style={{ color: brand.text }}>{s.rentChangeAbsolute > 0 ? '+' : ''}{fmtR(s.rentChangeAbsolute * s.monthsTotal)}</strong> vs flat
-                  </p>
-                </div>
-              ) : (
-                <div className="mb-4 p-3 rounded text-xs flex items-start gap-2" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
-                  <Info size={14} className="flex-shrink-0 mt-0.5" />
-                  <span>This lease appears to be <strong>new</strong> — no prior lease was found at this property/unit or for this tenant within the last 90 days.</span>
-                </div>
-              )}
-
-              {/* Pipeline meta */}
-              <div className="p-3 rounded text-xs" style={{ backgroundColor: brand.cream }}>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <span style={{ color: brand.textMuted }}>Stage:</span>{' '}
-                    <span style={{ color: brand.text }}>{LEASE_STAGES[summaryLease.pipelineStage]?.label || summaryLease.pipelineStage}</span>
-                  </div>
-                  <div>
-                    <span style={{ color: brand.textMuted }}>Assigned:</span>{' '}
-                    <span style={{ color: brand.text }}>{summaryLease.assignedTo || '—'}</span>
-                  </div>
-                  {summaryLease.docusignEnvelopeId && (
-                    <div className="col-span-2">
-                      <span style={{ color: brand.textMuted }}>DocuSign envelope:</span>{' '}
-                      <span style={{ color: brand.text, fontFamily: 'monospace' }}>{summaryLease.docusignEnvelopeId}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
-                <Button variant="ghost" onClick={() => setSummaryLease(null)}>Close</Button>
-                <Button variant="primary" icon={Edit2} onClick={() => { setSummaryLease(null); openEdit(summaryLease); }}>Edit lease</Button>
-              </div>
-            </>
-          );
-        })()}
-      </Modal>
+      {/* Lease Summary Modal removed in commit (h/8) -- unreachable after the pack rebuild dropped the only setSummaryLease caller. */}
 
       {/* The legacy "Send Lease to DocuSign" upload modal was removed
           in the pack pipeline rebuild (commit c/8). DocuSign send is
