@@ -26,7 +26,13 @@ const DEFAULT_DATA = {
   // Incoming webhook events from external services (Property Inspect, etc).
   // { id, userId, integration, receivedAt, headers (JSON), body (JSON or string), ip }
   webhookEvents: [],
-  nextId: { user: 1, secret: 1, audit: 1, webhook: 1 },
+  // Lease packs — see server/db/packs.js for the full record shape and
+  // stage-transition rules. Each pack is one end-to-end lease workflow
+  // from Offer Sent through to Loading-into-Property-Inspect. Files
+  // (draft DOCX/PDF, signed PDF, FICA docs) are stored inline as
+  // base64 inside the relevant fields — see lease-storage.js.
+  packs: [],
+  nextId: { user: 1, secret: 1, audit: 1, webhook: 1, pack: 1 },
 };
 
 let db;
