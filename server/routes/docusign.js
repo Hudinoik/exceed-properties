@@ -18,6 +18,9 @@ import {
   sendLeaseFromTemplate,
   getEnvelopeStatus,
   downloadSignedDocument,
+  listEnvelopes,
+  listRecipients,
+  listEnvelopeDocuments,
 } from '../docusign/envelopes.js';
 import { audit } from '../db.js';
 
@@ -101,6 +104,22 @@ router.post('/send-from-template', async (req, res) => {
   }
 });
 
+// ----- GET /envelopes ----------------------------------------
+// Query: ?fromDate=ISO-8601 (default: 30 days ago)
+// Lists envelopes whose status changed since `fromDate`. Used by
+// admin views and by the Go-Live smoke test (counts as the
+// listStatusChanges API method type).
+router.get('/envelopes', async (req, res) => {
+  const fromDate = req.query.fromDate ? String(req.query.fromDate) : undefined;
+  try {
+    const results = await listEnvelopes({ fromDate });
+    res.json({ results });
+  } catch (err) {
+    logErr('list-envelopes', err);
+    res.status(502).json({ error: 'Failed to list envelopes.' });
+  }
+});
+
 // ----- GET /envelopes/:id -------------------------------------
 router.get('/envelopes/:id', async (req, res) => {
   try {
@@ -109,6 +128,33 @@ router.get('/envelopes/:id', async (req, res) => {
   } catch (err) {
     logErr('get-envelope', err);
     res.status(502).json({ error: 'Failed to retrieve envelope.' });
+  }
+});
+
+// ----- GET /envelopes/:id/recipients --------------------------
+// Returns per-recipient status (created/sent/delivered/completed/
+// declined). For admin per-tenant progress views.
+router.get('/envelopes/:id/recipients', async (req, res) => {
+  try {
+    const recipients = await listRecipients(req.params.id);
+    res.json({ recipients });
+  } catch (err) {
+    logErr('list-recipients', err);
+    res.status(502).json({ error: 'Failed to list recipients.' });
+  }
+});
+
+// ----- GET /envelopes/:id/documents ---------------------------
+// Lists the documents in an envelope (metadata, not content).
+// Combined with GET /envelopes/:id/document to download specific
+// documents by ID.
+router.get('/envelopes/:id/documents', async (req, res) => {
+  try {
+    const documents = await listEnvelopeDocuments(req.params.id);
+    res.json({ documents });
+  } catch (err) {
+    logErr('list-documents', err);
+    res.status(502).json({ error: 'Failed to list documents.' });
   }
 });
 

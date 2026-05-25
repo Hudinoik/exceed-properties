@@ -136,6 +136,16 @@ export const proxy = {
   async docusignGetEnvelope(envelopeId) {
     return request(`/api/docusign/envelopes/${encodeURIComponent(envelopeId)}`);
   },
+  async docusignListEnvelopes({ fromDate } = {}) {
+    const qs = fromDate ? `?fromDate=${encodeURIComponent(fromDate)}` : '';
+    return request(`/api/docusign/envelopes${qs}`);
+  },
+  async docusignListRecipients(envelopeId) {
+    return request(`/api/docusign/envelopes/${encodeURIComponent(envelopeId)}/recipients`);
+  },
+  async docusignListEnvelopeDocuments(envelopeId) {
+    return request(`/api/docusign/envelopes/${encodeURIComponent(envelopeId)}/documents`);
+  },
   // Returns a Blob of the signed PDF — use FileSaver/etc. to hand it to
   // the user. We don't use request() here because the response isn't JSON.
   async docusignDownloadEnvelopeDocument(envelopeId, documentId = 'combined') {
