@@ -957,6 +957,7 @@ const PERMISSIONS = {
   VIEW_TENANCY: 'view:tenancy',
   VIEW_PROJECTIONS: 'view:projections',
   VIEW_LEASE_LEARNER: 'view:leaseLearner',
+  VIEW_AI: 'view:ai',
   VIEW_LEASING: 'view:leasing',
   EDIT_LEASING: 'edit:leasing',
   VIEW_DEBTORS: 'view:debtors',
@@ -987,7 +988,7 @@ const ROLES = {
       PERMISSIONS.VIEW_OUTAGES, PERMISSIONS.REPORT_OUTAGES,
       PERMISSIONS.VIEW_TENANCY, PERMISSIONS.VIEW_PROJECTIONS, PERMISSIONS.VIEW_LEASE_LEARNER,
       PERMISSIONS.VIEW_LEASING, PERMISSIONS.VIEW_DEBTORS, PERMISSIONS.VIEW_REPORTS,
-      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK,
+      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK, PERMISSIONS.VIEW_AI,
     ],
   },
   leasing_agent: {
@@ -999,7 +1000,7 @@ const ROLES = {
       PERMISSIONS.VIEW_LEASING, PERMISSIONS.EDIT_LEASING,
       PERMISSIONS.VIEW_DEBTORS, PERMISSIONS.VIEW_TENANCY,
       PERMISSIONS.VIEW_LEASE_LEARNER, PERMISSIONS.VIEW_PROJECTIONS,
-      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK,
+      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK, PERMISSIONS.VIEW_AI,
     ],
   },
   inspector: {
@@ -1010,7 +1011,7 @@ const ROLES = {
       PERMISSIONS.VIEW_DASHBOARD, PERMISSIONS.VIEW_PROPERTIES,
       PERMISSIONS.VIEW_INSPECTIONS, PERMISSIONS.EDIT_INSPECTIONS,
       PERMISSIONS.VIEW_MAINTENANCE, PERMISSIONS.VIEW_OUTAGES, PERMISSIONS.REPORT_OUTAGES,
-      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK,
+      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK, PERMISSIONS.VIEW_AI,
     ],
   },
   debtors_manager: {
@@ -1018,9 +1019,10 @@ const ROLES = {
     description: 'Track payments and chase overdue accounts',
     color: '#8B2929',
     permissions: [
-      PERMISSIONS.VIEW_DASHBOARD, PERMISSIONS.VIEW_DEBTORS, PERMISSIONS.EDIT_DEBTORS,
+      PERMISSIONS.VIEW_DASHBOARD, PERMISSIONS.VIEW_PROPERTIES,
+      PERMISSIONS.VIEW_DEBTORS, PERMISSIONS.EDIT_DEBTORS,
       PERMISSIONS.VIEW_LEASING, PERMISSIONS.VIEW_REPORTS,
-      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK,
+      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK, PERMISSIONS.VIEW_AI,
     ],
   },
   maintenance: {
@@ -1031,7 +1033,7 @@ const ROLES = {
       PERMISSIONS.VIEW_DASHBOARD, PERMISSIONS.VIEW_PROPERTIES,
       PERMISSIONS.VIEW_MAINTENANCE, PERMISSIONS.EDIT_MAINTENANCE,
       PERMISSIONS.VIEW_OUTAGES, PERMISSIONS.REPORT_OUTAGES,
-      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK,
+      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.EDIT_ONDESK, PERMISSIONS.VIEW_AI,
     ],
   },
   readonly: {
@@ -1044,7 +1046,7 @@ const ROLES = {
       PERMISSIONS.VIEW_LEASING, PERMISSIONS.VIEW_DEBTORS, PERMISSIONS.VIEW_REPORTS,
       PERMISSIONS.VIEW_OUTAGES, PERMISSIONS.VIEW_TENANCY,
       PERMISSIONS.VIEW_PROJECTIONS, PERMISSIONS.VIEW_LEASE_LEARNER,
-      PERMISSIONS.VIEW_ONDESK,
+      PERMISSIONS.VIEW_ONDESK, PERMISSIONS.VIEW_AI,
     ],
   },
 };
@@ -2337,12 +2339,33 @@ const EmployeesSection = ({ employees, setEmployees, showToast, logAction }) => 
                     <p className="text-xs flex items-center gap-1" style={{ color: brand.text }}><Mail size={11} /> {emp.email}</p>
                     <p className="text-xs flex items-center gap-1 mt-0.5" style={{ color: brand.textMuted }}><Phone size={11} /> {emp.phone}</p>
                   </td>
-                  <td className="px-5 py-4" style={{ color: brand.text }}>{emp.role}</td>
+                  <td className="px-5 py-4">
+                    <button
+                      type="button"
+                      onClick={() => setSearch(prev => prev.toLowerCase() === emp.role.toLowerCase() ? '' : emp.role)}
+                      className="text-left btn-press rounded px-1 -mx-1 hover:underline"
+                      style={{ color: search.toLowerCase() === emp.role.toLowerCase() ? brand.gold : brand.text, fontWeight: search.toLowerCase() === emp.role.toLowerCase() ? 600 : 400 }}
+                      title={search.toLowerCase() === emp.role.toLowerCase() ? 'Click to clear filter' : `Filter by ${emp.role}`}
+                    >
+                      {emp.role}
+                    </button>
+                  </td>
                   <td className="px-5 py-4">
                     <div className="flex items-center gap-2">
                       <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: DEPARTMENTS_CONFIG[emp.department]?.color || brand.gold }} />
                       <div>
-                        <p className="text-sm" style={{ color: brand.text }}>{emp.department}</p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setFilterTeam('All');
+                            setFilterDept(prev => prev === emp.department ? 'All' : emp.department);
+                          }}
+                          className="text-sm text-left btn-press rounded px-1 -mx-1 hover:underline"
+                          style={{ color: filterDept === emp.department ? brand.gold : brand.text, fontWeight: filterDept === emp.department ? 600 : 400 }}
+                          title={filterDept === emp.department ? 'Click to clear department filter' : `Filter by ${emp.department}`}
+                        >
+                          {emp.department}
+                        </button>
                         {emp.team && (
                           <p className="text-xs flex items-center gap-1" style={{ color: brand.textMuted }}>
                             {emp.team}
@@ -2445,15 +2468,52 @@ const EmployeesSection = ({ employees, setEmployees, showToast, logAction }) => 
 // ============================================================
 // PROPERTIES
 // ============================================================
-const PropertiesSection = ({ properties, setProperties, tenancies = [], setTenancies, showToast, logAction }) => {
+const PropertiesSection = ({ properties, setProperties, tenancies = [], setTenancies, employees = [], landlords = {}, setLandlords, showToast, logAction }) => {
   const [search, setSearch] = useState('');
   const [uploading, setUploading] = useState(false);
   const [lastImport, setLastImport] = useStoredState('ep:propertiesLastImport', null);
   const [tenanciesModalOpen, setTenanciesModalOpen] = useState(false);
   const [selectedProperty, setSelectedProperty] = useState(null);
+  const [editingManagerId, setEditingManagerId] = useState(null);
+  const [landlordProperty, setLandlordProperty] = useState(null);
+  const [landlordDraft, setLandlordDraft] = useState({ entity: '', bank: '', accountNumber: '', branchCode: '', accountHolder: '', vatNumber: '', resolution: '' });
   const uploadInputRef = useRef(null);
 
-  const filtered = properties.filter(p => p.address.toLowerCase().includes(search.toLowerCase()));
+  const blankLandlord = { entity: '', bank: '', accountNumber: '', branchCode: '', accountHolder: '', vatNumber: '', resolution: '' };
+  const openLandlord = (p) => {
+    setLandlordProperty(p);
+    setLandlordDraft({ ...blankLandlord, ...(landlords[p.address] || {}) });
+  };
+  const saveLandlord = () => {
+    if (!landlordProperty) return;
+    setLandlords({ ...landlords, [landlordProperty.address]: { ...landlordDraft } });
+    logAction && logAction(`Saved landlord details for ${landlordProperty.address}`);
+    showToast('Landlord saved', 'success');
+    setLandlordProperty(null);
+  };
+
+  // Skip placeholder rows imported from MRI/MDA that start with "Ex " (excluded
+  // / ex-portfolio properties). Matches "Ex", "EX", "Ex Centre" but not "Exceed".
+  const isExPlaceholder = (str) => /^ex\b/i.test(String(str || '').trim());
+
+  const filtered = properties
+    .filter(p => !isExPlaceholder(p.address))
+    .filter(p => p.address.toLowerCase().includes(search.toLowerCase()));
+
+  // Property managers are typically employees in Commercial/Residential management.
+  // Show all employees as options — the user picks any name.
+  const managerOptions = useMemo(
+    () => employees.filter(e => e.status !== 'Inactive').map(e => `${e.firstName} ${e.lastName}`).sort(),
+    [employees],
+  );
+
+  const updateManager = (propertyId, manager) => {
+    setProperties(properties.map(p => p.id === propertyId ? { ...p, manager } : p));
+    const p = properties.find(x => x.id === propertyId);
+    logAction && logAction(`Changed property manager for ${p?.address} to ${manager || '—'}`);
+    showToast('Property manager updated', 'success');
+    setEditingManagerId(null);
+  };
 
   // Per-property tenancy aggregates (used in cards + the View Tenants modal)
   const tenanciesByProperty = useMemo(() => {
@@ -2469,9 +2529,8 @@ const PropertiesSection = ({ properties, setProperties, tenancies = [], setTenan
     const key = (addr || '').trim().toLowerCase();
     // Match either exact OR the first comma-separated chunk (building name)
     const exact = tenanciesByProperty[key];
-    if (exact) return exact;
-    const firstChunk = key.split(',')[0].trim();
-    return tenanciesByProperty[firstChunk] || [];
+    const list = exact || tenanciesByProperty[key.split(',')[0].trim()] || [];
+    return list.filter(t => !isExPlaceholder(t.unit) && !isExPlaceholder(t.tenant));
   };
 
   const handleUploadMda = async (file) => {
@@ -2588,35 +2647,74 @@ const PropertiesSection = ({ properties, setProperties, tenancies = [], setTenan
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {filtered.map((p, i) => {
           const propTenancies = tenanciesFor(p.address);
+          const isEditingManager = editingManagerId === p.id;
           return (
           <Card key={p.id} className={`overflow-hidden card-lift animate-fade-in-up stagger-${Math.min(i + 1, 8)}`}>
-            <div className="h-32 relative" style={{ background: `linear-gradient(135deg, ${brand.navy} 0%, ${brand.navyLight} 100%)` }}>
-              <div className="absolute top-3 right-3"><StatusBadge status={p.status} /></div>
-              <div className="absolute bottom-3 left-4">
-                <Building2 size={28} style={{ color: brand.goldLight, opacity: 0.7 }} />
-              </div>
-            </div>
-            <div className="p-5">
-              <p className="text-xs tracking-wider uppercase mb-1" style={{ color: brand.gold }}>{p.type}</p>
-              <h3 className="text-base font-semibold mb-3" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{p.address}</h3>
-              <div className="grid grid-cols-2 gap-3 mb-4 text-xs">
-                <div>
-                  <p style={{ color: brand.textMuted }}>Occupancy</p>
-                  <p className="font-semibold mt-0.5" style={{ color: brand.text }}>{p.occupied}/{p.units} units</p>
-                </div>
-                <div>
-                  <p style={{ color: brand.textMuted }}>Vacancy Rate</p>
-                  <p className="font-semibold mt-0.5" style={{ color: brand.text }}>{p.units ? (((p.units - p.occupied) / p.units) * 100).toFixed(1) : '0.0'}%</p>
+            <button
+              type="button"
+              onClick={() => openTenancies(p)}
+              className="w-full text-left btn-press"
+              style={{ cursor: 'pointer' }}
+              title={`View units in ${p.address}`}
+            >
+              <div className="h-32 relative" style={{ background: `linear-gradient(135deg, ${brand.navy} 0%, ${brand.navyLight} 100%)` }}>
+                <div className="absolute top-3 right-3"><StatusBadge status={p.status} /></div>
+                <div className="absolute bottom-3 left-4">
+                  <Building2 size={28} style={{ color: brand.goldLight, opacity: 0.7 }} />
                 </div>
               </div>
-              <div className="flex items-center justify-between pt-3" style={{ borderTop: `1px solid ${brand.border}` }}>
-                <p className="text-xs" style={{ color: brand.textMuted }}>Manager: <span style={{ color: brand.text }}>{p.manager || '—'}</span></p>
+              <div className="p-5 pb-3">
+                <p className="text-xs tracking-wider uppercase mb-1" style={{ color: brand.gold }}>{p.type}</p>
+                <h3 className="text-base font-semibold mb-3" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{p.address}</h3>
+                <div className="grid grid-cols-2 gap-3 mb-2 text-xs">
+                  <div>
+                    <p style={{ color: brand.textMuted }}>Occupancy</p>
+                    <p className="font-semibold mt-0.5" style={{ color: brand.text }}>{p.occupied}/{p.units} units</p>
+                  </div>
+                  <div>
+                    <p style={{ color: brand.textMuted }}>Vacancy Rate</p>
+                    <p className="font-semibold mt-0.5" style={{ color: brand.text }}>{p.units ? (((p.units - p.occupied) / p.units) * 100).toFixed(1) : '0.0'}%</p>
+                  </div>
+                </div>
+              </div>
+            </button>
+            <div className="px-5 pb-5 flex items-center justify-between pt-3" style={{ borderTop: `1px solid ${brand.border}` }}>
+              <div className="text-xs flex items-center gap-2 flex-1 min-w-0">
+                <span style={{ color: brand.textMuted }}>Manager:</span>
+                {isEditingManager ? (
+                  <select
+                    autoFocus
+                    value={p.manager || ''}
+                    onChange={(e) => updateManager(p.id, e.target.value)}
+                    onBlur={() => setEditingManagerId(null)}
+                    className="px-1 py-0.5 text-xs rounded outline-none"
+                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.gold}`, color: brand.text, maxWidth: '160px' }}
+                  >
+                    <option value="">— No manager —</option>
+                    {managerOptions.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setEditingManagerId(p.id)}
+                    className="truncate hover:underline btn-press"
+                    style={{ color: brand.text }}
+                    title="Click to change property manager"
+                  >
+                    {p.manager || '— Click to set —'}
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button onClick={() => openLandlord(p)} className="text-xs font-medium btn-press" style={{ color: brand.navy }} title="Landlord & banking details">
+                  Landlord{landlords[p.address] ? ' ✓' : ''}
+                </button>
                 {propTenancies.length > 0 ? (
                   <button onClick={() => openTenancies(p)} className="text-xs font-medium flex items-center gap-1 btn-press" style={{ color: brand.gold }}>
-                    View Tenants ({propTenancies.length}) <ChevronRight size={12} />
+                    Units ({propTenancies.length}) <ChevronRight size={12} />
                   </button>
                 ) : (
-                  <span className="text-xs" style={{ color: brand.textMuted }}>No tenancies imported</span>
+                  <span className="text-xs" style={{ color: brand.textMuted }}>No tenancies</span>
                 )}
               </div>
             </div>
@@ -2625,8 +2723,69 @@ const PropertiesSection = ({ properties, setProperties, tenancies = [], setTenan
         })}
       </div>
 
-      {/* Tenancies modal — opens when "View Tenants" is clicked on a card */}
-      <Modal open={tenanciesModalOpen} onClose={() => setTenanciesModalOpen(false)} title={selectedProperty ? `Tenancies — ${selectedProperty.address}` : 'Tenancies'} size="lg">
+      {/* Landlord modal — banking details + resolution per centre */}
+      <Modal open={!!landlordProperty} onClose={() => setLandlordProperty(null)} title={landlordProperty ? `Landlord — ${landlordProperty.address}` : 'Landlord'} size="md">
+        {landlordProperty && (
+          <>
+            <p className="text-xs mb-3" style={{ color: brand.textMuted }}>
+              Held securely on the device. The resolution is pulled into the lease agreement when drafting a new pack for this centre.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
+              <Field label="Landlord entity">
+                <Input value={landlordDraft.entity} onChange={(e) => setLandlordDraft({ ...landlordDraft, entity: e.target.value })} placeholder="e.g. Bougainville Trading (Pty) Ltd" />
+              </Field>
+              <Field label="VAT number">
+                <Input value={landlordDraft.vatNumber} onChange={(e) => setLandlordDraft({ ...landlordDraft, vatNumber: e.target.value })} placeholder="e.g. 4123456789" />
+              </Field>
+              <Field label="Bank">
+                <Input value={landlordDraft.bank} onChange={(e) => setLandlordDraft({ ...landlordDraft, bank: e.target.value })} placeholder="e.g. Standard Bank" />
+              </Field>
+              <Field label="Branch code">
+                <Input value={landlordDraft.branchCode} onChange={(e) => setLandlordDraft({ ...landlordDraft, branchCode: e.target.value })} placeholder="e.g. 051001" />
+              </Field>
+              <Field label="Account holder">
+                <Input value={landlordDraft.accountHolder} onChange={(e) => setLandlordDraft({ ...landlordDraft, accountHolder: e.target.value })} />
+              </Field>
+              <Field label="Account number">
+                <Input value={landlordDraft.accountNumber} onChange={(e) => setLandlordDraft({ ...landlordDraft, accountNumber: e.target.value })} />
+              </Field>
+            </div>
+            <Field label="Resolution" hint="Pasted into the lease agreement when drafting">
+              <textarea
+                value={landlordDraft.resolution}
+                onChange={(e) => setLandlordDraft({ ...landlordDraft, resolution: e.target.value })}
+                rows={8}
+                placeholder="RESOLUTION OF THE DIRECTORS OF [LANDLORD ENTITY]…"
+                className="w-full px-3 py-2 text-sm rounded outline-none transition-all"
+                style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text, fontFamily: 'Georgia, serif' }}
+              />
+            </Field>
+            <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
+              <Button variant="ghost" onClick={() => setLandlordProperty(null)}>Cancel</Button>
+              {landlords[landlordProperty.address] && (
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    const next = { ...landlords };
+                    delete next[landlordProperty.address];
+                    setLandlords(next);
+                    logAction && logAction(`Removed landlord record for ${landlordProperty.address}`);
+                    showToast('Landlord removed', 'success');
+                    setLandlordProperty(null);
+                  }}
+                  style={{ color: brand.danger }}
+                >
+                  Remove
+                </Button>
+              )}
+              <Button variant="primary" icon={Save} onClick={saveLandlord}>Save Landlord</Button>
+            </div>
+          </>
+        )}
+      </Modal>
+
+      {/* Units modal — opens when a property card is clicked */}
+      <Modal open={tenanciesModalOpen} onClose={() => setTenanciesModalOpen(false)} title={selectedProperty ? `Units — ${selectedProperty.address}` : 'Units'} size="lg">
         {selectedProperty && (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -2831,7 +2990,6 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [filterLocation, setFilterLocation] = useState('All');
   const [search, setSearch] = useState('');
 
-  const [activeTab, setActiveTab] = useState('bycentre');
   const [reportGranularity, setReportGranularity] = useState('day');
 
   const [rawEntries, setRawEntries] = useState([]);
@@ -2955,38 +3113,8 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return true;
   }), [entries, filterPerson, filterLocation, search]);
 
-  const stats = useMemo(() => {
-    const totalHours = filteredEntries.reduce((s, e) => s + e.hours, 0);
-    const uniqueDays = new Set(filteredEntries.map(e => e.date).filter(Boolean)).size || 1;
-    const uniquePeople = new Set(filteredEntries.map(e => e.employee)).size;
-    return { totalHours, uniqueDays, uniquePeople, avgPerDay: totalHours / uniqueDays };
-  }, [filteredEntries]);
-
-  const byEmployee = useMemo(() => {
-    const map = new Map();
-    filteredEntries.forEach(e => {
-      if (!map.has(e.employee)) map.set(e.employee, { employee: e.employee, totalHours: 0, days: new Set() });
-      const r = map.get(e.employee);
-      r.totalHours += e.hours;
-      r.days.add(e.date);
-    });
-    return Array.from(map.values())
-      .map(r => ({ employee: r.employee, totalHours: r.totalHours, days: r.days.size, avgPerDay: r.totalHours / Math.max(r.days.size, 1) }))
-      .sort((a, b) => b.totalHours - a.totalHours);
-  }, [filteredEntries]);
-
-  const hoursByDay = useMemo(() => {
-    const map = new Map();
-    filteredEntries.forEach(e => {
-      if (!e.date) return;
-      map.set(e.date, (map.get(e.date) || 0) + e.hours);
-    });
-    return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, hours]) => ({
-        date: new Date(date).toLocaleDateString('en-ZA', { month: 'short', day: 'numeric' }),
-        hours: Math.round(hours * 10) / 10,
-      }));
-  }, [filteredEntries]);
+  // Builders Warehouse isn't a tracked centre — strip from the By Centre rollup.
+  const isBuildersWarehouse = (centre) => /builders\s*warehouse/i.test(String(centre || ''));
 
   // Empty state when Jibble isn't configured
   if (!isConfigured) {
@@ -3008,8 +3136,6 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       </div>
     );
   }
-
-  const topByEmployee = byEmployee.slice(0, 10);
 
   return (
     <div className="animate-fade-in-up">
@@ -3045,49 +3171,6 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           </div>
         </Card>
       )}
-
-      {/* Currently clocked in */}
-      <Card className="mb-4 p-4">
-        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-          <div className="flex items-center gap-2">
-            <div className="relative w-2.5 h-2.5">
-              <div className="absolute inset-0 rounded-full" style={{ backgroundColor: brand.success }} />
-              <div className="absolute inset-0 rounded-full animate-ping" style={{ backgroundColor: brand.success, opacity: 0.5 }} />
-            </div>
-            <p className="text-xs font-semibold tracking-wider uppercase" style={{ color: brand.navy }}>
-              Currently Clocked In · {liveEntries.length}
-            </p>
-            {liveLastRefresh && (
-              <span className="text-[11px]" style={{ color: brand.textMuted }}>refreshed {timeAgo(liveLastRefresh.toISOString())}</span>
-            )}
-          </div>
-          <button onClick={fetchLive} className="text-xs flex items-center gap-1 btn-press" style={{ color: brand.gold }}>
-            <RefreshCw size={11} /> Refresh
-          </button>
-        </div>
-        {liveEntries.length === 0 ? (
-          <p className="text-xs italic" style={{ color: brand.textMuted }}>No one is currently clocked in.</p>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-            {liveEntries.map(e => (
-              <div key={e.id} className="p-3 rounded flex items-center gap-3" style={{ backgroundColor: brand.successLight }}>
-                <div className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{ backgroundColor: '#fff', color: brand.success }}>
-                  {(e.employee || '?').split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase()}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-semibold truncate" style={{ color: brand.text }}>{e.employee}</p>
-                  <p className="text-xs flex items-center gap-1 truncate" style={{ color: brand.textMuted }}>
-                    <Clock size={11} /> Since {e.clockIn}
-                  </p>
-                  <p className="text-xs flex items-center gap-1 truncate" style={{ color: brand.text }}>
-                    <MapPin size={11} style={{ color: brand.gold }} /> {e.location}
-                  </p>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
 
       {/* Date range chips + filters */}
       <Card className="mb-4 p-4">
@@ -3143,56 +3226,12 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         </div>
       </Card>
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-        {[
-          { label: 'Total Hours', value: stats.totalHours.toFixed(1), icon: Clock, color: brand.navy },
-          { label: 'People Worked', value: stats.uniquePeople, icon: Users, color: brand.success },
-          { label: 'Days Worked', value: stats.uniqueDays, icon: Calendar, color: brand.warning },
-          { label: 'Avg Hours/Day', value: stats.avgPerDay.toFixed(1), icon: Activity, color: brand.gold },
-        ].map((s, i) => {
-          const Icon = s.icon;
-          return (
-            <Card key={i} className="p-3">
-              <div className="flex items-center justify-between mb-1">
-                <p className="text-xs tracking-wider uppercase" style={{ color: brand.textMuted }}>{s.label}</p>
-                <Icon size={14} style={{ color: s.color }} />
-              </div>
-              <p className="text-2xl font-semibold stat-number" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>{s.value}</p>
-            </Card>
-          );
-        })}
-      </div>
-
-      {/* Tab bar */}
-      <div className="flex gap-1 mb-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
-        {[
-          { id: 'bycentre', label: 'By Centre' },
-          { id: 'daily', label: 'Work Report' },
-          { id: 'overview', label: 'Overview' },
-          { id: 'entries', label: 'Entries' },
-          { id: 'byemployee', label: 'By Employee' },
-        ].map(t => (
-          <button
-            key={t.id}
-            onClick={() => setActiveTab(t.id)}
-            className="px-4 py-2 text-sm font-medium transition-all relative btn-press"
-            style={{
-              color: activeTab === t.id ? brand.gold : brand.textMuted,
-              fontWeight: activeTab === t.id ? 600 : 500,
-            }}
-          >
-            {t.label}
-            {activeTab === t.id && <div className="absolute bottom-0 left-0 right-0 h-0.5" style={{ backgroundColor: brand.gold }} />}
-          </button>
-        ))}
-      </div>
-
-      {/* Tab: By Centre — universal overview of every centre in the filter range */}
-      {activeTab === 'bycentre' && (() => {
+      {/* By Centre — landing view, every centre in range (Builders Warehouse excluded) */}
+      {(() => {
         const byCentre = new Map();
         filteredEntries.forEach(e => {
           const centre = e.location || '—';
+          if (isBuildersWarehouse(centre)) return;
           if (!byCentre.has(centre)) byCentre.set(centre, { centre, visits: 0, hours: 0, people: new Set() });
           const row = byCentre.get(centre);
           row.visits += 1;
@@ -3205,7 +3244,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
 
         if (rows.length === 0) {
           return (
-            <Card className="p-8">
+            <Card className="p-8 mb-4">
               <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
                 {loading ? 'Loading…' : 'No entries match your filters.'}
               </p>
@@ -3217,12 +3256,12 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         const totalHours = rows.reduce((s, r) => s + r.hours, 0);
 
         return (
-          <Card className="p-5">
+          <Card className="p-5 mb-4">
             <div className="mb-4 flex items-end justify-between flex-wrap gap-2">
               <div>
                 <p className="text-xs tracking-wider uppercase" style={{ color: brand.gold }}>Time by Property</p>
                 <h2 className="text-xl" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
-                  Centres in this range
+                  By Centre
                 </h2>
                 <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
                   {rows.length} {rows.length === 1 ? 'centre' : 'centres'} · {dateRange.from} to {dateRange.to}
@@ -3261,68 +3300,51 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         );
       })()}
 
-      {/* Tab: Overview */}
-      {activeTab === 'overview' && (
-        <Card className="p-4">
-          <p className="text-xs font-semibold tracking-wider uppercase mb-3" style={{ color: brand.navy }}>Hours Worked Per Day</p>
-          {hoursByDay.length === 0 ? (
-            <p className="text-sm italic py-8 text-center" style={{ color: brand.textMuted }}>
-              {loading ? 'Loading…' : 'No data in the selected range.'}
+      {/* Currently clocked in */}
+      <Card className="mb-4 p-4">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <div className="relative w-2.5 h-2.5">
+              <div className="absolute inset-0 rounded-full" style={{ backgroundColor: brand.success }} />
+              <div className="absolute inset-0 rounded-full animate-ping" style={{ backgroundColor: brand.success, opacity: 0.5 }} />
+            </div>
+            <p className="text-xs font-semibold tracking-wider uppercase" style={{ color: brand.navy }}>
+              Currently Clocked In · {liveEntries.length}
             </p>
-          ) : (
-            <ResponsiveContainer width="100%" height={280}>
-              <BarChart data={hoursByDay}>
-                <CartesianGrid strokeDasharray="3 3" stroke={brand.border} />
-                <XAxis dataKey="date" tick={{ fontSize: 11, fill: brand.textMuted }} />
-                <YAxis tick={{ fontSize: 11, fill: brand.textMuted }} />
-                <RTooltip />
-                <Bar dataKey="hours" fill={brand.gold} radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </Card>
-      )}
-
-      {/* Tab: Entries */}
-      {activeTab === 'entries' && (
-        <Card>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr style={{ borderBottom: `1px solid ${brand.border}` }}>
-                  {['Employee', 'Date', 'Clock In', 'Clock Out', 'Hours', 'Location'].map(h => (
-                    <th key={h} className="text-left px-5 py-3 text-xs font-medium tracking-wider uppercase" style={{ color: brand.textMuted }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {filteredEntries.length === 0 && (
-                  <tr><td colSpan={6} className="text-center py-8" style={{ color: brand.textMuted }}>
-                    {loading ? 'Loading entries…' : 'No entries match your filters.'}
-                  </td></tr>
-                )}
-                {filteredEntries.map(e => (
-                  <tr key={e.id} style={{ borderBottom: `1px solid ${brand.border}` }} className="hover:bg-black hover:bg-opacity-[0.02]">
-                    <td className="px-5 py-3 font-medium" style={{ color: brand.text }}>{e.employee}</td>
-                    <td className="px-5 py-3 text-xs" style={{ color: brand.textMuted }}>{e.date}</td>
-                    <td className="px-5 py-3" style={{ color: brand.text }}>{e.clockIn}</td>
-                    <td className="px-5 py-3" style={{ color: brand.text }}>{e.clockOut}</td>
-                    <td className="px-5 py-3 font-semibold" style={{ color: brand.navy }}>{e.hours.toFixed(1)}h</td>
-                    <td className="px-5 py-3 text-xs" style={{ color: brand.textMuted }}>
-                      <span className="flex items-center gap-1"><MapPin size={11} />{e.location}</span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {liveLastRefresh && (
+              <span className="text-[11px]" style={{ color: brand.textMuted }}>refreshed {timeAgo(liveLastRefresh.toISOString())}</span>
+            )}
           </div>
-        </Card>
-      )}
+          <button onClick={fetchLive} className="text-xs flex items-center gap-1 btn-press" style={{ color: brand.gold }}>
+            <RefreshCw size={11} /> Refresh
+          </button>
+        </div>
+        {liveEntries.length === 0 ? (
+          <p className="text-xs italic" style={{ color: brand.textMuted }}>No one is currently clocked in.</p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+            {liveEntries.map(e => (
+              <div key={e.id} className="p-3 rounded flex items-center gap-3" style={{ backgroundColor: brand.successLight }}>
+                <div className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{ backgroundColor: '#fff', color: brand.success }}>
+                  {(e.employee || '?').split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold truncate" style={{ color: brand.text }}>{e.employee}</p>
+                  <p className="text-xs flex items-center gap-1 truncate" style={{ color: brand.textMuted }}>
+                    <Clock size={11} /> Since {e.clockIn}
+                  </p>
+                  <p className="text-xs flex items-center gap-1 truncate" style={{ color: brand.text }}>
+                    <MapPin size={11} style={{ color: brand.gold }} /> {e.location}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
 
-      {/* Tab: Daily Report — one table per (person, date) styled like the
-          paper sign-in sheet: Property / Time In / Time Out / Total, then
-          Total Worked and Balance (8 - total) at the bottom. */}
-      {activeTab === 'daily' && (() => {
+      {/* Reporting — one card at a time, driven by the period chips + person filter above. */}
+      {(() => {
         const TARGET_HOURS = 8;
 
         // Helpers to bucket an entry's date into a period key
@@ -3348,11 +3370,22 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           return dateISO;
         };
         const periodLabel = (key) => {
-          if (reportGranularity === 'week') return `${key} → ${sundayOf(key)}`;
+          if (reportGranularity === 'week') return `${key} to ${sundayOf(key)}`;
           if (reportGranularity === 'month') return monthLabelOf(key);
           return key;
         };
         const reportTitle = reportGranularity === 'week' ? 'Weekly' : reportGranularity === 'month' ? 'Monthly' : 'Daily';
+
+        // Person's centre universe: every centre this person has been seen at
+        // across the broader Jibble pull (not narrowed by location/search).
+        // Used to inject 0-visit rows in week/month rollups so Week/Month
+        // reports list every centre the person normally visits.
+        const centreUniverseByPerson = new Map();
+        entries.forEach(e => {
+          if (!e.employee || !e.location) return;
+          if (!centreUniverseByPerson.has(e.employee)) centreUniverseByPerson.set(e.employee, new Set());
+          centreUniverseByPerson.get(e.employee).add(e.location);
+        });
 
         // Group filtered entries by person → period key → [entries]
         const byPersonKey = new Map();
@@ -3365,7 +3398,8 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           keyMap.get(k).push(e);
         });
 
-        // Flatten to report cards. For week/month also compute visits-by-centre.
+        // Flatten to report cards. For week/month also compute visits-by-centre
+        // with 0-visit rows for centres the person normally goes to.
         const reports = [];
         byPersonKey.forEach((keyMap, person) => {
           keyMap.forEach((rows, key) => {
@@ -3375,16 +3409,20 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
               return ai - bi;
             });
             const total = sorted.reduce((s, r) => s + (r.hours || 0), 0);
-            // Visits by centre — one paired clock-in/out = one visit.
             const visits = new Map();
             sorted.forEach(row => {
               const centre = row.location || '—';
               const prev = visits.get(centre) || { count: 0, hours: 0 };
               visits.set(centre, { count: prev.count + 1, hours: prev.hours + (row.hours || 0) });
             });
+            // Inject 0-visit rows for centres in the person's universe but not visited this period.
+            const universe = centreUniverseByPerson.get(person) || new Set();
+            universe.forEach(centre => {
+              if (!visits.has(centre)) visits.set(centre, { count: 0, hours: 0 });
+            });
             const visitList = Array.from(visits.entries())
               .map(([centre, v]) => ({ centre, count: v.count, hours: v.hours }))
-              .sort((a, b) => b.count - a.count || b.hours - a.hours);
+              .sort((a, b) => b.count - a.count || b.hours - a.hours || a.centre.localeCompare(b.centre));
             reports.push({ person, key, rows: sorted, total, visits: visitList });
           });
         });
@@ -3393,10 +3431,16 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           return a.person.localeCompare(b.person);
         });
 
-        const granularityChips = (
-          <Card className="mb-4 p-3">
+        // Only one report at a time. Most recent / first match wins.
+        const r = reports[0];
+
+        const sectionHeader = (
+          <div className="mb-3 flex items-end justify-between flex-wrap gap-2">
+            <div>
+              <p className="text-xs tracking-[0.2em] uppercase" style={{ color: brand.gold }}>Time & Attendance</p>
+              <h2 className="text-xl" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Reporting</h2>
+            </div>
             <div className="flex items-center gap-2 flex-wrap">
-              <p className="text-xs font-medium tracking-wider uppercase" style={{ color: brand.textMuted }}>Granularity</p>
               {[
                 { key: 'day', label: 'Day' },
                 { key: 'week', label: 'Week' },
@@ -3416,13 +3460,13 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                 </button>
               ))}
             </div>
-          </Card>
+          </div>
         );
 
-        if (reports.length === 0) {
+        if (!r) {
           return (
             <>
-              {granularityChips}
+              {sectionHeader}
               <Card className="p-8">
                 <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
                   {loading ? 'Loading…' : 'No entries match your filters.'}
@@ -3432,139 +3476,83 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           );
         }
 
-        const showBalance = reportGranularity === 'day';
-        const showVisitsByCentre = reportGranularity !== 'day';
+        const balance = TARGET_HOURS - r.total;
+        const isDay = reportGranularity === 'day';
 
+        // Week/Month → centre-aggregated table (Project | Visits | Total Time + Total footer)
+        // Day → per-entry table (Property | Time In | Time Out | Total) + Balance row
         return (
           <>
-            {granularityChips}
-            <div className="space-y-6">
-              {reports.map(r => {
-                const balance = TARGET_HOURS - r.total;
-                return (
-                  <Card key={`${r.person}|${r.key}`} className="p-5">
-                    <h2 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
-                      {r.person} - {reportTitle} Work Report ({periodLabel(r.key)})
-                    </h2>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
-                        <thead>
-                          <tr style={{ backgroundColor: brand.navy }}>
-                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
-                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
-                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
-                            <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {r.rows.map((row, idx) => (
-                            <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
-                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
-                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
-                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
-                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
-                            </tr>
-                          ))}
-                          <tr style={{ backgroundColor: '#f8f8f8' }}>
-                            <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
-                            <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
-                            <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
-                          </tr>
-                          {showBalance && (
-                            <tr style={{ backgroundColor: '#f8f8f8' }}>
-                              <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
-                              <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
-                              <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
-                            </tr>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-
-                    {showVisitsByCentre && r.visits.length > 0 && (
-                      <div className="mt-5">
-                        <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>
-                          Visits by Centre · {r.visits.reduce((s, v) => s + v.count, 0)} total
-                        </p>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
-                            <thead>
-                              <tr style={{ backgroundColor: brand.cream }}>
-                                <th className="px-4 py-2 text-left text-xs font-semibold tracking-wider" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>Centre</th>
-                                <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: brand.navy, border: `1px solid ${brand.border}`, width: '120px' }}>Visits</th>
-                                <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: brand.navy, border: `1px solid ${brand.border}`, width: '140px' }}>Hours</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {r.visits.map((v, idx) => (
-                                <tr key={v.centre} style={{ backgroundColor: idx % 2 === 0 ? '#fff' : '#f8f8f8' }}>
-                                  <td className="px-4 py-2" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.centre}</td>
-                                  <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.count}</td>
-                                  <td className="px-4 py-2 text-center" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>{fmtHoursMin(v.hours)}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    )}
-                  </Card>
-                );
-              })}
-            </div>
+            {sectionHeader}
+            <Card key={`${r.person}|${r.key}`} className="p-5">
+              <h3 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                {r.person} – {reportTitle} Work Report ({periodLabel(r.key)})
+              </h3>
+              {isDay ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ backgroundColor: brand.navy }}>
+                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
+                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
+                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
+                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {r.rows.map((row, idx) => (
+                        <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
+                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
+                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
+                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+                        </tr>
+                      ))}
+                      <tr style={{ backgroundColor: '#f8f8f8' }}>
+                        <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                        <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
+                        <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
+                      </tr>
+                      <tr style={{ backgroundColor: '#f8f8f8' }}>
+                        <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                        <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
+                        <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ backgroundColor: brand.navy }}>
+                        <th className="px-4 py-2 text-left text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Project</th>
+                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '120px' }}>Visits</th>
+                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '160px' }}>Total Time</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {r.visits.map((v, idx) => (
+                        <tr key={v.centre} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff', opacity: v.count === 0 ? 0.55 : 1 }}>
+                          <td className="px-4 py-2" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.centre}</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.count}</td>
+                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(v.hours)}</td>
+                        </tr>
+                      ))}
+                      <tr style={{ backgroundColor: brand.cream }}>
+                        <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>Total Hours</td>
+                        <td className="px-4 py-2" style={{ border: `1px solid ${brand.border}` }} />
+                        <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Card>
           </>
         );
       })()}
 
-      {/* Tab: By Employee */}
-      {activeTab === 'byemployee' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <Card className="p-4">
-            <p className="text-xs font-semibold tracking-wider uppercase mb-3" style={{ color: brand.navy }}>
-              Top {topByEmployee.length} by Hours
-            </p>
-            {topByEmployee.length === 0 ? (
-              <p className="text-sm italic py-8 text-center" style={{ color: brand.textMuted }}>No data.</p>
-            ) : (
-              <ResponsiveContainer width="100%" height={Math.max(220, topByEmployee.length * 32 + 40)}>
-                <BarChart data={topByEmployee} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" stroke={brand.border} />
-                  <XAxis type="number" tick={{ fontSize: 11, fill: brand.textMuted }} />
-                  <YAxis type="category" dataKey="employee" width={120} tick={{ fontSize: 11, fill: brand.textMuted }} />
-                  <RTooltip />
-                  <Bar dataKey="totalHours" fill={brand.gold} radius={[0, 4, 4, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </Card>
-          <Card>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr style={{ borderBottom: `1px solid ${brand.border}` }}>
-                    {['Employee', 'Hours', 'Days', 'Avg/Day'].map(h => (
-                      <th key={h} className="text-left px-4 py-2 text-xs font-medium tracking-wider uppercase" style={{ color: brand.textMuted }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {byEmployee.length === 0 && (
-                    <tr><td colSpan={4} className="text-center py-8" style={{ color: brand.textMuted }}>No data.</td></tr>
-                  )}
-                  {byEmployee.map(r => (
-                    <tr key={r.employee} style={{ borderBottom: `1px solid ${brand.border}` }}>
-                      <td className="px-4 py-2 font-medium" style={{ color: brand.text }}>{r.employee}</td>
-                      <td className="px-4 py-2 font-semibold" style={{ color: brand.navy }}>{r.totalHours.toFixed(1)}h</td>
-                      <td className="px-4 py-2 text-xs" style={{ color: brand.textMuted }}>{r.days}</td>
-                      <td className="px-4 py-2 text-xs" style={{ color: brand.textMuted }}>{r.avgPerDay.toFixed(1)}h</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-        </div>
-      )}
     </div>
   );
 };
@@ -6580,11 +6568,14 @@ const computeLeaseSummary = (lease, allLeases) => {
   };
 };
 
-const LeasingSection = ({ leases, setLeases, properties, employees, debtors, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
+const LeasingSection = ({ leases, setLeases, properties, employees, debtors, landlords = {}, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
   // Top-level tab: pipeline view vs Lease Learner. Lease Drafter now lives
   // at its own nav target ('leaseDrafter') so the sidebar stays visible.
   const [subTab, setSubTab] = useState('pipeline');
-  const [activeCategory, setActiveCategory] = useState('all'); // 'all' | 'commercial' | 'residential'
+  const [activeCategory, setActiveCategory] = useState('commercial'); // 'commercial' | 'residential' — kept separate, no combined "All" view
+  const [calculatorOpen, setCalculatorOpen] = useState(false);
+  const [resolutionLease, setResolutionLease] = useState(null);
+  const [resolutionDraft, setResolutionDraft] = useState('');
   const [viewMode, setViewMode] = useState('pipeline'); // 'pipeline' | 'table'
   const [stageFilter, setStageFilter] = useState('All');
   const [expandedStages, setExpandedStages] = useState({}); // stageKey -> bool, default all collapsed
@@ -6632,7 +6623,6 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
 
   // Filter leases based on active category
   const categoryFilteredLeases = useMemo(() => {
-    if (activeCategory === 'all') return leases;
     return leases.filter(l => l.type === activeCategory);
   }, [leases, activeCategory]);
 
@@ -6954,6 +6944,20 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
             </button>
           )}
           <button
+            onClick={() => {
+              const landlordForCentre = landlords[lease.property]
+                || landlords[String(lease.property || '').split(',')[0].trim()];
+              const prefill = lease.resolution || landlordForCentre?.resolution || '';
+              setResolutionDraft(prefill);
+              setResolutionLease(lease);
+            }}
+            className="text-xs px-2 py-1 rounded btn-press"
+            style={{ color: brand.navy, border: `1px solid ${brand.border}` }}
+            title={lease.resolution ? 'View / edit resolution' : 'Add a landlord resolution'}
+          >
+            {lease.resolution ? 'Resolution ✓' : 'Resolution'}
+          </button>
+          <button
             onClick={() => openEdit(lease)}
             className="text-xs px-2 py-1 rounded btn-press"
             style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}
@@ -6988,7 +6992,21 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
               : 'Track leases from offer through DocuSign signing to active. Separate workflows for commercial and residential.'}
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
+          <Button
+            variant="ghost"
+            icon={Calculator}
+            onClick={() => setCalculatorOpen(v => !v)}
+          >
+            {calculatorOpen ? 'Hide Calculator' : 'Calculator'}
+          </Button>
+          <Button
+            variant="ghost"
+            icon={Sparkles}
+            onClick={() => setSubTab(subTab === 'learner' ? 'pipeline' : 'learner')}
+          >
+            {subTab === 'learner' ? 'Close Lease Learner' : 'Lease Learner'}
+          </Button>
           {subTab === 'pipeline' && (
             <>
               <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${brand.border}` }}>
@@ -6996,39 +7014,20 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
                 <button onClick={() => setViewMode('table')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'table' ? brand.navy : '#fff', color: viewMode === 'table' ? '#fff' : brand.text }}>Table</button>
               </div>
               <Button variant="gold" icon={Sparkles} onClick={() => onNavigate?.('leaseDrafter')}>Draft Lease</Button>
-              <Button variant="primary" icon={Plus} onClick={() => openCreate(activeCategory === 'residential' ? 'residential' : 'commercial')}>New Lease</Button>
+              <Button variant="primary" icon={Plus} onClick={() => openCreate(activeCategory === 'residential' ? 'residential' : 'commercial')}>New Pack</Button>
             </>
           )}
         </div>
       </div>
 
-      {/* Top-level sub-tab strip — Pipeline vs Lease Learner */}
-      <div className="flex gap-1 mb-5" style={{ borderBottom: `1px solid ${brand.border}` }}>
-        {[
-          { id: 'pipeline', label: 'Lease Pipeline', icon: FileSignature },
-          { id: 'learner', label: 'Lease Learner', icon: Sparkles },
-        ].map(t => {
-          const Icon = t.icon;
-          const active = subTab === t.id;
-          return (
-            <button
-              key={t.id}
-              onClick={() => setSubTab(t.id)}
-              className="px-4 py-2 text-sm font-medium tracking-wide transition-all flex items-center gap-2"
-              style={{
-                color: active ? brand.navy : brand.textMuted,
-                borderBottom: `2px solid ${active ? brand.gold : 'transparent'}`,
-                marginBottom: '-1px',
-              }}
-            >
-              <Icon size={14} />
-              {t.label}
-            </button>
-          );
-        })}
-      </div>
+      {/* Calculator — collapsible panel at the top */}
+      {calculatorOpen && (
+        <div className="mb-4">
+          <LeasingCalculator />
+        </div>
+      )}
 
-      {/* Lease Learner pane — reuses the standalone component */}
+      {/* Lease Learner pane — opened via the header button */}
       {subTab === 'learner' && (
         <LeaseLearnerSection
           integrations={integrations}
@@ -7042,10 +7041,9 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
       {subTab === 'pipeline' && (
         <>
 
-      {/* Category tabs */}
+      {/* Category tabs — Commercial and Residential kept separate (no combined "All") */}
       <div className="flex gap-1 mb-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
         {[
-          { id: 'all', label: 'All Leases', count: leases.length, color: brand.navy },
           { id: 'commercial', label: 'Commercial', count: commercialCount, color: brand.gold },
           { id: 'residential', label: 'Residential', count: residentialCount, color: brand.success },
         ].map(t => (
@@ -7206,11 +7204,8 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
         </Card>
       )}
 
-      {/* Rental Escalation Calculator */}
-      <LeasingCalculator />
-
       {/* Create/Edit Modal */}
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingId ? 'Edit Lease' : 'New Lease'} size="lg">
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingId ? 'Edit Lease' : 'New Pack'} size="lg">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
           <Field label="Lease Category" required>
             <Select value={form.type} onChange={(e) => handleField('type', e.target.value)}>
@@ -7262,6 +7257,54 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, int
           <Button variant="ghost" onClick={() => setModalOpen(false)}>Cancel</Button>
           <Button variant="primary" icon={Save} onClick={handleSubmit}>{editingId ? 'Save Changes' : 'Create Lease'}</Button>
         </div>
+      </Modal>
+
+      {/* Resolution Modal — paste / view the landlord resolution attached to a lease */}
+      <Modal open={!!resolutionLease} onClose={() => setResolutionLease(null)} title={resolutionLease ? `Landlord Resolution — ${resolutionLease.tenant}` : 'Landlord Resolution'} size="md">
+        {resolutionLease && (
+          <>
+            <p className="text-xs mb-3" style={{ color: brand.textMuted }}>
+              The landlord resolution authorises the lease. Paste the full resolution text here — it will be pulled into the lease agreement when drafting.
+            </p>
+            <textarea
+              value={resolutionDraft}
+              onChange={(e) => setResolutionDraft(e.target.value)}
+              rows={12}
+              placeholder="RESOLUTION OF THE DIRECTORS OF [LANDLORD ENTITY]…"
+              className="w-full px-3 py-2 text-sm rounded outline-none transition-all"
+              style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text, fontFamily: 'Georgia, serif' }}
+            />
+            <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
+              <Button variant="ghost" onClick={() => setResolutionLease(null)}>Cancel</Button>
+              {resolutionLease.resolution && (
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setLeases(leases.map(l => l.id === resolutionLease.id ? { ...l, resolution: '' } : l));
+                    logAction(`Removed resolution from lease "${resolutionLease.tenant}"`);
+                    showToast('Resolution cleared', 'success');
+                    setResolutionLease(null);
+                  }}
+                  style={{ color: brand.danger }}
+                >
+                  Clear
+                </Button>
+              )}
+              <Button
+                variant="primary"
+                icon={Save}
+                onClick={() => {
+                  setLeases(leases.map(l => l.id === resolutionLease.id ? { ...l, resolution: resolutionDraft.trim() } : l));
+                  logAction(`Saved resolution for lease "${resolutionLease.tenant}"`);
+                  showToast('Resolution saved', 'success');
+                  setResolutionLease(null);
+                }}
+              >
+                Save Resolution
+              </Button>
+            </div>
+          </>
+        )}
       </Modal>
 
       {/* DocuSign Send Modal */}
@@ -9496,9 +9539,6 @@ const UsersSection = ({ employees, setEmployees, currentUser, setCurrentUser, sh
           <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Users & Roles</h1>
           <p className="text-sm" style={{ color: brand.textMuted }}>Manage who can access the system and what they can do.</p>
         </div>
-        {canManage && (
-          <Button variant="primary" icon={UserPlus} onClick={openInvite}>Invite User</Button>
-        )}
       </div>
 
       {/* Role distribution */}
@@ -11336,6 +11376,7 @@ const SettingsSection = ({
   auditLog, setAuditLog,
   employees, properties, inspections, leases, debtors, maintenance,
   setEmployees, setProperties, setInspections, setLeases, setDebtors, setMaintenance,
+  tenancies, setTenancies, landlords, setLandlords, outages, setOutages,
   showToast, logAction,
 }) => {
   const [activeTab, setActiveTab] = useState('company');
@@ -11402,14 +11443,18 @@ const SettingsSection = ({
     setDeptToDelete(null);
   };
 
-  // ---- Data Export / Reset ----
+  // ---- Data Export / Import / Reset ----
+  // What goes into a backup. Keep keys stable — they're the contract for import.
+  const buildBackup = () => ({
+    schema: 'exceed-properties-backup/v1',
+    exportedAt: new Date().toISOString(),
+    companyProfile, departments, notificationPrefs, integrations, security,
+    employees, properties, inspections, leases, debtors, maintenance, auditLog,
+    tenancies: tenancies || [], landlords: landlords || {}, outages: outages || [],
+  });
+
   const exportData = () => {
-    const data = {
-      exportedAt: new Date().toISOString(),
-      companyProfile, departments, notificationPrefs, integrations, security,
-      employees, properties, inspections, leases, debtors, maintenance, auditLog,
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(buildBackup(), null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -11418,6 +11463,47 @@ const SettingsSection = ({
     URL.revokeObjectURL(url);
     logAction('Exported full data backup');
     showToast('Backup downloaded', 'success');
+  };
+
+  const importInputRef = useRef(null);
+  const [importing, setImporting] = useState(false);
+  const handleImportFile = (file) => {
+    if (!file) return;
+    setImporting(true);
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(String(reader.result || ''));
+        if (typeof data !== 'object' || data === null) throw new Error('Not a JSON object');
+        // Only apply keys that exist in the backup — leave the rest untouched.
+        if (data.companyProfile) setCompanyProfile(data.companyProfile);
+        if (Array.isArray(data.departments)) setDepartments(data.departments);
+        if (data.notificationPrefs) setNotificationPrefs(data.notificationPrefs);
+        if (data.integrations) setIntegrations(data.integrations);
+        if (data.security) setSecurity(data.security);
+        if (Array.isArray(data.employees)) setEmployees(data.employees);
+        if (Array.isArray(data.properties)) setProperties(data.properties);
+        if (Array.isArray(data.inspections)) setInspections(data.inspections);
+        if (Array.isArray(data.leases)) setLeases(data.leases);
+        if (Array.isArray(data.debtors)) setDebtors(data.debtors);
+        if (Array.isArray(data.maintenance)) setMaintenance(data.maintenance);
+        if (Array.isArray(data.auditLog)) setAuditLog(data.auditLog);
+        if (Array.isArray(data.tenancies) && setTenancies) setTenancies(data.tenancies);
+        if (data.landlords && typeof data.landlords === 'object' && setLandlords) setLandlords(data.landlords);
+        if (Array.isArray(data.outages) && setOutages) setOutages(data.outages);
+        logAction(`Imported backup from ${file.name}`);
+        showToast('Backup imported successfully', 'success');
+      } catch (err) {
+        showToast('Import failed: ' + (err.message || 'invalid file'), 'error');
+      } finally {
+        setImporting(false);
+      }
+    };
+    reader.onerror = () => {
+      showToast('Could not read file', 'error');
+      setImporting(false);
+    };
+    reader.readAsText(file);
   };
 
   const resetAllData = () => {
@@ -11754,7 +11840,7 @@ const SettingsSection = ({
             <div className="space-y-4">
               <Card className="p-6">
                 <h2 className="text-lg font-semibold mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>Data Backup</h2>
-                <p className="text-xs mb-4" style={{ color: brand.textMuted }}>Download a complete JSON snapshot of all employees, properties, leases, debtors, inspections, maintenance, and settings.</p>
+                <p className="text-xs mb-4" style={{ color: brand.textMuted }}>Download a complete JSON snapshot, or restore from a previous backup. Includes employees, properties, leases, debtors, inspections, maintenance, tenancies, landlords, outages, and settings.</p>
                 <div className="flex items-center gap-3 mb-4">
                   <div className="grid grid-cols-3 gap-3 flex-1 text-xs">
                     <div className="text-center p-2 rounded" style={{ backgroundColor: brand.cream }}>
@@ -11771,7 +11857,22 @@ const SettingsSection = ({
                     </div>
                   </div>
                 </div>
-                <Button variant="primary" icon={Download} onClick={exportData}>Export Full Backup</Button>
+                <div className="flex gap-2 flex-wrap">
+                  <Button variant="primary" icon={Download} onClick={exportData}>Export Full Backup</Button>
+                  <input
+                    ref={importInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    className="hidden"
+                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleImportFile(f); e.target.value = ''; }}
+                  />
+                  <Button variant="ghost" icon={Upload} onClick={() => importInputRef.current?.click()} disabled={importing}>
+                    {importing ? 'Importing…' : 'Import Backup'}
+                  </Button>
+                </div>
+                <p className="text-[11px] mt-3" style={{ color: brand.textMuted }}>
+                  Import overwrites only the sections that the backup file contains. Other sections stay as they are. Schema: <code>exceed-properties-backup/v1</code>.
+                </p>
               </Card>
 
               <Card className="p-6" style={{ borderColor: brand.danger }}>
@@ -12183,8 +12284,6 @@ const OutagesSection = ({ outages, setOutages, properties, currentUser, showToas
     severity: [validators.required],
     startedAt: [validators.required],
     description: [(v) => !v || v.trim().length < 10 ? 'Please describe the outage in at least 10 characters' : ''],
-    reporterName: [validators.required],
-    reporterContact: [validators.required],
   };
 
   const handleField = (f, v) => {
@@ -12425,13 +12524,7 @@ const OutagesSection = ({ outages, setOutages, properties, currentUser, showToas
           <Field label="Units Affected" hint="Approximate count, optional">
             <Input type="number" min="0" value={form.affectedUnits} onChange={(e) => handleField('affectedUnits', e.target.value)} placeholder="e.g. 12" />
           </Field>
-          <Field label="Reporter Name" required error={touched.reporterName && errors.reporterName}>
-            <Input value={form.reporterName} onChange={(e) => handleField('reporterName', e.target.value)} onBlur={() => handleBlur('reporterName')} error={touched.reporterName && errors.reporterName} placeholder="Who is reporting this" />
-          </Field>
         </div>
-        <Field label="Reporter Contact" required error={touched.reporterContact && errors.reporterContact} hint="Phone or email for follow-up">
-          <Input value={form.reporterContact} onChange={(e) => handleField('reporterContact', e.target.value)} onBlur={() => handleBlur('reporterContact')} error={touched.reporterContact && errors.reporterContact} placeholder="+27 82 555 0000 or name@example.co.za" />
-        </Field>
         <Field label="What's happening?" required error={touched.description && errors.description} hint="Minimum 10 characters — include any safety concerns">
           <textarea
             value={form.description}
@@ -13305,6 +13398,461 @@ Return ONLY valid JSON. No prose before or after.`;
 };
 
 // ============================================================
+// AI ASSISTANT
+// ============================================================
+// Free-form chat with Claude that has read access to the app's state. Users
+// can paste data or upload .csv / .pdf files and ask Claude to populate the
+// app — Claude calls structured tools (add_properties, add_employees,
+// add_leases) which the UI surfaces as confirmation cards before applying.
+const AI_TOOLS = [
+  {
+    name: 'add_properties',
+    description: 'Propose new property records to add to the Properties tab. Use this when the user provides a list of properties (e.g. from a CSV or PDF) and asks to add them.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        properties: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              address: { type: 'string', description: 'Full property name / address. Required.' },
+              type: { type: 'string', description: 'e.g. Shopping Centre, Office Park, Apartment Complex, Residential Estate' },
+              units: { type: 'number' },
+              occupied: { type: 'number' },
+              manager: { type: 'string' },
+              status: { type: 'string', description: 'Active or Inactive' },
+            },
+            required: ['address'],
+          },
+        },
+      },
+      required: ['properties'],
+    },
+  },
+  {
+    name: 'add_employees',
+    description: 'Propose new employees to add. Use when the user provides a roster of staff to import.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        employees: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              firstName: { type: 'string' },
+              lastName: { type: 'string' },
+              email: { type: 'string' },
+              phone: { type: 'string' },
+              role: { type: 'string' },
+              department: { type: 'string' },
+              status: { type: 'string', description: 'Active / On Leave / Inactive' },
+              startDate: { type: 'string', description: 'ISO YYYY-MM-DD' },
+              idNumber: { type: 'string', description: 'South African 13-digit ID, optional' },
+            },
+            required: ['firstName', 'lastName'],
+          },
+        },
+      },
+      required: ['employees'],
+    },
+  },
+  {
+    name: 'add_leases',
+    description: 'Propose new leases to add. Use when the user provides a list of leases to import.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        leases: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              tenant: { type: 'string' },
+              property: { type: 'string' },
+              unit: { type: 'string' },
+              type: { type: 'string', description: 'commercial or residential' },
+              startDate: { type: 'string', description: 'ISO YYYY-MM-DD' },
+              endDate: { type: 'string', description: 'ISO YYYY-MM-DD' },
+              monthlyRent: { type: 'number' },
+              deposit: { type: 'number' },
+              assignedTo: { type: 'string' },
+            },
+            required: ['tenant', 'property'],
+          },
+        },
+      },
+      required: ['leases'],
+    },
+  },
+];
+
+const AISection = ({
+  employees, setEmployees,
+  properties, setProperties,
+  leases, setLeases,
+  debtors, maintenance, outages, tenancies, landlords,
+  integrations, showToast, logAction, onNavigateToSettings,
+}) => {
+  const anthropicCfg = integrations?.anthropic || {};
+  const [hasKey, setHasKey] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.secrets.get('anthropic')
+      .then(rows => { if (!cancelled) setHasKey(!!rows.find(r => r.key === 'apiKey' && r.hasValue)); })
+      .catch(() => { if (!cancelled) setHasKey(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // messages: [{ role: 'user'|'assistant', content: string | [{type, ...}], proposals?: [{kind, items}] }]
+  const [messages, setMessages] = useStoredState('ep:aiMessages', []);
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  const [attachments, setAttachments] = useState([]); // [{ name, text }]
+  const fileInputRef = useRef(null);
+  const transcriptRef = useRef(null);
+
+  useEffect(() => {
+    // Stick to the bottom on new messages.
+    if (transcriptRef.current) {
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+    }
+  }, [messages, sending]);
+
+  const buildSystemPrompt = () => {
+    const summary = {
+      employees: employees.length,
+      properties: properties.length,
+      leases: leases.length,
+      debtors: debtors?.length || 0,
+      maintenance: maintenance?.length || 0,
+      outages: outages?.length || 0,
+      tenancies: tenancies?.length || 0,
+      landlords: Object.keys(landlords || {}).length,
+    };
+    // Send a compact list of property names + lease counts so Claude can
+    // reason about the portfolio without spilling sensitive details.
+    const propertyList = properties.slice(0, 50).map(p => `${p.address} (${p.type || '—'}, ${p.occupied || 0}/${p.units || 0} units, mgr: ${p.manager || '—'})`).join('\n');
+    return [
+      'You are the assistant for the Exceed Properties web application.',
+      'You can answer questions about the portfolio, explain how the app works, and help the user import data.',
+      '',
+      'Current portfolio snapshot (counts):',
+      JSON.stringify(summary),
+      '',
+      'Known properties (up to 50):',
+      propertyList || '(none yet)',
+      '',
+      'When the user asks you to ADD records (properties, employees, leases) from data they paste or attach:',
+      '  • Call the relevant tool (add_properties / add_employees / add_leases) with the parsed records.',
+      '  • Do not invent fields — only include what you can extract or that the user explicitly provides.',
+      '  • Briefly explain in your text response what you proposed and any caveats.',
+      '',
+      'For ad-hoc questions, answer concisely with bullet points or short paragraphs.',
+    ].join('\n');
+  };
+
+  // Apply a tool-use proposal to app state.
+  const applyProposal = (kind, items) => {
+    if (!Array.isArray(items) || items.length === 0) return;
+    if (kind === 'add_properties') {
+      const baseId = Math.max(0, ...properties.map(p => Number(p.id) || 0));
+      const next = items.map((it, idx) => ({
+        id: baseId + idx + 1,
+        address: it.address || `New Property ${idx + 1}`,
+        type: it.type || 'Property',
+        units: Number(it.units) || 0,
+        occupied: Number(it.occupied) || 0,
+        manager: it.manager || '',
+        status: it.status || 'Active',
+      }));
+      setProperties([...properties, ...next]);
+      logAction(`Added ${next.length} propert${next.length === 1 ? 'y' : 'ies'} via AI Assistant`);
+      showToast(`Added ${next.length} propert${next.length === 1 ? 'y' : 'ies'}`, 'success');
+    } else if (kind === 'add_employees') {
+      const baseId = Math.max(0, ...employees.map(e => Number(e.id) || 0));
+      const next = items.map((it, idx) => ({
+        id: baseId + idx + 1,
+        firstName: it.firstName || '',
+        lastName: it.lastName || '',
+        email: it.email || '',
+        phone: it.phone || '',
+        role: it.role || '',
+        department: it.department || 'Commercial Leasing',
+        team: '',
+        isTeamLead: false,
+        status: it.status || 'Active',
+        startDate: it.startDate || todayISO(),
+        idNumber: it.idNumber || '',
+      }));
+      setEmployees([...employees, ...next]);
+      logAction(`Added ${next.length} employee${next.length === 1 ? '' : 's'} via AI Assistant`);
+      showToast(`Added ${next.length} employee${next.length === 1 ? '' : 's'}`, 'success');
+    } else if (kind === 'add_leases') {
+      const baseId = Math.max(0, ...leases.map(l => Number(l.id) || 0));
+      const next = items.map((it, idx) => ({
+        id: baseId + idx + 1,
+        type: it.type === 'residential' ? 'residential' : 'commercial',
+        tenant: it.tenant || `Tenant ${idx + 1}`,
+        property: it.property || '',
+        unit: it.unit || '',
+        startDate: it.startDate || todayISO(),
+        endDate: it.endDate || '',
+        monthlyRent: Number(it.monthlyRent) || 0,
+        deposit: Number(it.deposit) || 0,
+        assignedTo: it.assignedTo || '',
+        status: 'Active',
+        pipelineStage: 'active',
+      }));
+      setLeases([...leases, ...next]);
+      logAction(`Added ${next.length} lease${next.length === 1 ? '' : 's'} via AI Assistant`);
+      showToast(`Added ${next.length} lease${next.length === 1 ? '' : 's'}`, 'success');
+    }
+  };
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    try {
+      let text = '';
+      if (/\.pdf$/i.test(file.name)) {
+        text = await extractPdfText(file);
+      } else if (/\.csv$/i.test(file.name)) {
+        text = await file.text();
+      } else if (/\.(txt|md|json)$/i.test(file.name)) {
+        text = await file.text();
+      } else {
+        showToast('Supported: .csv, .pdf, .txt, .md, .json', 'error');
+        return;
+      }
+      const trimmed = text.slice(0, 50000); // cap so we don't blow the context window
+      setAttachments(prev => [...prev, { name: file.name, text: trimmed, fullSize: text.length }]);
+      showToast(`Attached ${file.name}`, 'success');
+    } catch (err) {
+      showToast(`Could not read ${file.name}: ${err.message}`, 'error');
+    }
+  };
+
+  const send = async () => {
+    if (!hasKey) {
+      showToast('Connect the Anthropic API in Settings → Integrations first', 'error');
+      return;
+    }
+    const userText = input.trim();
+    if (!userText && attachments.length === 0) return;
+
+    // Compose the user message, embedding any attached files inline.
+    const attachmentBlock = attachments.length === 0 ? '' :
+      '\n\n=== ATTACHED FILES ===\n' + attachments.map(a => `--- ${a.name} (${a.fullSize} chars, ${a.text.length} included) ---\n${a.text}`).join('\n\n');
+    const composed = userText + attachmentBlock;
+
+    const newUserMsg = { role: 'user', content: composed, attachmentNames: attachments.map(a => a.name) };
+    const next = [...messages, newUserMsg];
+    setMessages(next);
+    setInput('');
+    setAttachments([]);
+    setSending(true);
+
+    try {
+      const apiMessages = next.map(m => ({
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      }));
+      const res = await api.proxy.anthropicMessages({
+        model: anthropicCfg.model || 'claude-haiku-4-5-20251001',
+        max_tokens: 4096,
+        system: buildSystemPrompt(),
+        tools: AI_TOOLS,
+        messages: apiMessages,
+      });
+      const blocks = res.content || [];
+      const textOut = blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
+      const toolUses = blocks.filter(b => b.type === 'tool_use');
+      const proposals = toolUses.map(b => {
+        const kind = b.name;
+        const items = b.input?.properties || b.input?.employees || b.input?.leases || [];
+        return { kind, items };
+      }).filter(p => Array.isArray(p.items) && p.items.length > 0);
+
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: textOut || (proposals.length ? '(see proposed records below)' : '(no response)'),
+        proposals: proposals.length ? proposals : undefined,
+      }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err.message || 'Request failed'}` }]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const clearChat = () => {
+    setMessages([]);
+    setAttachments([]);
+  };
+
+  if (!hasKey) {
+    return (
+      <div className="animate-fade-in-up">
+        <div className="mb-6">
+          <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Assistant</p>
+          <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>AI Assistant</h1>
+          <p className="text-sm" style={{ color: brand.textMuted }}>Ask Claude about your portfolio, or paste data to import.</p>
+        </div>
+        <Card className="p-8">
+          <EmptyState
+            icon={Sparkles}
+            title="Connect Claude first"
+            message="Add your Anthropic API key in Settings → Integrations to start using the AI Assistant."
+            action={<Button variant="primary" icon={SettingsIcon} onClick={onNavigateToSettings}>Open Settings</Button>}
+          />
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className="animate-fade-in-up">
+      <div className="flex items-end justify-between mb-4 flex-wrap gap-3">
+        <div>
+          <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Assistant</p>
+          <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>AI Assistant</h1>
+          <p className="text-sm" style={{ color: brand.textMuted }}>Claude has read-only access to your portfolio. Upload .csv / .pdf to import.</p>
+        </div>
+        <div className="flex gap-2">
+          {messages.length > 0 && (
+            <Button variant="ghost" icon={Undo2} onClick={clearChat}>Clear Chat</Button>
+          )}
+        </div>
+      </div>
+
+      <Card className="p-0">
+        <div
+          ref={transcriptRef}
+          className="overflow-y-auto p-4 space-y-3"
+          style={{ minHeight: '300px', maxHeight: '60vh', backgroundColor: brand.cream }}
+        >
+          {messages.length === 0 && (
+            <div className="text-center py-12">
+              <Sparkles size={28} className="mx-auto mb-3" style={{ color: brand.gold }} />
+              <p className="text-sm" style={{ color: brand.textMuted }}>
+                Try: <em>"How many leases are expiring in the next 90 days?"</em> · <em>"Add the properties from this CSV"</em>
+              </p>
+            </div>
+          )}
+          {messages.map((m, idx) => (
+            <div key={idx} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div
+                className="max-w-[85%] rounded p-3 text-sm whitespace-pre-wrap"
+                style={{
+                  backgroundColor: m.role === 'user' ? brand.navy : '#fff',
+                  color: m.role === 'user' ? '#fff' : brand.text,
+                  border: m.role === 'user' ? 'none' : `1px solid ${brand.border}`,
+                }}
+              >
+                {m.attachmentNames && m.attachmentNames.length > 0 && (
+                  <div className="mb-2 text-xs italic" style={{ opacity: 0.85 }}>
+                    📎 {m.attachmentNames.join(', ')}
+                  </div>
+                )}
+                <div>{typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}</div>
+                {m.proposals && m.proposals.map((p, pi) => (
+                  <div key={pi} className="mt-3 p-3 rounded" style={{ backgroundColor: brand.goldPale, color: brand.text, border: `1px solid ${brand.gold}` }}>
+                    <p className="text-xs font-semibold mb-1" style={{ color: brand.navy }}>
+                      Claude wants to {p.kind.replace('_', ' ')} ({p.items.length})
+                    </p>
+                    <ul className="text-xs space-y-0.5 mb-2 max-h-40 overflow-y-auto">
+                      {p.items.slice(0, 15).map((it, i) => (
+                        <li key={i} style={{ color: brand.text }}>
+                          {p.kind === 'add_properties' && `• ${it.address}${it.type ? ` (${it.type})` : ''}`}
+                          {p.kind === 'add_employees' && `• ${it.firstName} ${it.lastName}${it.role ? ` — ${it.role}` : ''}`}
+                          {p.kind === 'add_leases' && `• ${it.tenant} @ ${it.property}${it.unit ? ` · ${it.unit}` : ''}`}
+                        </li>
+                      ))}
+                      {p.items.length > 15 && <li className="italic" style={{ color: brand.textMuted }}>… and {p.items.length - 15} more</li>}
+                    </ul>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      icon={Save}
+                      onClick={() => {
+                        applyProposal(p.kind, p.items);
+                        // Strip this proposal so it can't be applied twice.
+                        setMessages(prev => prev.map((mm, mi) => mi === idx ? { ...mm, proposals: mm.proposals.filter((_, qi) => qi !== pi) } : mm));
+                      }}
+                    >
+                      Apply
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+          {sending && (
+            <div className="flex justify-start">
+              <div className="rounded p-3 text-sm" style={{ backgroundColor: '#fff', color: brand.textMuted, border: `1px solid ${brand.border}` }}>
+                <span className="inline-flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full animate-pulse-soft" style={{ backgroundColor: brand.gold }} />
+                  Claude is thinking…
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="p-3" style={{ borderTop: `1px solid ${brand.border}` }}>
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-1.5">
+              {attachments.map((a, i) => (
+                <span key={i} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded" style={{ backgroundColor: brand.goldPale, color: brand.text }}>
+                  📎 {a.name}
+                  <button type="button" onClick={() => setAttachments(prev => prev.filter((_, j) => j !== i))} className="ml-1" style={{ color: brand.danger }}>×</button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-2 items-end">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.pdf,.txt,.md,.json"
+              className="hidden"
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="p-2 rounded btn-press flex-shrink-0"
+              style={{ border: `1px solid ${brand.border}`, color: brand.textMuted }}
+              title="Attach .csv / .pdf"
+              disabled={sending}
+            >
+              <Upload size={16} />
+            </button>
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+              rows={2}
+              placeholder="Ask Claude about your portfolio, or paste data to import…"
+              className="flex-1 px-3 py-2 text-sm rounded outline-none resize-none"
+              style={{ border: `1px solid ${brand.border}`, color: brand.text }}
+              disabled={sending}
+            />
+            <Button variant="primary" onClick={send} disabled={sending || (!input.trim() && attachments.length === 0)}>
+              {sending ? 'Sending…' : 'Send'}
+            </Button>
+          </div>
+          <p className="text-[11px] mt-2" style={{ color: brand.textMuted }}>
+            Model: {anthropicCfg.model || 'claude-haiku-4-5-20251001'} · Press Enter to send, Shift+Enter for newline
+          </p>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+// ============================================================
 // MAIN APP
 // ============================================================
 export default function ExceedProperties() {
@@ -13318,6 +13866,9 @@ export default function ExceedProperties() {
   const [leases, setLeases] = useStoredState('ep:leases', seedLeases);
   const [debtors, setDebtors] = useStoredState('ep:debtors', seedDebtors);
   const [tenancies, setTenancies] = useStoredState('ep:tenancies', []);
+  // Landlord records keyed by centre/property name. Holds entity details, banking,
+  // and the standing landlord resolution used when drafting leases for that centre.
+  const [landlords, setLandlords] = useStoredState('ep:landlords', {});
   // Persistent collections workflow state — keyed by MDA account number so
   // assignments / notes / status survive across monthly debtor imports.
   const [debtorAccounts, setDebtorAccounts] = useStoredState('ep:debtorAccounts', {});
@@ -13389,7 +13940,6 @@ export default function ExceedProperties() {
   const [toast, setToast] = useState({ message: '', type: 'success' });
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [notifPanelOpen, setNotifPanelOpen] = useState(false);
-  const [globalSearch, setGlobalSearch] = useState('');
   // Mobile drawer for the sidebar. md:+ ignores this and keeps the sidebar
   // permanently visible; phones get a slide-in drawer triggered by the
   // hamburger button in the top bar.
@@ -13630,7 +14180,7 @@ export default function ExceedProperties() {
 
   // All possible nav items — each gated by a permission
   const allNavItems = [
-    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, permission: PERMISSIONS.VIEW_DASHBOARD },
+    { id: 'dashboard', label: 'My dashboard', icon: LayoutDashboard, permission: PERMISSIONS.VIEW_DASHBOARD },
     { id: 'ondesk', label: 'Dashboards', icon: Zap, permission: PERMISSIONS.VIEW_ONDESK },
     { id: 'properties', label: 'Properties', icon: Building2, permission: PERMISSIONS.VIEW_PROPERTIES },
     { id: 'employees', label: 'Employees', icon: Users, permission: PERMISSIONS.VIEW_EMPLOYEES },
@@ -13639,6 +14189,7 @@ export default function ExceedProperties() {
     { id: 'outages', label: 'Report Outage', icon: Siren, permission: PERMISSIONS.VIEW_OUTAGES },
     { id: 'tenancy', label: 'Entries & Exits', icon: Home, permission: PERMISSIONS.VIEW_TENANCY },
     { id: 'leasing', label: 'Leasing', icon: FileSignature, permission: PERMISSIONS.VIEW_LEASING },
+    { id: 'ai', label: 'AI Assistant', icon: Sparkles, permission: PERMISSIONS.VIEW_AI },
     { id: 'debtors', label: 'Debtors', icon: DollarSign, permission: PERMISSIONS.VIEW_DEBTORS },
     { id: 'projections', label: 'Projections', icon: TrendingUp, permission: PERMISSIONS.VIEW_PROJECTIONS },
     { id: 'settings', label: 'Settings', icon: SettingsIcon, permission: PERMISSIONS.VIEW_SETTINGS },
@@ -13653,29 +14204,16 @@ export default function ExceedProperties() {
   const HIDDEN_ROUTES = new Set(['leaseDrafter']);
 
   // If the user lost permission for the current page, send them home.
+  // Wait until the auth probe has resolved AND we have a currentUser — otherwise
+  // navItems is empty on first paint (because hasPermission(null, ...) is false)
+  // and the user's stored route gets clobbered to "dashboard" on every refresh.
   useEffect(() => {
+    if (!authChecked || !currentUser) return;
     if (HIDDEN_ROUTES.has(activeNav)) return;
     if (!navItems.find(n => n.id === activeNav)) {
       setActiveNav(navItems[0]?.id || 'dashboard');
     }
-  }, [navItems, activeNav]);
-
-  // Global search
-  const handleGlobalSearch = (e) => {
-    if (e.key !== 'Enter' || !globalSearch.trim()) return;
-    const q = globalSearch.toLowerCase();
-    if (employees.some(emp => `${emp.firstName} ${emp.lastName} ${emp.email} ${emp.role}`.toLowerCase().includes(q)) && hasPermission(currentUser, PERMISSIONS.VIEW_EMPLOYEES)) {
-      setActiveNav('employees');
-    } else if (debtors.some(d => `${d.tenant} ${d.property} ${d.unit}`.toLowerCase().includes(q)) && hasPermission(currentUser, PERMISSIONS.VIEW_DEBTORS)) {
-      setActiveNav('debtors');
-    } else if (leases.some(l => `${l.tenant} ${l.property} ${l.unit}`.toLowerCase().includes(q)) && hasPermission(currentUser, PERMISSIONS.VIEW_LEASING)) {
-      setActiveNav('leasing');
-    } else if (properties.some(p => p.address.toLowerCase().includes(q)) && hasPermission(currentUser, PERMISSIONS.VIEW_PROPERTIES)) {
-      setActiveNav('properties');
-    } else {
-      showToast('No matches found or you lack permission', 'error');
-    }
-  };
+  }, [authChecked, currentUser, navItems, activeNav]);
 
   const renderContent = () => {
     // Permission guard — defense in depth, even though nav is filtered
@@ -13693,14 +14231,15 @@ export default function ExceedProperties() {
     switch (activeNav) {
       case 'dashboard': return checkPerm(PERMISSIONS.VIEW_DASHBOARD) || <Dashboard employees={employees} properties={properties} inspections={inspections} leases={leases} debtors={debtors} activityLog={activityLog} currentUser={currentUser} onNavigate={setActiveNav} />;
       case 'ondesk': return checkPerm(PERMISSIONS.VIEW_ONDESK) || <OnDeskSection employees={employees} deskStatuses={deskStatuses} setDeskStatuses={setDeskStatuses} activityLog={activityLog} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
-      case 'properties': return checkPerm(PERMISSIONS.VIEW_PROPERTIES) || <PropertiesSection properties={properties} setProperties={setProperties} tenancies={tenancies} setTenancies={setTenancies} showToast={showToast} logAction={logAction} />;
+      case 'properties': return checkPerm(PERMISSIONS.VIEW_PROPERTIES) || <PropertiesSection properties={properties} setProperties={setProperties} tenancies={tenancies} setTenancies={setTenancies} employees={employees} landlords={landlords} setLandlords={setLandlords} showToast={showToast} logAction={logAction} />;
       case 'employees': return checkPerm(PERMISSIONS.VIEW_EMPLOYEES) || <PeopleSection employees={employees} setEmployees={setEmployees} currentUser={currentUser} setCurrentUser={setCurrentUser} showToast={showToast} logAction={logAction} />;
       case 'time': return checkPerm(PERMISSIONS.VIEW_TIME) || <TimeTrackingSection employees={employees} showToast={showToast} integrations={integrations} setIntegrations={setIntegrations} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'maintenance': return checkPerm(PERMISSIONS.VIEW_MAINTENANCE) || <MaintenanceSection maintenance={maintenance} setMaintenance={setMaintenance} properties={properties} employees={employees} showToast={showToast} logAction={logAction} />;
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'tenancy': return checkPerm(PERMISSIONS.VIEW_TENANCY) || <TenancyActivitySection inspections={inspections} integrations={integrations} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'projections': return checkPerm(PERMISSIONS.VIEW_PROJECTIONS) || <ProjectionsSection showToast={showToast} logAction={logAction} />;
-      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection leases={leases} setLeases={setLeases} properties={properties} employees={employees} debtors={debtors} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
+      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection leases={leases} setLeases={setLeases} properties={properties} employees={employees} debtors={debtors} landlords={landlords} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
+      case 'ai': return checkPerm(PERMISSIONS.VIEW_AI) || <AISection employees={employees} setEmployees={setEmployees} properties={properties} setProperties={setProperties} leases={leases} setLeases={setLeases} debtors={debtors} maintenance={maintenance} outages={outages} tenancies={tenancies} landlords={landlords} integrations={integrations} showToast={showToast} logAction={logAction} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'leaseDrafter': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeaseDrafter currentUser={currentUser} showToast={showToast} logAction={logAction} integrations={integrations} debtors={debtors} onNavigateToSettings={() => setActiveNav('settings')} onClose={() => setActiveNav('leasing')} />;
       case 'debtors': return checkPerm(PERMISSIONS.VIEW_DEBTORS) || <DebtorsSection debtors={debtors} setDebtors={setDebtors} debtorAccounts={debtorAccounts} setDebtorAccounts={setDebtorAccounts} debtorNotes={debtorNotes} setDebtorNotes={setDebtorNotes} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'settings': return checkPerm(PERMISSIONS.VIEW_SETTINGS) || (
@@ -13716,6 +14255,9 @@ export default function ExceedProperties() {
           setEmployees={setEmployees} setProperties={setProperties}
           setInspections={setInspections} setLeases={setLeases}
           setDebtors={setDebtors} setMaintenance={setMaintenance}
+          tenancies={tenancies} setTenancies={setTenancies}
+          landlords={landlords} setLandlords={setLandlords}
+          outages={outages} setOutages={setOutages}
           showToast={showToast} logAction={logAction}
         />
       );
@@ -13909,7 +14451,7 @@ export default function ExceedProperties() {
       <main className="flex-1 flex flex-col min-w-0">
         {/* Topbar */}
         <header className="px-4 md:px-8 py-4 flex items-center justify-between gap-3" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
-          <div className="flex items-center gap-3 flex-1 min-w-0 max-w-md">
+          <div className="flex items-center gap-3 min-w-0">
             {/* Hamburger — opens the mobile drawer. Hidden on md:+. */}
             <button
               type="button"
@@ -13919,20 +14461,8 @@ export default function ExceedProperties() {
             >
               <Menu size={20} style={{ color: brand.text }} />
             </button>
-            <div className="flex-1 relative">
-              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: brand.textMuted }} />
-              <input
-                type="text"
-                placeholder="Search properties, tenants, employees..."
-                value={globalSearch}
-                onChange={(e) => setGlobalSearch(e.target.value)}
-                onKeyDown={handleGlobalSearch}
-                className="w-full pl-9 pr-3 py-2 text-sm rounded outline-none"
-                style={{ backgroundColor: brand.cream, border: `1px solid ${brand.border}` }}
-              />
-            </div>
           </div>
-          <div className="flex items-center gap-3 ml-4">
+          <div className="flex items-center gap-3">
             <div className="relative">
               <button onClick={() => setUserMenuOpen(!userMenuOpen)} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-black hover:bg-opacity-5 btn-press">
                 <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold" style={{ backgroundColor: brand.goldPale, color: brand.gold }}>

@@ -34,3 +34,33 @@ textarea.lease-flash {
 td.calc-year-cell::before {
   content: 'Year ' attr(data-year);
 }
+
+/* --------------------------------------------------------------
+   Mobile responsiveness baseline.
+   - iOS Safari zooms a text input on focus whenever the input's
+     font-size is < 16px. Force 16px on small screens to stop that.
+   - Bump minimum tap target to 40px to satisfy WCAG 2.5.5.
+   - Cap media so embedded images / iframes never blow out the viewport.
+-------------------------------------------------------------- */
+img, video, iframe {
+  max-width: 100%;
+  height: auto;
+}
+
+@media (max-width: 768px) {
+  input:not([type='checkbox']):not([type='radio']):not([type='range']),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+
+  button,
+  [role='button'] {
+    min-height: 40px;
+  }
+
+  /* Tighten the body horizontal padding so cards fit on narrow phones. */
+  body {
+    -webkit-text-size-adjust: 100%;
+  }
+}
