@@ -38,16 +38,40 @@ const pdfLib = async () => {
 const router = express.Router();
 router.use(requireAuth);
 
+// Single-line, copy-pasteable error log. Render's log viewer shows
+// each console call as one line, so packing all the diagnostic info
+// onto one line beats multi-line dumps (which can be reordered or
+// interleaved with other request logs).
+//
+// Format:
+//   [docusign] <op> failed code=<X> http=<Y> sdk="<original SDK message>" upstream=<JSON>
+//
+// The upstream blob is JSON.stringified so an object body doesn't
+// degrade to "[object Object]" in the log line. Truncated at 1000
+// chars to keep one runaway error from filling the log.
+const truncate = (s, n) => (s && s.length > n ? s.slice(0, n) + '...[truncated]' : s);
 const logErr = (op, err) => {
-  // Use whatever logger the project standardised on. Today that's
-  // raw console.error (same as the rest of server/*); switch here
-  // if a real logger lands later.
-  // eslint-disable-next-line no-console
-  console.error(`[docusign] ${op} failed:`, err?.code || '', err?.message || err);
-  if (err?.upstream) {
-    // eslint-disable-next-line no-console
-    console.error(`[docusign] ${op} upstream:`, err.upstream);
+  const parts = [`[docusign] ${op} failed`];
+  parts.push(`code=${err?.code || 'none'}`);
+  if (err?.statusCode != null) parts.push(`http=${err.statusCode}`);
+  if (err?.sdkMessage && err.sdkMessage !== err.message) {
+    parts.push(`sdk=${JSON.stringify(truncate(err.sdkMessage, 400))}`);
   }
+  // The wrapped message (often the friendly "consent required ..." or
+  // "invalid_grant ..." string) — log it too so the line is self-
+  // contained, but don't duplicate sdkMessage if they're the same.
+  if (err?.message) parts.push(`msg=${JSON.stringify(truncate(err.message, 400))}`);
+  if (err?.upstream != null) {
+    let blob;
+    try {
+      blob = typeof err.upstream === 'string' ? err.upstream : JSON.stringify(err.upstream);
+    } catch {
+      blob = String(err.upstream);
+    }
+    parts.push(`upstream=${truncate(blob, 1000)}`);
+  }
+  // eslint-disable-next-line no-console
+  console.error(parts.join(' '));
 };
 
 // ----- POST /send-lease ---------------------------------------
@@ -138,13 +162,20 @@ router.post('/test-envelope', async (req, res) => {
     const pdf = await PDFDocument.create();
     const page = pdf.addPage([612, 792]);
     const font = await pdf.embedFont(StandardFonts.Helvetica);
-    page.drawText('Exceed Props — DocuSign Test Envelope', {
+    // All literal strings here are intentionally ASCII-only —
+    // pdf-lib's default StandardFonts.Helvetica uses WinAnsi encoding,
+    // which cannot represent characters like em-dash, en-dash, right
+    // arrow, smart quotes, or ellipsis. Embedding a Unicode TTF via
+    // fontkit would unblock those, but for a one-page test envelope
+    // it's cheaper to stick to ASCII. If you change copy here, keep
+    // it ASCII or switch to an embedded TTF.
+    page.drawText('Exceed Props -- DocuSign Test Envelope', {
       x: 50, y: 720, size: 16, font, color: rgb(0, 0, 0),
     });
     page.drawText(`Generated ${new Date().toISOString()}`, {
       x: 50, y: 695, size: 10, font, color: rgb(0.3, 0.3, 0.3),
     });
-    page.drawText('This is an integration test from Settings → DocuSign.', {
+    page.drawText('This is an integration test from Settings -> DocuSign.', {
       x: 50, y: 660, size: 11, font,
     });
     page.drawText('Signature:', { x: 50, y: 540, size: 11, font });

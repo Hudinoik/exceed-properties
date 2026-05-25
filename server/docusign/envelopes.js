@@ -46,17 +46,22 @@ const DEFAULT_NOTIFICATION = () => {
 // DocuSign error shape:
 //   err.response.body = { errorCode, message, ... }  (object)
 //   err.response.text = '<raw JSON string>'          (string)
-// Normalise into one consistent Error.
+//   err.response.statusCode = <HTTP status>          (number)
+// Normalise into one consistent Error with the diagnostic fields
+// (.code, .statusCode, .upstream, .sdkMessage) that logErr expects.
 const wrapDocusignError = (err, op) => {
   let body = err?.response?.body || null;
   if (!body && err?.response?.text) {
     try { body = JSON.parse(err.response.text); } catch { body = err.response.text; }
   }
+  const statusCode = err?.response?.statusCode ?? err?.response?.status ?? null;
   const code = (body && typeof body === 'object' && body.errorCode) || null;
   const detail = (body && typeof body === 'object' && body.message) || err?.message || 'unknown';
   const e = new Error(`DocuSign ${op} failed: ${detail}`);
   e.code = code;
+  e.statusCode = statusCode;
   e.upstream = body;
+  e.sdkMessage = err?.message || null;
   return e;
 };
 

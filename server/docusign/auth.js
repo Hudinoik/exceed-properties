@@ -129,40 +129,62 @@ let cached = null;
 // Surface DocuSign's nested error shape with a remediation hint.
 // The SDK throws an Error whose .response.body is the raw response
 // JSON; consent_required and invalid_grant both surface there.
+//
+// We always preserve:
+//   e.code        — the upstream `error` field, or 'auth_failed' as fallback
+//   e.statusCode  — HTTP status from the response, if any
+//   e.upstream    — the raw response body (object or string), if any
+//   e.sdkMessage  — the original SDK error message
+// so logErr can print something usable even when the upstream body
+// doesn't surface a known code. Outward-facing message stays generic
+// in the wrapper (.message) — log lines look at .sdkMessage/.upstream.
 const wrapAuthError = (err, oauthHost) => {
   const body = err?.response?.body || err?.response?.text || null;
+  const statusCode = err?.response?.statusCode ?? err?.response?.status ?? null;
   const errCode =
     (body && typeof body === 'object' && body.error) ||
     (typeof body === 'string' && body.match(/"error"\s*:\s*"([^"]+)"/)?.[1]) ||
     null;
-  if (errCode === 'consent_required') {
-    const cfg = readConfig();
-    const consentUrl =
-      `https://${oauthHost}/oauth/auth?response_type=code` +
-      `&scope=${encodeURIComponent(SCOPES.join(' '))}` +
-      `&client_id=${encodeURIComponent(cfg.integrationKey)}` +
-      // Redirect URI here is only used to land somewhere after consent;
-      // the code itself is never exchanged. Any registered URL works.
-      `&redirect_uri=${encodeURIComponent('https://www.docusign.com')}`;
-    const e = new Error(
-      `DocuSign consent required. Open this URL while logged in as the impersonated user and click Accept:\n  ${consentUrl}`,
-    );
-    e.code = 'consent_required';
+  // Helper to attach the diagnostic fields consistently.
+  const attach = (e, code) => {
+    e.code = code;
+    e.statusCode = statusCode;
+    e.upstream = body;
+    e.sdkMessage = err?.message || null;
     return e;
+  };
+  if (errCode === 'consent_required') {
+    let cfg;
+    try { cfg = readConfig(); } catch { cfg = null; }
+    const consentUrl = cfg
+      ? `https://${oauthHost}/oauth/auth?response_type=code` +
+        `&scope=${encodeURIComponent(SCOPES.join(' '))}` +
+        `&client_id=${encodeURIComponent(cfg.integrationKey)}` +
+        // Redirect URI here is only used to land somewhere after consent;
+        // the code itself is never exchanged. Any registered URL works.
+        `&redirect_uri=${encodeURIComponent('https://www.docusign.com')}`
+      : '(consent URL unavailable — readConfig failed)';
+    return attach(
+      new Error(
+        `DocuSign consent required. Open this URL while logged in as the impersonated user and click Accept:\n  ${consentUrl}`,
+      ),
+      'consent_required',
+    );
   }
   if (errCode === 'invalid_grant') {
-    const e = new Error(
-      'DocuSign invalid_grant — typical causes: (1) DOCUSIGN_USER_ID does not match the API user GUID, (2) DOCUSIGN_INTEGRATION_KEY/private key mismatch, (3) wrong DOCUSIGN_OAUTH_HOST for the environment, (4) clock skew on the server.',
+    return attach(
+      new Error(
+        'DocuSign invalid_grant -- typical causes: (1) DOCUSIGN_USER_ID does not match the API user GUID, (2) DOCUSIGN_INTEGRATION_KEY/private key mismatch, (3) wrong DOCUSIGN_OAUTH_HOST for the environment, (4) clock skew on the server.',
+      ),
+      'invalid_grant',
     );
-    e.code = 'invalid_grant';
-    return e;
   }
-  // Unknown — surface the raw body to the server logs but keep the
-  // outward-facing message generic.
-  const e = new Error(`DocuSign JWT auth failed: ${err.message || 'unknown error'}`);
-  e.code = errCode || 'auth_failed';
-  e.upstream = body;
-  return e;
+  // Unknown — keep outward message generic, rely on .sdkMessage +
+  // .upstream + .statusCode in logErr for the actual diagnostic info.
+  return attach(
+    new Error(`DocuSign JWT auth failed: ${err?.message || 'unknown error'}`),
+    errCode || 'auth_failed',
+  );
 };
 
 // Discover the per-account base URI via /oauth/userinfo. Returns

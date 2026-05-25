@@ -56,15 +56,21 @@ const banner = () => {
   console.log(`========================================\n`);
 };
 
-// Generate a small, valid PDF in-memory containing the /sig1/ and
-// /date1/ anchor strings used by sendLeaseForSignature. Returns a
-// Buffer suitable for DocuSign's documentBase64 field.
+// Generate a small, valid PDF in-memory containing the role-based
+// anchor strings used by sendLeaseForSignature ({role}='tenant' here,
+// so \sig_tenant\ and \date_tenant\). Returns a Buffer suitable for
+// DocuSign's documentBase64 field.
+//
+// All literals are ASCII-only. pdf-lib's StandardFonts.Helvetica uses
+// WinAnsi encoding, which cannot represent em-dash, right arrow,
+// smart quotes, ellipsis, or other typographic niceties. Keep it
+// ASCII or embed a Unicode TTF via fontkit if you need them.
 const buildTestPdf = async (title) => {
   const pdf = await PDFDocument.create();
   const page = pdf.addPage([612, 792]); // US Letter
   const font = await pdf.embedFont(StandardFonts.Helvetica);
   // Visible title + body
-  page.drawText('Exceed Props — DocuSign Smoke Test', {
+  page.drawText('Exceed Props -- DocuSign Smoke Test', {
     x: 50, y: 720, size: 16, font, color: rgb(0, 0, 0),
   });
   page.drawText(title, {
@@ -76,15 +82,16 @@ const buildTestPdf = async (title) => {
   page.drawText('scripts/docusign-smoke-test.js. You may ignore it.', {
     x: 50, y: 644, size: 11, font, color: rgb(0, 0, 0),
   });
-  // Signature anchor box — visible label, then the anchor strings
+  // Signature anchor box -- visible label, then the anchor strings
   // in white-on-white at size 1 so DocuSign locates them but they
-  // don't show in the rendered page.
+  // don't show in the rendered page. These match the tenant role's
+  // anchors derived by server/docusign/envelopes.js tabsForRole().
   page.drawText('Signature:', { x: 50, y: 540, size: 11, font });
-  page.drawText('/sig1/', {
+  page.drawText('\\sig_tenant\\', {
     x: 50, y: 520, size: 1, font, color: rgb(1, 1, 1),
   });
   page.drawText('Date:', { x: 50, y: 480, size: 11, font });
-  page.drawText('/date1/', {
+  page.drawText('\\date_tenant\\', {
     x: 50, y: 460, size: 1, font, color: rgb(1, 1, 1),
   });
   const bytes = await pdf.save();
@@ -107,11 +114,13 @@ const main = async () => {
       const subject = `Smoke test envelope ${new Date().toISOString().slice(0, 19)}${SUBJECT_SUFFIX ? ' ' + SUBJECT_SUFFIX : ''}`;
       const pdfBuffer = await buildTestPdf(subject);
       const out = await sendLeaseForSignature({
-        signerName: TEST_NAME,
-        signerEmail: TEST_EMAIL,
+        signers: [{ name: TEST_NAME, email: TEST_EMAIL, role: 'tenant' }],
         pdfBuffer,
         emailSubject: subject,
         documentName: 'Smoke test',
+        // Reminders off for smoke tests so DocuSign doesn't nag the
+        // reviewer's inbox every 2 days about a throwaway envelope.
+        enableReminders: false,
       });
       envelopeId = out.envelopeId;
       results.push({ method: 'createEnvelope', ok: true, elapsed: ms(t0), detail: `id=${envelopeId} status=${out.status}` });
