@@ -24,6 +24,7 @@ import {
   resendEnvelope,
   getServiceAccountInfo,
 } from '../docusign/envelopes.js';
+import { envDiagnostics } from '../docusign/auth.js';
 import { audit } from '../db.js';
 // Lazy-loaded pdf-lib for the test-envelope endpoint — pulled in
 // only when /test-envelope is hit, so the dep cost doesn't apply to
@@ -108,11 +109,16 @@ router.get('/status', async (req, res) => {
     res.json({ configured: true, ...info });
   } catch (err) {
     logErr('status', err);
+    // When status fails, include the env-var diagnostic snapshot
+    // (presence/length, never values) so an admin can confirm from
+    // the browser whether DOCUSIGN_PRIVATE_KEY et al. are actually
+    // visible to the running process. Mirrors the boot-log summary.
     res.json({
       configured: false,
       error: err.code === 'consent_required'
         ? 'DocuSign consent required — see server logs for the consent URL.'
         : (err.code || err.message || 'Failed to reach DocuSign.'),
+      envDiagnostics: envDiagnostics(),
     });
   }
 });

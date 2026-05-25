@@ -37,8 +37,73 @@ const normalizePrivateKey = (raw) => {
   return unquoted.includes('\\n') ? unquoted.replace(/\\n/g, '\n') : unquoted;
 };
 
+// Inspect an env var's state without exposing its value. Returns
+//   { state: 'set' | 'missing' | 'empty' | 'whitespace', length }
+// 'set'         — defined and has non-whitespace content
+// 'missing'     — not in process.env at all
+// 'empty'       — defined as "" (empty string)
+// 'whitespace'  — defined but only whitespace (trim() → "")
+// Used for boot-time diagnostics and the /status fallback payload.
+const envStatus = (name) => {
+  const raw = process.env[name];
+  if (raw === undefined) return { state: 'missing', length: 0 };
+  if (raw === '') return { state: 'empty', length: 0 };
+  if (String(raw).trim() === '') return { state: 'whitespace', length: raw.length };
+  return { state: 'set', length: raw.length };
+};
+
+// Public: redacted snapshot of every DocuSign env var. Lengths but
+// never values. Safe to log and to return in error responses.
+export const envDiagnostics = () => ({
+  DOCUSIGN_INTEGRATION_KEY: envStatus('DOCUSIGN_INTEGRATION_KEY'),
+  DOCUSIGN_USER_ID:         envStatus('DOCUSIGN_USER_ID'),
+  DOCUSIGN_ACCOUNT_ID:      envStatus('DOCUSIGN_ACCOUNT_ID'),
+  DOCUSIGN_OAUTH_HOST:      envStatus('DOCUSIGN_OAUTH_HOST'),
+  DOCUSIGN_BASE_PATH:       envStatus('DOCUSIGN_BASE_PATH'),
+  DOCUSIGN_PRIVATE_KEY:     envStatus('DOCUSIGN_PRIVATE_KEY'),
+  DOCUSIGN_WEBHOOK_SECRET:  envStatus('DOCUSIGN_WEBHOOK_SECRET'),
+});
+
+// Track which PEM-shape warnings we've already printed so the same
+// gripe doesn't fire on every JWT refresh. Cleared when the env var
+// changes (length comparison) so re-configuration immediately shows
+// a fresh warning if the new value is still bad.
+let _lastPemWarnedFor = null;
+const warnIfBadPem = (pem) => {
+  if (!pem) return;
+  const looksLikePem = pem.includes('-----BEGIN ') && pem.includes('-----END ');
+  if (looksLikePem) {
+    _lastPemWarnedFor = null;
+    return;
+  }
+  if (_lastPemWarnedFor === pem.length) return; // already warned about this exact bad value
+  _lastPemWarnedFor = pem.length;
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[docusign] DOCUSIGN_PRIVATE_KEY does not look like a PEM ` +
+    `(missing -----BEGIN.../-----END... markers). Length after normalisation: ${pem.length}. ` +
+    `Most likely cause: a multi-line PEM was pasted into a single-line input, so only the first ` +
+    `line was stored. Re-paste with \\n between lines, or use Render's multi-line var input. ` +
+    `The JWT mint will fail with an SDK-level error after this warning.`,
+  );
+};
+
 // Read env lazily so test scripts can change values between runs.
 const readConfig = () => {
+  // Distinguish missing / empty / whitespace per var so the error
+  // tells the operator what to actually fix on Render, instead of
+  // the misleading "missing X" when X is actually set to "".
+  const required = ['DOCUSIGN_INTEGRATION_KEY', 'DOCUSIGN_USER_ID', 'DOCUSIGN_ACCOUNT_ID', 'DOCUSIGN_PRIVATE_KEY'];
+  const issues = [];
+  for (const name of required) {
+    const s = envStatus(name);
+    if (s.state !== 'set') {
+      issues.push(`${name} is ${s.state}`);
+    }
+  }
+  if (issues.length) {
+    throw new Error(`DocuSign config: ${issues.join('; ')}`);
+  }
   const cfg = {
     integrationKey: process.env.DOCUSIGN_INTEGRATION_KEY,
     userId: process.env.DOCUSIGN_USER_ID,
@@ -48,14 +113,7 @@ const readConfig = () => {
     basePathFallback: process.env.DOCUSIGN_BASE_PATH || 'https://demo.docusign.net/restapi',
     privateKey: normalizePrivateKey(process.env.DOCUSIGN_PRIVATE_KEY),
   };
-  const missing = [];
-  if (!cfg.integrationKey) missing.push('DOCUSIGN_INTEGRATION_KEY');
-  if (!cfg.userId) missing.push('DOCUSIGN_USER_ID');
-  if (!cfg.accountId) missing.push('DOCUSIGN_ACCOUNT_ID');
-  if (!cfg.privateKey) missing.push('DOCUSIGN_PRIVATE_KEY');
-  if (missing.length) {
-    throw new Error(`DocuSign config is incomplete: missing ${missing.join(', ')}`);
-  }
+  warnIfBadPem(cfg.privateKey);
   return cfg;
 };
 

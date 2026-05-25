@@ -9971,10 +9971,31 @@ const DocuSignIntegrationCard = ({ integrations, setIntegrations, showToast, log
           {status && !isConfigured && (
             <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.dangerLight, color: brand.danger }}>
               <AlertCircle size={14} className="flex-shrink-0 mt-0.5" />
-              <div className="flex-1">
+              <div className="flex-1 min-w-0">
                 <p><strong>Not configured.</strong></p>
                 {(status.error || statusErr) && (
                   <pre className="mt-1 whitespace-pre-wrap text-xs" style={{ fontFamily: 'inherit' }}>{status.error || statusErr}</pre>
+                )}
+                {/* Env-var presence snapshot. Lengths only, never values.
+                    Shows up only when /status reports configured: false,
+                    so an admin can see at a glance which var the running
+                    process can't see. */}
+                {status.envDiagnostics && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer" style={{ color: brand.danger }}>Server env-var snapshot (presence only, no values)</summary>
+                    <table className="mt-2 text-xs">
+                      <tbody>
+                        {Object.entries(status.envDiagnostics).map(([name, s]) => (
+                          <tr key={name}>
+                            <td className="pr-3 font-mono" style={{ verticalAlign: 'top' }}>{name}</td>
+                            <td style={{ color: s.state === 'set' ? brand.success : brand.danger }}>
+                              {s.state === 'set' ? `set (${s.length} chars)` : s.state.toUpperCase()}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </details>
                 )}
                 <p className="mt-2">Set <code>DOCUSIGN_INTEGRATION_KEY</code>, <code>DOCUSIGN_USER_ID</code>, <code>DOCUSIGN_ACCOUNT_ID</code>, <code>DOCUSIGN_OAUTH_HOST</code>, <code>DOCUSIGN_PRIVATE_KEY</code> in the server environment.</p>
               </div>
