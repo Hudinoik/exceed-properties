@@ -218,6 +218,90 @@ export const proxy = {
   },
 };
 
+// --- Lease packs (the end-to-end leasing workflow) ---
+export const packs = {
+  async list({ archived = false } = {}) {
+    const qs = archived ? '?archived=1' : '';
+    const r = await request(`/api/packs${qs}`);
+    return r.packs || [];
+  },
+  async get(packId) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}`);
+    return r.pack;
+  },
+  async create(pack) {
+    const r = await request('/api/packs', { method: 'POST', body: pack });
+    return r.pack;
+  },
+  async update(packId, patch) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}`, {
+      method: 'PATCH', body: patch,
+    });
+    return r.pack;
+  },
+  async transition(packId, toStage, reason) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/stage`, {
+      method: 'POST', body: { toStage, reason },
+    });
+    return r.pack;
+  },
+  async saveDraft(packId, { docxBase64, pdfBase64 }) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/draft`, {
+      method: 'POST', body: { docxBase64, pdfBase64 },
+    });
+    return r.pack;
+  },
+  async sendToDocusign(packId) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/send-to-docusign`, {
+      method: 'POST', body: {},
+    });
+    return r;
+  },
+  async resendReminder(packId) {
+    return request(`/api/packs/${encodeURIComponent(packId)}/resend-reminder`, {
+      method: 'POST', body: {},
+    });
+  },
+  async voidEnvelope(packId, reason) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/void-envelope`, {
+      method: 'POST', body: { reason },
+    });
+    return r.pack;
+  },
+  async markLoaded(packId, propertyInspectRef) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/mark-loaded`, {
+      method: 'POST', body: { propertyInspectRef },
+    });
+    return r.pack;
+  },
+  async addComment(packId, body) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/comments`, {
+      method: 'POST', body: { body },
+    });
+    return r.comment;
+  },
+  // Files are returned as Blob -- use FileSaver/etc. to surface them.
+  async downloadFile(packId, fileType) {
+    const csrf = (() => {
+      if (typeof document === 'undefined') return '';
+      const m = document.cookie.split('; ').find(r => r.startsWith('ep.csrf='));
+      return m ? decodeURIComponent(m.split('=')[1]) : '';
+    })();
+    const url = `/api/packs/${encodeURIComponent(packId)}/files/${encodeURIComponent(fileType)}`;
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: { 'X-CSRF-Token': csrf },
+    });
+    if (!res.ok) {
+      let msg;
+      try { const j = await res.json(); msg = j?.error || `HTTP ${res.status}`; }
+      catch { msg = `HTTP ${res.status}`; }
+      throw new ApiError(msg, res.status, null);
+    }
+    return res.blob();
+  },
+};
+
 // Convenience: flatten a secrets array into an object {key: {hasValue, last4, ...}}
 // for easy access from React components.
 export const secretsToMap = (rows) => {
