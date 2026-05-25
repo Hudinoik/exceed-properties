@@ -28,6 +28,7 @@ import secretsRouter from './routes/secrets.js';
 import proxyRouter from './routes/proxy.js';
 import docusignRouter from './routes/docusign.js';
 import { publicRouter as webhookPublicRouter, apiRouter as webhookApiRouter } from './routes/webhooks.js';
+import { isProduction as docusignIsProduction } from './docusign/auth.js';
 import { seedIfEmpty } from './seed.js';
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -159,4 +160,17 @@ app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT} (NODE_ENV=${process.env.NODE_ENV || 'development'})`);
   // eslint-disable-next-line no-console
   console.log(`[server] CORS allowed origin: ${CLIENT_ORIGIN}`);
+  // DocuSign environment banner. Loud, deliberate — operators glancing
+  // at Render logs should instantly see whether this dyno is talking
+  // to demo or prod. Base path is auto-discovered per-request via
+  // /oauth/userinfo so we don't print it here (would be misleading
+  // pre-first-request).
+  const dsProd = docusignIsProduction();
+  const dsHost = process.env.DOCUSIGN_OAUTH_HOST || 'account-d.docusign.com';
+  // eslint-disable-next-line no-console
+  console.log(`[docusign] environment: ${dsProd ? 'PRODUCTION' : 'DEMO'} (oauth host=${dsHost}, base path auto-discovered)`);
+  if (dsProd && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.warn('[docusign] ⚠️  WARNING: DocuSign is set to PRODUCTION but NODE_ENV is not "production". Real envelopes will be sent against live customers if you exercise the API. Double-check this is intentional.');
+  }
 });
