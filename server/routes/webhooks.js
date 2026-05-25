@@ -112,28 +112,106 @@ publicRouter.post(
     }
 
     // ------------------------------------------------------------------
-    // TODO(lease-pipeline): hook envelope events into the lease state
-    //   machine. The project uses lowdb (server/db.js) for persistence.
-    //   When you add lease records, branch here and update them:
+    // Pack pipeline updates. Find the pack by envelopeId and apply
+    // the state transition that matches this event. Webhook-driven
+    // transitions bypass the user-facing rules (envelope-declined
+    // can move docusign -> lease_drafting; the matrix in packs.js
+    // allows this when viaWebhook: true).
     //
-    //     switch (eventType) {
-    //       case 'envelope-completed':
-    //         await leases.markSigned(envelopeId, body.data);
-    //         break;
-    //       case 'envelope-declined':
-    //         await leases.markDeclined(envelopeId, body.data);
-    //         break;
-    //       case 'envelope-voided':
-    //         await leases.markVoided(envelopeId);
-    //         break;
-    //       case 'recipient-completed':
-    //         await leases.markRecipientCompleted(envelopeId, body.data);
-    //         break;
-    //     }
-    //
-    //   For now we just log + record above; the SPA can poll the webhook
-    //   event store via /api/webhooks/docusign/events (added below).
-    // ------------------------------------------------------------------
+    // Errors here are SWALLOWED (logged only). The webhook handler
+    // already replied 200 above, and DocuSign retries on non-2xx
+    // would only multiply the same broken update. Better to log
+    // and move on; the SPA's 30s envelope poll picks up the actual
+    // status from DocuSign as a fallback.
+    if (envelopeId) {
+      try {
+        const packs = await import('../db/packs.js');
+        switch (eventType) {
+          case 'envelope-sent':
+          case 'envelope-delivered':
+            await packs.updateEnvelopeStatus(envelopeId, { status: 'delivered' });
+            break;
+
+          case 'recipient-completed':
+            // For tenant-only envelopes (the pack flow), the next
+            // event after this will be envelope-completed. For multi-
+            // signer envelopes from the standalone drafter, this
+            // means "one signer has signed but more remain". The
+            // backend uses 'partially_signed' for the latter; same
+            // intermediate state in either case.
+            await packs.updateEnvelopeStatus(envelopeId, { status: 'partially_signed' });
+            break;
+
+          case 'envelope-completed': {
+            // Pull the signed PDF and store on the pack so "View PDF"
+            // works without an additional DocuSign round-trip on every
+            // page load.
+            let signedPdfBase64 = null;
+            try {
+              const { downloadSignedDocument } = await import('../docusign/envelopes.js');
+              const buf = await downloadSignedDocument(envelopeId, 'combined');
+              signedPdfBase64 = buf.toString('base64');
+            } catch (dlErr) {
+              // eslint-disable-next-line no-console
+              console.error('[webhook] DocuSign signed PDF fetch failed:', dlErr.code || '', dlErr.message);
+            }
+            await packs.updateEnvelopeStatus(envelopeId, {
+              status: 'completed',
+              signedPdfBase64,
+              reason: 'Envelope completed -- all signers signed',
+            });
+            break;
+          }
+
+          case 'envelope-declined': {
+            const pack = await packs.updateEnvelopeStatus(envelopeId, {
+              status: 'declined',
+              reason: 'Envelope declined by signer. Pack returned to Lease Drafting.',
+            });
+            if (pack && pack.stage === 'docusign') {
+              try {
+                await packs.transition(pack.packId, 'lease_drafting', {
+                  by: null,
+                  viaWebhook: true,
+                  reason: 'envelope-declined webhook',
+                });
+              } catch (tErr) {
+                // eslint-disable-next-line no-console
+                console.error('[webhook] transition after decline failed:', tErr.message);
+              }
+            }
+            break;
+          }
+
+          case 'envelope-voided': {
+            const pack = await packs.updateEnvelopeStatus(envelopeId, {
+              status: 'voided',
+              reason: 'Envelope voided. Pack returned to Lease Drafting.',
+            });
+            if (pack && pack.stage === 'docusign') {
+              try {
+                await packs.transition(pack.packId, 'lease_drafting', {
+                  by: null,
+                  viaWebhook: true,
+                  reason: 'envelope-voided webhook',
+                });
+              } catch (tErr) {
+                // eslint-disable-next-line no-console
+                console.error('[webhook] transition after void failed:', tErr.message);
+              }
+            }
+            break;
+          }
+
+          default:
+            // Unknown event type -- already logged + recorded above.
+            break;
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[webhook] DocuSign ${eventType} pack-update failed:`, err.message);
+      }
+    }
   },
 );
 
