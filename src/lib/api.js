@@ -121,10 +121,24 @@ export const proxy = {
   },
   // DocuSign now uses a single JWT service account (see server/docusign/).
   // The per-user OAuth helpers (docusignExchangeCode etc.) have been removed.
-  async docusignSendLease({ signerName, signerEmail, pdfBase64, emailSubject, documentName }) {
+  async docusignGetStatus() {
+    return request('/api/docusign/status');
+  },
+  async docusignSendTestEnvelope({ name, email }) {
+    return request('/api/docusign/test-envelope', {
+      method: 'POST',
+      body: { name, email },
+    });
+  },
+  async docusignSendLease({ signers, pdfBase64, emailSubject, documentName }) {
     return request('/api/docusign/send-lease', {
       method: 'POST',
-      body: { signerName, signerEmail, pdfBase64, emailSubject, documentName },
+      body: { signers, pdfBase64, emailSubject, documentName },
+    });
+  },
+  async docusignRemindEnvelope(envelopeId) {
+    return request(`/api/docusign/envelopes/${encodeURIComponent(envelopeId)}/remind`, {
+      method: 'POST',
     });
   },
   async docusignSendFromTemplate({ templateId, signerName, signerEmail, roleName, emailSubject }) {

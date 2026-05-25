@@ -9,12 +9,38 @@
 // ============================================================
 import fs from 'node:fs';
 import docusign from 'docusign-esign';
-import { getApiClient } from './auth.js';
+import { getApiClient, isProduction } from './auth.js';
 
-// Anchor strings the lease PDF must contain (in white size-1 text
-// so they don't show in the rendered document). See docs.
-const ANCHOR_SIG = '/sig1/';
-const ANCHOR_DATE = '/date1/';
+// Anchor strings are derived from the signer's role, matching the
+// template constants in src/App.jsx (DOCUSIGN_ANCHORS). Format:
+//   \sig_<role>\   \date_<role>\   \name_<role>\   \init_<role>\
+// where <role> is one of landlord, tenant, surety, witness.
+// The lease DOCX template renders these in white size-1 text so
+// DocuSign locates them but they don't show in the final document.
+const VALID_ROLES = new Set(['landlord', 'tenant', 'surety', 'witness']);
+const anchorsFor = (role) => ({
+  sig:  `\\sig_${role}\\`,
+  date: `\\date_${role}\\`,
+  name: `\\name_${role}\\`,
+  init: `\\init_${role}\\`,
+});
+
+// Default reminder schedule applied to real lease envelopes.
+// DocuSign's "notification" object on the envelope: nag after N days
+// of no action, repeat every M days, expire after X days.
+const DEFAULT_NOTIFICATION = () => {
+  const n = new docusign.Notification();
+  n.useAccountDefaults = 'false';
+  n.reminders = new docusign.Reminders();
+  n.reminders.reminderEnabled = 'true';
+  n.reminders.reminderDelay = '3';     // first nudge 3 days after send
+  n.reminders.reminderFrequency = '2'; // every 2 days thereafter
+  n.expirations = new docusign.Expirations();
+  n.expirations.expireEnabled = 'true';
+  n.expirations.expireAfter = '30';    // void if unsigned after 30 days
+  n.expirations.expireWarn = '5';      // warn signer 5 days before
+  return n;
+};
 
 // DocuSign error shape:
 //   err.response.body = { errorCode, message, ... }  (object)
@@ -62,17 +88,67 @@ const wrapDocusignError = (err, op) => {
 //   an AES-issuing provider, not this code path.
 //   This is a documentation comment only — there is no runtime
 //   check, since the document type isn't visible to us here.
+// Build the per-signer Tabs object from a role. Returns a docusign.Tabs
+// populated with all four anchor types — SignHere, DateSigned, FullName,
+// InitialHere — pointing at the role-prefixed anchor strings.
+const tabsForRole = (role) => {
+  const a = anchorsFor(role);
+  const sig = new docusign.SignHere();
+  sig.anchorString = a.sig;
+  sig.anchorUnits = 'pixels';
+  sig.anchorXOffset = '0';
+  sig.anchorYOffset = '0';
+  const date = new docusign.DateSigned();
+  date.anchorString = a.date;
+  date.anchorUnits = 'pixels';
+  date.anchorXOffset = '0';
+  date.anchorYOffset = '0';
+  const name = new docusign.FullName();
+  name.anchorString = a.name;
+  name.anchorUnits = 'pixels';
+  name.anchorXOffset = '0';
+  name.anchorYOffset = '0';
+  const initial = new docusign.InitialHere();
+  initial.anchorString = a.init;
+  initial.anchorUnits = 'pixels';
+  initial.anchorXOffset = '0';
+  initial.anchorYOffset = '0';
+  const tabs = new docusign.Tabs();
+  tabs.signHereTabs = [sig];
+  tabs.dateSignedTabs = [date];
+  tabs.fullNameTabs = [name];
+  tabs.initialHereTabs = [initial];
+  return tabs;
+};
+
+// signers: [{ name, email, role: 'landlord'|'tenant'|'surety'|'witness',
+//             routingOrder?: number }]
+// At least one signer required. routingOrder defaults to position+1
+// in array order. Anchors derived from role.
+//
+// enableReminders: if true (default), set the DocuSign envelope's
+// notification block so DocuSign emails nags at days 3, 5, 7, ...
+// and expires the envelope after 30 days of inactivity. Disable for
+// test envelopes so we don't spam reviewers.
 export const sendLeaseForSignature = async ({
-  signerName,
-  signerEmail,
+  signers,
   pdfBuffer,
   pdfPath,
   emailSubject,
   documentName = 'Lease Agreement',
+  enableReminders = true,
 }) => {
-  if (!signerName || !signerEmail) {
-    throw new Error('signerName and signerEmail are required');
+  if (!Array.isArray(signers) || signers.length === 0) {
+    throw new Error('signers[] is required (at least one signer)');
   }
+  signers.forEach((s, i) => {
+    if (!s || !s.name || !s.email || !s.role) {
+      throw new Error(`signers[${i}] requires name, email, role`);
+    }
+    if (!VALID_ROLES.has(s.role)) {
+      throw new Error(`signers[${i}].role='${s.role}' not in {${[...VALID_ROLES].join(', ')}}`);
+    }
+  });
   if (!pdfBuffer && !pdfPath) {
     throw new Error('Provide pdfBuffer (preferred) or pdfPath');
   }
@@ -83,6 +159,7 @@ export const sendLeaseForSignature = async ({
   const envDef = new docusign.EnvelopeDefinition();
   envDef.emailSubject = emailSubject || 'Please sign your lease agreement';
   envDef.status = 'sent';
+  if (enableReminders) envDef.notification = DEFAULT_NOTIFICATION();
 
   const doc = new docusign.Document();
   doc.documentBase64 = buf.toString('base64');
@@ -91,30 +168,17 @@ export const sendLeaseForSignature = async ({
   doc.documentId = '1';
   envDef.documents = [doc];
 
-  const signer = new docusign.Signer();
-  signer.email = signerEmail;
-  signer.name = signerName;
-  signer.recipientId = '1';
-  signer.routingOrder = '1';
-
-  const signHere = new docusign.SignHere();
-  signHere.anchorString = ANCHOR_SIG;
-  signHere.anchorYOffset = '0';
-  signHere.anchorUnits = 'pixels';
-  signHere.anchorXOffset = '0';
-
-  const dateSigned = new docusign.DateSigned();
-  dateSigned.anchorString = ANCHOR_DATE;
-  dateSigned.anchorYOffset = '0';
-  dateSigned.anchorUnits = 'pixels';
-  dateSigned.anchorXOffset = '0';
-
-  signer.tabs = new docusign.Tabs();
-  signer.tabs.signHereTabs = [signHere];
-  signer.tabs.dateSignedTabs = [dateSigned];
-
   envDef.recipients = new docusign.Recipients();
-  envDef.recipients.signers = [signer];
+  envDef.recipients.signers = signers.map((s, i) => {
+    const signer = new docusign.Signer();
+    signer.name = s.name;
+    signer.email = s.email;
+    signer.recipientId = String(i + 1);
+    signer.routingOrder = String(s.routingOrder ?? i + 1);
+    signer.roleName = s.role; // useful in webhooks for downstream routing
+    signer.tabs = tabsForRole(s.role);
+    return signer;
+  });
 
   try {
     const { apiClient, accountId } = await getApiClient();
@@ -218,6 +282,82 @@ export const listRecipients = async (envelopeId) => {
   } catch (err) {
     throw wrapDocusignError(err, 'listRecipients');
   }
+};
+
+// ----- mutate: resend signing emails + (re)enable reminders --
+// "Resend" in DocuSign is implemented as PUT /recipients with the
+// query flag resend_envelope=true: it re-sends the signing email to
+// every recipient on the envelope whose status isn't 'completed'.
+// We also flip the envelope's notification block on to re-enable the
+// reminder cadence in case it was disabled previously (or the
+// envelope was created before we set defaults).
+export const resendEnvelope = async (envelopeId) => {
+  if (!envelopeId) throw new Error('envelopeId is required');
+  try {
+    const { apiClient, accountId } = await getApiClient();
+    const envelopesApi = new docusign.EnvelopesApi(apiClient);
+
+    // 1. Fetch current recipients, find the ones still pending.
+    const recipients = await envelopesApi.listRecipients(accountId, envelopeId);
+    const signers = Array.isArray(recipients?.signers) ? recipients.signers : [];
+    const pending = signers.filter(s => s.status !== 'completed' && s.status !== 'declined');
+    if (pending.length === 0) {
+      return { ok: true, resent: 0, note: 'no pending signers' };
+    }
+
+    // 2. Re-trigger signing emails via updateRecipients?resend_envelope=true.
+    //    Pass through the existing signer rows so DocuSign doesn't replace
+    //    the recipient list — we're only flipping the resend flag.
+    const updatePayload = new docusign.Recipients();
+    updatePayload.signers = pending;
+    await envelopesApi.updateRecipients(accountId, envelopeId, {
+      recipients: updatePayload,
+      resendEnvelope: 'true',
+    });
+
+    // 3. Make sure the envelope-level reminder schedule is on so
+    //    DocuSign keeps nagging without further action from us.
+    try {
+      const env = new docusign.Envelope();
+      env.notification = DEFAULT_NOTIFICATION();
+      await envelopesApi.update(accountId, envelopeId, { envelope: env });
+    } catch {
+      // Notification update is best-effort; don't fail the resend over it.
+    }
+
+    return { ok: true, resent: pending.length, recipients: pending.map(s => s.email) };
+  } catch (err) {
+    throw wrapDocusignError(err, 'resendEnvelope');
+  }
+};
+
+// ----- read: service account / config info -------------------
+// Used by GET /api/docusign/status. Mints a JWT (which also runs
+// /oauth/userinfo discovery) and returns just the metadata needed
+// to render a status card in the SPA — no secrets.
+export const getServiceAccountInfo = async () => {
+  const { apiClient, accountId, basePath } = await getApiClient();
+  // /oauth/userinfo via the SDK requires the access token already in
+  // the apiClient's default headers (it is — getApiClient set it).
+  let userInfo = null;
+  try {
+    userInfo = await apiClient.getUserInfo(
+      apiClient.defaultHeaders.Authorization.replace(/^Bearer\s+/i, ''),
+    );
+  } catch {
+    // Best-effort — base path was already discovered, status can
+    // still render.
+  }
+  const account = (userInfo?.accounts || []).find(
+    a => String(a.accountId) === String(accountId),
+  ) || null;
+  return {
+    environment: isProduction() ? 'PRODUCTION' : 'DEMO',
+    accountId,
+    accountName: account?.accountName || null,
+    apiUsername: userInfo?.email || null,
+    baseUri: basePath,
+  };
 };
 
 // ----- read: list documents within an envelope ---------------

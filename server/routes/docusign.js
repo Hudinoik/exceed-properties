@@ -21,8 +21,18 @@ import {
   listEnvelopes,
   listRecipients,
   listEnvelopeDocuments,
+  resendEnvelope,
+  getServiceAccountInfo,
 } from '../docusign/envelopes.js';
 import { audit } from '../db.js';
+// Lazy-loaded pdf-lib for the test-envelope endpoint — pulled in
+// only when /test-envelope is hit, so the dep cost doesn't apply to
+// real lease sends.
+let _pdfLibCache;
+const pdfLib = async () => {
+  if (!_pdfLibCache) _pdfLibCache = await import('pdf-lib');
+  return _pdfLibCache;
+};
 
 const router = express.Router();
 router.use(requireAuth);
@@ -40,13 +50,21 @@ const logErr = (op, err) => {
 };
 
 // ----- POST /send-lease ---------------------------------------
-// Body: { signerName, signerEmail, pdfBase64, emailSubject?, documentName? }
-// We accept base64 over the wire because the SPA generates lease
-// PDFs client-side (docxtemplater → PDF). Server decodes to Buffer.
+// Body: {
+//   signers: [{ name, email, role: 'landlord'|'tenant'|..., routingOrder? }],
+//   pdfBase64,
+//   emailSubject?, documentName?
+// }
+// PDF is base64 over the wire — the SPA generates lease DOCX +
+// converts to PDF entirely client-side, then sends the bytes.
+// Render's filesystem is ephemeral so we never use pdfPath.
 router.post('/send-lease', async (req, res) => {
-  const { signerName, signerEmail, pdfBase64, emailSubject, documentName } = req.body || {};
-  if (!signerName || !signerEmail || !pdfBase64) {
-    return res.status(400).json({ error: 'signerName, signerEmail and pdfBase64 are required' });
+  const { signers, pdfBase64, emailSubject, documentName } = req.body || {};
+  if (!Array.isArray(signers) || signers.length === 0) {
+    return res.status(400).json({ error: 'signers[] is required (at least one signer)' });
+  }
+  if (!pdfBase64) {
+    return res.status(400).json({ error: 'pdfBase64 is required' });
   }
   let pdfBuffer;
   try {
@@ -59,12 +77,15 @@ router.post('/send-lease', async (req, res) => {
   }
   try {
     const result = await sendLeaseForSignature({
-      signerName, signerEmail, pdfBuffer, emailSubject, documentName,
+      signers, pdfBuffer, emailSubject, documentName, enableReminders: true,
     });
     await audit.log({
       userId: req.session.userId, userEmail: req.session.email,
       action: 'docusign.send-lease',
-      details: { envelopeId: result.envelopeId, signerEmail },
+      details: {
+        envelopeId: result.envelopeId,
+        signers: signers.map(s => ({ role: s.role, email: s.email })),
+      },
       ip: req.ip,
     });
     res.json({ ok: true, envelopeId: result.envelopeId, status: result.status });
@@ -74,6 +95,84 @@ router.post('/send-lease', async (req, res) => {
       return res.status(503).json({ error: 'DocuSign consent required — see server logs.' });
     }
     res.status(502).json({ error: 'Failed to send envelope.' });
+  }
+});
+
+// ----- GET /status --------------------------------------------
+// Used by the Settings → DocuSign panel to render the green/red
+// indicator. Tries to mint a JWT + hit /oauth/userinfo; if either
+// fails, returns { configured: false, error }.
+router.get('/status', async (req, res) => {
+  try {
+    const info = await getServiceAccountInfo();
+    res.json({ configured: true, ...info });
+  } catch (err) {
+    logErr('status', err);
+    res.json({
+      configured: false,
+      error: err.code === 'consent_required'
+        ? 'DocuSign consent required — see server logs for the consent URL.'
+        : (err.code || err.message || 'Failed to reach DocuSign.'),
+    });
+  }
+});
+
+// ----- POST /test-envelope ------------------------------------
+// Body: { name, email }
+// Generates a one-page test PDF in-memory containing the tenant
+// anchor strings, sends it without reminders, returns the envelope
+// ID. Lets an admin verify the integration end-to-end from Settings.
+router.post('/test-envelope', async (req, res) => {
+  const { name, email } = req.body || {};
+  if (!name || !email) {
+    return res.status(400).json({ error: 'name and email are required' });
+  }
+  try {
+    const { PDFDocument, StandardFonts, rgb } = await pdfLib();
+    const pdf = await PDFDocument.create();
+    const page = pdf.addPage([612, 792]);
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    page.drawText('Exceed Props — DocuSign Test Envelope', {
+      x: 50, y: 720, size: 16, font, color: rgb(0, 0, 0),
+    });
+    page.drawText(`Generated ${new Date().toISOString()}`, {
+      x: 50, y: 695, size: 10, font, color: rgb(0.3, 0.3, 0.3),
+    });
+    page.drawText('This is an integration test from Settings → DocuSign.', {
+      x: 50, y: 660, size: 11, font,
+    });
+    page.drawText('Signature:', { x: 50, y: 540, size: 11, font });
+    // White-on-white size-1 anchors so DocuSign locates them but
+    // they don't render visibly.
+    page.drawText('\\sig_tenant\\', {
+      x: 50, y: 520, size: 1, font, color: rgb(1, 1, 1),
+    });
+    page.drawText('Date:', { x: 50, y: 500, size: 11, font });
+    page.drawText('\\date_tenant\\', {
+      x: 50, y: 480, size: 1, font, color: rgb(1, 1, 1),
+    });
+    const pdfBuffer = Buffer.from(await pdf.save());
+
+    const result = await sendLeaseForSignature({
+      signers: [{ name, email, role: 'tenant' }],
+      pdfBuffer,
+      emailSubject: 'Exceed Props — DocuSign test envelope',
+      documentName: 'Test Envelope',
+      enableReminders: false,
+    });
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'docusign.test-envelope',
+      details: { envelopeId: result.envelopeId, recipient: email },
+      ip: req.ip,
+    });
+    res.json({ ok: true, envelopeId: result.envelopeId, status: result.status });
+  } catch (err) {
+    logErr('test-envelope', err);
+    if (err.code === 'consent_required') {
+      return res.status(503).json({ error: 'DocuSign consent required — see server logs.' });
+    }
+    res.status(502).json({ error: 'Failed to send test envelope.' });
   }
 });
 
@@ -128,6 +227,27 @@ router.get('/envelopes/:id', async (req, res) => {
   } catch (err) {
     logErr('get-envelope', err);
     res.status(502).json({ error: 'Failed to retrieve envelope.' });
+  }
+});
+
+// ----- POST /envelopes/:id/remind -----------------------------
+// Re-triggers the DocuSign signing email for any still-pending
+// recipients and (re-)enables the envelope's reminder schedule.
+// Idempotent — calling repeatedly just re-sends; DocuSign rate-
+// limits if you abuse it.
+router.post('/envelopes/:id/remind', async (req, res) => {
+  try {
+    const result = await resendEnvelope(req.params.id);
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'docusign.remind',
+      details: { envelopeId: req.params.id, resent: result.resent },
+      ip: req.ip,
+    });
+    res.json(result);
+  } catch (err) {
+    logErr('remind', err);
+    res.status(502).json({ error: 'Failed to send reminder.' });
   }
 });
 
