@@ -3712,9 +3712,12 @@ const blankLeaseForm = () => ({
   leaseFees: { amount: '750.00' },
   annexures: ['A', 'B', 'C', 'D'],
   annexureSelected: { A: true, B: true, C: true, D: true },
-  // leaseType is chosen by the user on first load via a chooser modal —
-  // null means "not yet chosen", which keeps the chooser blocking the form.
-  meta: { createdAt: null, updatedAt: null, draftId: null, leaseType: null },
+  // leaseType used to gate the form via a "new / renewal / addendum"
+  // chooser modal on first open. The chooser was removed once the
+  // drafter became pack-bound (pack.packType already records new vs
+  // renewal). Default to 'New Lease' so any downstream code that
+  // reads form.meta.leaseType continues to work.
+  meta: { createdAt: null, updatedAt: null, draftId: null, leaseType: 'New Lease' },
 });
 
 // Date helpers
@@ -5403,64 +5406,14 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   // so the sidebar stays visible. `open` is kept as a no-op prop for backwards
   // compatibility with the old call site that mounted this in a Modal-style way.
 
-  // Lease-type chooser — blocks the form until the user picks one. Triggered
-  // on first load (blank form) and again whenever the user clicks the pill
-  // in the header to change their mind. We intentionally do not let the
-  // user dismiss the chooser without picking, because every downstream
-  // section (escalation defaults, addendum-only sections, etc.) depends on it.
-  const leaseTypeOptions = [
-    { id: 'New Lease', label: 'New Lease', desc: 'A brand-new agreement between landlord and tenant for a previously un-leased premises (or with a new tenant).', icon: Sparkles },
-    { id: 'Renewal',   label: 'Renewal',   desc: 'The current tenant is staying on. Carries forward most landlord/premises details — only term, rent and escalation typically change.', icon: RefreshCw },
-    { id: 'Addendum',  label: 'Addendum',  desc: 'A short amendment to an existing lease (e.g. variation of rent, change in premises area, deposit top-up). Not a full lease document.', icon: FileText },
-  ];
-  const pickLeaseType = (id) => {
-    upd('meta.leaseType', id);
-    logAction(`Lease type selected: ${id}`);
-    showToast(`Drafting as ${id}`, 'success');
-  };
+  // Lease-type chooser (new / renewal / addendum) removed -- the pack
+  // already carries packType ('new' | 'renewal'); imposing a second
+  // disambiguation on the drafter was redundant. Default leaseType
+  // is set in blankLeaseForm() so downstream code reading
+  // form.meta.leaseType still gets a value.
 
   return (
     <div className="animate-fade-in-up">
-      {/* Lease-type chooser — appears whenever meta.leaseType is null. */}
-      {!form.meta.leaseType && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ backgroundColor: 'rgba(15, 30, 46, 0.7)' }}
-        >
-          <div className="w-full max-w-2xl rounded-lg" style={{ backgroundColor: brand.ivory, border: `1px solid ${brand.borderDark}` }}>
-            <div className="px-6 py-4" style={{ borderBottom: `1px solid ${brand.border}` }}>
-              <p className="text-xs tracking-[0.2em] uppercase mb-1" style={{ color: brand.gold }}>Before we start</p>
-              <h3 className="text-lg font-semibold tracking-tight" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>
-                What are you drafting today?
-              </h3>
-              <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
-                Pick one so we can show the right defaults and the right document template.
-              </p>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 p-6">
-              {leaseTypeOptions.map(opt => {
-                const Icon = opt.icon;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    onClick={() => pickLeaseType(opt.id)}
-                    className="text-left rounded p-4 transition-all hover:-translate-y-0.5"
-                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, boxShadow: '0 1px 2px rgba(15,30,46,0.04)' }}
-                  >
-                    <div className="w-9 h-9 rounded flex items-center justify-center mb-2" style={{ backgroundColor: brand.goldPale, color: brand.gold }}>
-                      <Icon size={18} />
-                    </div>
-                    <p className="font-semibold text-sm mb-1" style={{ color: brand.navy }}>{opt.label}</p>
-                    <p className="text-[11px] leading-snug" style={{ color: brand.textMuted }}>{opt.desc}</p>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Header banner — matches the app's navy + gold theme */}
       <div className="px-4 md:px-6 py-4 -mx-4 md:-mx-8 -mt-4 md:-mt-6 mb-0" style={{ backgroundColor: brand.navy }}>
         <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -5472,17 +5425,9 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
               <p className="text-xs tracking-[0.2em] uppercase" style={{ color: brand.gold }}>Tools</p>
               <h1 className="text-xl" style={{ color: '#fff', fontFamily: 'Georgia, serif', fontWeight: 600 }}>Automated Lease Drafting</h1>
             </div>
-            {form.meta.leaseType && (
-              <button
-                type="button"
-                onClick={() => upd('meta.leaseType', null)}
-                className="text-[11px] px-2 py-1 rounded uppercase tracking-wider hover:opacity-80"
-                style={{ backgroundColor: brand.gold, color: brand.navy, fontWeight: 600 }}
-                title="Change lease type"
-              >
-                {form.meta.leaseType}
-              </button>
-            )}
+            {/* Lease-type pill removed (commit follow-up h+1): the
+                chooser modal is gone, so the pill no longer serves
+                as a "change type" affordance. */}
           </div>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 px-3 py-1.5 rounded" style={{ backgroundColor: 'rgba(255,255,255,0.08)' }}>
@@ -5545,40 +5490,34 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
         </div>
       )}
 
-      {/* Action bar */}
+      {/* Action bar. Removed in this commit:
+            - Drafts (N)         -- localStorage draft list (pack-bound
+                                    drafts live on the pack, not in
+                                    browser storage)
+            - Save Draft         -- writes to localStorage; superseded
+                                    by "Save Draft to Pack" in the
+                                    pack-bound banner above
+            - Saved (N)          -- list of locally-finalised leases;
+                                    finalised leases live on the pack
+                                    as draftedLease + envelopeId now
+            - Send via DocuSign  -- direct browser-to-DocuSign send;
+                                    superseded by "Approve & Send to
+                                    DocuSign" on the lease_checking
+                                    pipeline card */}
       <div className="px-4 md:px-6 py-3 -mx-4 md:-mx-8" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
         <div className="flex items-center gap-2 flex-wrap">
-          <Button size="sm" variant="ghost" icon={FileText} onClick={() => setDraftsModalOpen(true)}>Drafts ({drafts.length})</Button>
           <Button size="sm" variant="ghost" icon={History} onClick={() => setHistoryModalOpen(true)}>History</Button>
           <Button size="sm" variant="ghost" icon={Eye} onClick={() => setPreviewOpen(true)}>Preview</Button>
           <Button size="sm" variant="primary" icon={Download} onClick={handleGenerateWord} disabled={generating !== null}>
             {generating === 'word' ? 'Generating…' : 'Generate Word'}
           </Button>
-          {/* "Send via DocuSign" is hidden in pack-bound mode -- packs
-              send through the pipeline ("Approve & Send to DocuSign"
-              button on the lease_checking card). Standalone mode keeps
-              the direct-send button for admins. */}
-          {!boundPack && (
-          <Button
-            size="sm"
-            variant="gold"
-            icon={Send}
-            onClick={handleSendToDocuSign}
-            disabled={generating !== null || !integrations?.docusign?.connected || !isAdmin}
-            title={!isAdmin ? 'Admin only' : (integrations?.docusign?.connected ? 'Send for e-signature' : 'Connect DocuSign in Settings first')}
-          >
-            {generating === 'docusign' ? 'Sending…' : 'Send via DocuSign'}
-          </Button>
-          )}
           <Button size="sm" variant="ghost" icon={FileText} onClick={() => generateSinglePart('partA')} disabled={generating !== null}>
             {generating === 'partA' ? 'Part A…' : 'Part A only'}
           </Button>
           <Button size="sm" variant="ghost" icon={FileText} onClick={() => generateSinglePart('partB')} disabled={generating !== null}>
             {generating === 'partB' ? 'Part B…' : 'Part B only'}
           </Button>
-          <Button size="sm" variant="primary" icon={Save} onClick={handleSaveDraft}>Save Draft</Button>
           <Button size="sm" variant="danger" icon={Trash2} onClick={() => setClearConfirmOpen(true)}>Clear</Button>
-          <Button size="sm" variant="ghost" icon={FileCheck} onClick={() => setSavedModalOpen(true)}>Saved ({savedLeases.length})</Button>
           <div className="ml-auto">
             <Button size="sm" variant="gold" icon={CheckCircle2} onClick={handleSaveLease}>Finalise Lease</Button>
           </div>
