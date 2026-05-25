@@ -23,9 +23,11 @@ router.use(requireAuth);
 // abused as a generic blob store.
 export const INTEGRATIONS = {
   anthropic: ['apiKey', 'model'],
-  docusign: ['integrationKey', 'clientSecret', 'redirectUri', 'environment',
-             'accessToken', 'refreshToken', 'tokenExpiry',
-             'accountId', 'baseUri', 'userId', 'userEmail'],
+  // DocuSign was removed from the vault when the integration switched
+  // to a JWT service account configured via server env vars
+  // (DOCUSIGN_INTEGRATION_KEY etc.). Any pre-migration rows in the
+  // secrets table remain ignored — the integration code no longer
+  // reads them.
   // Property Inspect — OAuth (authorization_code) only. PAT mode removed.
   // webhookToken is a per-user random string embedded in the public webhook
   // URL — receipt of a POST with a matching token identifies whose data

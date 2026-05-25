@@ -14,10 +14,11 @@ import { getApiClient, isProduction } from './auth.js';
 // Anchor strings are derived from the signer's role, matching the
 // template constants in src/App.jsx (DOCUSIGN_ANCHORS). Format:
 //   \sig_<role>\   \date_<role>\   \name_<role>\   \init_<role>\
-// where <role> is one of landlord, tenant, surety, witness.
-// The lease DOCX template renders these in white size-1 text so
+// Roles: landlord, tenant, or surety_<n> / witness_<n> for multiple
+// sureties/witnesses (1-based, e.g. surety_1, surety_2). The lease
+// DOCX template renders these anchors in white size-1 text so
 // DocuSign locates them but they don't show in the final document.
-const VALID_ROLES = new Set(['landlord', 'tenant', 'surety', 'witness']);
+const ROLE_REGEX = /^(landlord|tenant|(surety|witness)(_\d+)?)$/;
 const anchorsFor = (role) => ({
   sig:  `\\sig_${role}\\`,
   date: `\\date_${role}\\`,
@@ -145,8 +146,8 @@ export const sendLeaseForSignature = async ({
     if (!s || !s.name || !s.email || !s.role) {
       throw new Error(`signers[${i}] requires name, email, role`);
     }
-    if (!VALID_ROLES.has(s.role)) {
-      throw new Error(`signers[${i}].role='${s.role}' not in {${[...VALID_ROLES].join(', ')}}`);
+    if (!ROLE_REGEX.test(s.role)) {
+      throw new Error(`signers[${i}].role='${s.role}' must match landlord | tenant | surety[_<n>] | witness[_<n>]`);
     }
   });
   if (!pdfBuffer && !pdfPath) {

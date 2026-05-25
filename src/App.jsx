@@ -639,198 +639,14 @@ const propertyInspectAPI = {
 // Real REST envelope creation via eSignature REST API v2.1.
 // ============================================================
 //
-// DocuSign hosts differ between developer sandbox and production.
-//   Demo  (sandbox) — account-d.docusign.com (auth) + demo.docusign.net  (api)
-//   Prod  (live)    — account.docusign.com  (auth) + per-account base URI
-//
-// Required OAuth scopes for envelope creation:
-//   - signature (basic envelope operations)
-//   - extended  (optional — enables refresh tokens)
-//
-// IMPORTANT: This client never deletes envelopes, never voids envelopes,
-// and never modifies recipients on existing envelopes. The only write
-// operation it exposes is `createEnvelope` (POST /envelopes) which creates
-// a NEW envelope from the lease document. All other methods are GETs.
-const DOCUSIGN_ENVIRONMENTS = {
-  demo: {
-    label: 'Demo / Sandbox',
-    authHost: 'https://account-d.docusign.com',
-    defaultBaseUri: 'https://demo.docusign.net/restapi',
-  },
-  prod: {
-    label: 'Production',
-    authHost: 'https://account.docusign.com',
-    // base URI is account-specific — we fetch the real one from /userinfo
-    defaultBaseUri: 'https://www.docusign.net/restapi',
-  },
-};
-
-const localizeDocuSignForDev = (url) => {
-  if (typeof window === 'undefined') return url;
-  const host = window.location.hostname;
-  if (host !== 'localhost' && host !== '127.0.0.1') return url;
-  return url
-    .replace(/^https:\/\/account-d\.docusign\.com/, '/api/ds-auth-d')
-    .replace(/^https:\/\/account\.docusign\.com/, '/api/ds-auth')
-    // Any DocuSign REST host — match the most specific patterns first.
-    .replace(/^https:\/\/demo\.docusign\.net/, '/api/ds-rest-d')
-    .replace(/^https:\/\/(eu|na1|na2|na3|na4|au|ca|sg)\.docusign\.net/, '/api/ds-rest')
-    .replace(/^https:\/\/www\.docusign\.net/, '/api/ds-rest');
-};
-
-const docusignAPI = {
-  // Build the URL the user is redirected to in order to approve our app.
-  buildAuthorizeUrl({ environment = 'demo', clientId, redirectUri, state, scope = 'signature extended' }) {
-    const env = DOCUSIGN_ENVIRONMENTS[environment] || DOCUSIGN_ENVIRONMENTS.demo;
-    const url = new URL(`${env.authHost}/oauth/auth`);
-    url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', scope);
-    url.searchParams.set('client_id', clientId);
-    url.searchParams.set('redirect_uri', redirectUri);
-    url.searchParams.set('state', state);
-    return url.toString();
-  },
-
-  // Exchange authorization code for access + refresh tokens.
-  async exchangeAuthorizationCode({ environment = 'demo', clientId, clientSecret, code, redirectUri }) {
-    const env = DOCUSIGN_ENVIRONMENTS[environment] || DOCUSIGN_ENVIRONMENTS.demo;
-    const url = localizeDocuSignForDev(`${env.authHost}/oauth/token`);
-    const body = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-    });
-    const basic = btoa(`${clientId}:${clientSecret}`);
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${basic}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-      body,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`DocuSign token exchange failed (HTTP ${res.status}): ${text || res.statusText}`);
-    }
-    const json = await res.json();
-    if (!json.access_token) throw new Error('DocuSign token response missing access_token');
-    const expiresIn = Number(json.expires_in) || 3600;
-    return {
-      accessToken: json.access_token,
-      refreshToken: json.refresh_token || null,
-      expiresAt: Date.now() + Math.max(60, expiresIn - 30) * 1000,
-    };
-  },
-
-  // Refresh an expired access token using the stored refresh token.
-  async refreshAccessToken({ environment = 'demo', clientId, clientSecret, refreshToken }) {
-    if (!refreshToken) throw new Error('No DocuSign refresh token — re-authenticate.');
-    const env = DOCUSIGN_ENVIRONMENTS[environment] || DOCUSIGN_ENVIRONMENTS.demo;
-    const url = localizeDocuSignForDev(`${env.authHost}/oauth/token`);
-    const basic = btoa(`${clientId}:${clientSecret}`);
-    const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken });
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${basic}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-      body,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`DocuSign refresh failed (HTTP ${res.status}): ${text || res.statusText}`);
-    }
-    const json = await res.json();
-    const expiresIn = Number(json.expires_in) || 3600;
-    return {
-      accessToken: json.access_token,
-      refreshToken: json.refresh_token || refreshToken,
-      expiresAt: Date.now() + Math.max(60, expiresIn - 30) * 1000,
-    };
-  },
-
-  // Read user/account info — used right after OAuth to auto-detect
-  // accountId and base_uri (production base URIs vary per account region).
-  async getUserInfo({ environment = 'demo', accessToken }) {
-    const env = DOCUSIGN_ENVIRONMENTS[environment] || DOCUSIGN_ENVIRONMENTS.demo;
-    const url = localizeDocuSignForDev(`${env.authHost}/oauth/userinfo`);
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`DocuSign /userinfo failed (HTTP ${res.status}): ${text || res.statusText}`);
-    }
-    return res.json();
-  },
-
-  // Get a specific envelope's status. Read-only.
-  async getEnvelope({ baseUri, accountId, envelopeId, accessToken }) {
-    const url = localizeDocuSignForDev(`${baseUri}/v2.1/accounts/${encodeURIComponent(accountId)}/envelopes/${encodeURIComponent(envelopeId)}`);
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`DocuSign getEnvelope failed (HTTP ${res.status}): ${text || res.statusText}`);
-    }
-    return res.json();
-  },
-
-  // Create a NEW envelope. This is the ONLY write method exposed.
-  // No method exists in this client to void, delete, or modify an envelope's
-  // recipients/documents after creation.
-  async createEnvelope({ baseUri, accountId, envelope, accessToken }) {
-    const url = localizeDocuSignForDev(`${baseUri}/v2.1/accounts/${encodeURIComponent(accountId)}/envelopes`);
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify(envelope),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`DocuSign createEnvelope failed (HTTP ${res.status}): ${text || res.statusText}`);
-    }
-    return res.json();
-  },
-
-  // Ensure we have a fresh access token, refreshing if needed.
-  async ensureAccessToken(ds) {
-    const now = Date.now();
-    if (ds.cachedAccessToken && ds.cachedAccessTokenExpiry && now < ds.cachedAccessTokenExpiry) {
-      return { accessToken: ds.cachedAccessToken, updates: null };
-    }
-    if (ds.cachedRefreshToken) {
-      const refreshed = await this.refreshAccessToken({
-        environment: ds.environment,
-        clientId: ds.integrationKey,
-        clientSecret: ds.clientSecret,
-        refreshToken: ds.cachedRefreshToken,
-      });
-      return {
-        accessToken: refreshed.accessToken,
-        updates: {
-          cachedAccessToken: refreshed.accessToken,
-          cachedAccessTokenExpiry: refreshed.expiresAt,
-          cachedRefreshToken: refreshed.refreshToken,
-        },
-      };
-    }
-    throw new Error('No DocuSign access token available. Click Connect in Settings → Integrations.');
-  },
-};
+// DocuSign authentication and envelope operations live SERVER-SIDE
+// (server/docusign/*) — the SPA only talks to /api/docusign/* via
+// api.proxy.docusign*. The previous browser-based OAuth client
+// (docusignAPI, DOCUSIGN_ENVIRONMENTS, localizeDocuSignForDev) was
+// removed when we switched to JWT service-account auth.
 
 // Helper — convert a Blob (e.g. a generated lease DOCX) to a base64 string
-// suitable for DocuSign's documentBase64 field. Pure local operation.
+// suitable for POSTing to /api/docusign/send-lease. Pure local operation.
 const blobToBase64 = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader();
   reader.onerror = () => reject(reader.error);
@@ -872,38 +688,10 @@ const DOCUSIGN_ANCHORS = {
   }),
 };
 
-// Build DocuSign tab definitions from anchor strings.
-// All anchor offsets are pixels; positive Y moves the field DOWN on the page.
-const buildSignerTabs = (anchorSet) => ({
-  signHereTabs: anchorSet.signature ? [{
-    anchorString: anchorSet.signature,
-    anchorUnits: 'pixels',
-    anchorXOffset: '0',
-    anchorYOffset: '0',
-    anchorIgnoreIfNotPresent: 'true',
-  }] : [],
-  dateSignedTabs: anchorSet.date ? [{
-    anchorString: anchorSet.date,
-    anchorUnits: 'pixels',
-    anchorXOffset: '0',
-    anchorYOffset: '0',
-    anchorIgnoreIfNotPresent: 'true',
-  }] : [],
-  fullNameTabs: anchorSet.name ? [{
-    anchorString: anchorSet.name,
-    anchorUnits: 'pixels',
-    anchorXOffset: '0',
-    anchorYOffset: '0',
-    anchorIgnoreIfNotPresent: 'true',
-  }] : [],
-  initialHereTabs: anchorSet.initials ? [{
-    anchorString: anchorSet.initials,
-    anchorUnits: 'pixels',
-    anchorXOffset: '0',
-    anchorYOffset: '0',
-    anchorIgnoreIfNotPresent: 'true',
-  }] : [],
-});
+// buildSignerTabs() was removed when the SPA stopped composing DocuSign
+// Tab payloads directly. The backend now derives all four tab types
+// (SignHere, DateSigned, FullName, InitialHere) from each signer's
+// role — see server/docusign/envelopes.js tabsForRole().
 
 // ============================================================
 // DEPARTMENT & TEAM STRUCTURE
@@ -1614,24 +1402,12 @@ const defaultIntegrations = {
     lastSyncStatus: null,
     lastSyncError: null,
   },
-  docusign: {
-    connected: false,
-    environment: 'demo', // 'demo' or 'prod'
-    integrationKey: '',  // OAuth client_id
-    clientSecret: '',    // OAuth client_secret
-    redirectUri: '',     // populated from window.location on first render
-    accountId: '',       // auto-detected via /userinfo after OAuth
-    baseUri: '',         // auto-detected via /userinfo after OAuth
-    userId: '',          // user GUID returned by /userinfo
-    userEmail: '',
-    cachedAccessToken: '',
-    cachedAccessTokenExpiry: null,
-    cachedRefreshToken: '',
-    lastSync: null,
-    lastSyncStatus: null,
-    lastSyncError: null,
-    lastEnvelopeId: '',
-  },
+  // DocuSign now uses a JWT service account configured via server env
+  // vars (DOCUSIGN_INTEGRATION_KEY etc.). Settings → DocuSign reads
+  // /api/docusign/status for live state — no per-user config persists
+  // here. This empty object is kept so old `integrations.docusign`
+  // references in pre-migration localStorage don't crash on read.
+  docusign: {},
   emailProvider: { provider: 'SendGrid', connected: true, fromAddress: 'noreply@exceedproperties.co.za' },
   smsProvider: { provider: 'Twilio', connected: false, fromNumber: '' },
   anthropic: { connected: false, apiKey: '', model: 'claude-haiku-4-5-20251001', lastTested: null, lastError: null },
@@ -5294,16 +5070,13 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   };
 
   // Send the rendered lease to DocuSign as a new envelope.
-  // Creates ONE envelope per click. Never modifies an existing one.
-  // Recipients are derived from the form (landlord, tenant signatory, sureties).
+  // Creates ONE envelope per click. The backend (JWT service account)
+  // owns the actual createEnvelope call; we just POST signers + base64
+  // bytes to /api/docusign/send-lease. Roles map 1:1 to template
+  // anchor strings (\sig_landlord\, \sig_tenant\, \sig_surety_N\).
   const handleSendToDocuSign = async () => {
-    const ds = integrations?.docusign || {};
-    if (!ds.connected || !ds.accountId || !ds.baseUri) {
-      showToast('DocuSign isn\'t connected. Go to Settings → Integrations → DocuSign and click Connect.', 'error');
-      onNavigateToSettings?.();
-      return;
-    }
-    // Need at least one signer email — the tenant signatory is the primary signer.
+    // Need at least one signer email — the tenant signatory is the
+    // primary signer.
     const tenantEmail = form.tenant?.signatoryEmail || form.tenant?.email;
     const tenantName = form.tenant?.signatoryName || form.tenant?.companyName;
     if (!tenantEmail || !tenantName) {
@@ -5315,36 +5088,30 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
 
     setGenerating('docusign');
     try {
-      // 1. Get a fresh access token (auto-refresh if needed).
-      const { accessToken, updates } = await docusignAPI.ensureAccessToken(ds);
-      if (updates) setIntegrations({ ...integrations, docusign: { ...ds, ...updates } });
-
-      // 2. Build the DOCX in memory.
+      // 1. Build the DOCX in memory.
       const blob = await buildLeaseBlob();
-      const documentBase64 = await blobToBase64(blob);
+      const pdfBase64 = await blobToBase64(blob);
 
-      // 3. Compose recipients with anchor-based tabs. Routing order:
+      // 2. Compose signers. Routing order:
       //    1 = tenant signs first, 2 = landlord countersigns, 3+ = sureties.
-      //    Each signer gets only the tabs that match their anchor namespace.
+      //    Backend derives anchor strings from `role`, so each signer
+      //    only needs name/email/role/routingOrder here.
       const signers = [];
-      let recipientId = 1;
       let routingOrder = 1;
 
       signers.push({
-        recipientId: String(recipientId++),
-        routingOrder: String(routingOrder++),
         name: String(tenantName).slice(0, 100),
         email: tenantEmail,
-        tabs: buildSignerTabs(DOCUSIGN_ANCHORS.tenant),
+        role: 'tenant',
+        routingOrder: routingOrder++,
       });
 
       if (landlordEmail && landlordName) {
         signers.push({
-          recipientId: String(recipientId++),
-          routingOrder: String(routingOrder++),
           name: String(landlordName).slice(0, 100),
           email: landlordEmail,
-          tabs: buildSignerTabs(DOCUSIGN_ANCHORS.landlord),
+          role: 'landlord',
+          routingOrder: routingOrder++,
         });
       }
 
@@ -5352,68 +5119,36 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
         form.surety.forEach((s, idx) => {
           if (!s?.email || !s?.name) return;
           signers.push({
-            recipientId: String(recipientId++),
-            routingOrder: String(routingOrder++),
             name: String(s.name).slice(0, 100),
             email: s.email,
-            tabs: buildSignerTabs(DOCUSIGN_ANCHORS.surety(idx + 1)),
+            // Numbered surety anchors: \sig_surety_1\, \sig_surety_2\, ...
+            role: `surety_${idx + 1}`,
+            routingOrder: routingOrder++,
           });
         });
       }
 
-      // 4. POST the envelope. status:'sent' triggers immediate emails;
-      //    status:'created' would save as draft on DocuSign.
-      const envelopeRequest = {
+      // 3. POST to the JWT backend. It handles createEnvelope + tab
+      //    placement + reminder schedule.
+      const safeDocName = `${form.tenant?.companyName || 'Lease'}.docx`.replace(/[/\\:*?"<>|]/g, '_');
+      const r = await api.proxy.docusignSendLease({
+        signers,
+        pdfBase64,
         emailSubject: `Lease Agreement — ${form.premises?.buildingName || form.tenant?.companyName || 'Exceed Properties'}`,
-        emailBlurb: `Please review and sign the attached lease agreement.\n\nIf you have any questions, contact the landlord directly.`,
-        status: 'sent',
-        documents: [{
-          documentBase64,
-          name: `${form.tenant?.companyName || 'Lease'}.docx`.replace(/[\/\\:*?"<>|]/g, '_'),
-          fileExtension: 'docx',
-          documentId: '1',
-        }],
-        recipients: { signers },
-      };
-      const env = await docusignAPI.createEnvelope({
-        baseUri: ds.baseUri,
-        accountId: ds.accountId,
-        envelope: envelopeRequest,
-        accessToken,
+        documentName: safeDocName,
       });
-
-      // 5. Persist the envelope ID for later status lookup.
-      setIntegrations(prev => ({
-        ...prev,
-        docusign: {
-          ...(prev.docusign || {}),
-          lastEnvelopeId: env.envelopeId,
-          lastSync: new Date().toISOString(),
-          lastSyncStatus: 'success',
-          lastSyncError: null,
-        },
-      }));
 
       setHistory(prev => [{
         id: `h-${Date.now()}`,
         action: 'Sent to DocuSign',
-        label: `${form.tenant?.companyName || 'Lease'} → ${env.envelopeId}`,
+        label: `${form.tenant?.companyName || 'Lease'} → ${r.envelopeId}`,
         at: new Date().toISOString(),
       }, ...prev].slice(0, 100));
-      logAction(`Sent lease "${form.tenant?.companyName || 'Unnamed'}" to DocuSign — envelope ${env.envelopeId}`);
-      showToast(`Sent to DocuSign — ${signers.length} signer${signers.length === 1 ? '' : 's'} · envelope ${env.envelopeId}`, 'success');
+      logAction(`Sent lease "${form.tenant?.companyName || 'Unnamed'}" to DocuSign — envelope ${r.envelopeId}`);
+      showToast(`Sent to DocuSign — ${signers.length} signer${signers.length === 1 ? '' : 's'} · envelope ${String(r.envelopeId).slice(0, 8)}…`, 'success');
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[DocuSign] send failed:', err);
-      setIntegrations(prev => ({
-        ...prev,
-        docusign: {
-          ...(prev.docusign || {}),
-          lastSync: new Date().toISOString(),
-          lastSyncStatus: 'error',
-          lastSyncError: err.message,
-        },
-      }));
       showToast('DocuSign send failed: ' + (err.message || 'unknown'), 'error');
     } finally {
       setGenerating(null);
@@ -14249,122 +13984,13 @@ export default function ExceedProperties() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // DocuSign OAuth callback handler. Mirrors the PI handler. Triggered when
-  // the browser is redirected back to /oauth/docusign-callback after the user
-  // approves the app on DocuSign. Exchanges code → tokens, fetches userInfo
-  // to auto-detect accountId + base_uri, persists everything.
+  // DocuSign OAuth callback handler — removed. The integration uses a
+  // JWT service account configured via server env vars; there is no
+  // per-user OAuth and no /oauth/docusign-callback page. If you find a
+  // stale ep:ds-oauth-pending entry in sessionStorage from before the
+  // migration, clear it on first run so it doesn't sit there forever.
   useEffect(() => {
-    const url = new URL(window.location.href);
-    const code = url.searchParams.get('code');
-    const state = url.searchParams.get('state');
-    const error = url.searchParams.get('error');
-    const isDSCallback = url.pathname === '/oauth/docusign-callback' || (code && state && sessionStorage.getItem('ep:ds-oauth-pending'));
-    if (!isDSCallback) return;
-
-    const cleanUrl = () => {
-      window.history.replaceState({}, document.title, window.location.origin + '/');
-    };
-
-    let pending = null;
-    try {
-      const raw = sessionStorage.getItem('ep:ds-oauth-pending');
-      pending = raw ? JSON.parse(raw) : null;
-    } catch { /* ignore */ }
-
-    if (error) {
-      const errDesc = url.searchParams.get('error_description') || '';
-      showToast(`DocuSign connection cancelled: ${error}${errDesc ? ' — ' + errDesc : ''}`, 'error');
-      setIntegrations(prev => ({
-        ...prev,
-        docusign: {
-          ...(prev.docusign || {}),
-          lastSync: new Date().toISOString(),
-          lastSyncStatus: 'error',
-          lastSyncError: `OAuth ${error}: ${errDesc || '(no description)'}`,
-        },
-      }));
-      sessionStorage.removeItem('ep:ds-oauth-pending');
-      cleanUrl();
-      setActiveNav('settings');
-      return;
-    }
-    if (!code || !pending) {
-      sessionStorage.removeItem('ep:ds-oauth-pending');
-      cleanUrl();
-      return;
-    }
-    if (state !== pending.state) {
-      showToast('DocuSign OAuth state mismatch — possible CSRF. Aborted.', 'error');
-      sessionStorage.removeItem('ep:ds-oauth-pending');
-      cleanUrl();
-      return;
-    }
-
-    (async () => {
-      try {
-        const tokens = await docusignAPI.exchangeAuthorizationCode({
-          environment: pending.environment,
-          clientId: pending.integrationKey,
-          clientSecret: pending.clientSecret,
-          code,
-          redirectUri: pending.redirectUri,
-        });
-        // Pull account info to auto-detect accountId + base_uri.
-        let info = null;
-        try {
-          info = await docusignAPI.getUserInfo({
-            environment: pending.environment,
-            accessToken: tokens.accessToken,
-          });
-        } catch (e) {
-          // Continue even if userinfo fails — user can edit manually if needed.
-          console.warn('[DocuSign] /userinfo failed:', e.message);
-        }
-        // Pick the account marked default, else the first one.
-        const defaultAcct = (info?.accounts || []).find(a => a.is_default) || (info?.accounts || [])[0] || null;
-
-        setIntegrations(prev => ({
-          ...prev,
-          docusign: {
-            ...(prev.docusign || {}),
-            environment: pending.environment,
-            integrationKey: pending.integrationKey,
-            clientSecret: pending.clientSecret,
-            redirectUri: pending.redirectUri,
-            connected: true,
-            cachedAccessToken: tokens.accessToken,
-            cachedAccessTokenExpiry: tokens.expiresAt,
-            cachedRefreshToken: tokens.refreshToken,
-            accountId: defaultAcct?.account_id || prev.docusign?.accountId || '',
-            baseUri: defaultAcct?.base_uri ? `${defaultAcct.base_uri}/restapi` : (prev.docusign?.baseUri || ''),
-            userId: info?.sub || prev.docusign?.userId || '',
-            userEmail: info?.email || prev.docusign?.userEmail || '',
-            lastSync: new Date().toISOString(),
-            lastSyncStatus: 'success',
-            lastSyncError: null,
-          },
-        }));
-        logAction(`Connected to DocuSign (${pending.environment}) as ${info?.email || 'unknown'}`);
-        showToast('Connected to DocuSign', 'success');
-      } catch (err) {
-        setIntegrations(prev => ({
-          ...prev,
-          docusign: {
-            ...(prev.docusign || {}),
-            connected: false,
-            lastSync: new Date().toISOString(),
-            lastSyncStatus: 'error',
-            lastSyncError: err.message,
-          },
-        }));
-        showToast('DocuSign connection failed: ' + err.message, 'error');
-      } finally {
-        sessionStorage.removeItem('ep:ds-oauth-pending');
-        cleanUrl();
-        setActiveNav('settings');
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    try { sessionStorage.removeItem('ep:ds-oauth-pending'); } catch { /* ignore */ }
   }, []);
 
   const unreadCount = notifications.filter(n => !n.read).length;

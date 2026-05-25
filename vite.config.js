@@ -14,6 +14,8 @@ export default defineConfig({
       '/api/auth': { target: 'http://localhost:4000', changeOrigin: true, secure: false },
       '/api/secrets': { target: 'http://localhost:4000', changeOrigin: true, secure: false },
       '/api/proxy': { target: 'http://localhost:4000', changeOrigin: true, secure: false },
+      '/api/docusign': { target: 'http://localhost:4000', changeOrigin: true, secure: false },
+      '/api/webhooks': { target: 'http://localhost:4000', changeOrigin: true, secure: false },
       '/api/health': { target: 'http://localhost:4000', changeOrigin: true, secure: false },
       '/api/jibble-identity': {
         target: 'https://identity.prod.jibble.io',
@@ -54,29 +56,10 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/pi-my/, ''),
       },
-      // DocuSign — OAuth + eSignature REST API.
-      // Demo (sandbox) hosts:
-      '/api/ds-auth-d': {
-        target: 'https://account-d.docusign.com',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/ds-auth-d/, ''),
-      },
-      '/api/ds-rest-d': {
-        target: 'https://demo.docusign.net',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/ds-rest-d/, ''),
-      },
-      // Production hosts:
-      '/api/ds-auth': {
-        target: 'https://account.docusign.com',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/ds-auth/, ''),
-      },
-      '/api/ds-rest': {
-        target: 'https://www.docusign.net',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/ds-rest/, ''),
-      },
+      // DocuSign — direct-from-browser proxy paths removed when the
+      // integration switched to JWT service-account auth. All DocuSign
+      // calls now go through /api/docusign/* (server-side) which is
+      // forwarded to the backend by the rule above.
     },
   },
 })
