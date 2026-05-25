@@ -11,7 +11,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "seed": "node server/seed.js"
+    "seed": "node server/seed.js",
+    "test": "node scripts/test-pack-transitions.js && node scripts/test-pack-happy-path.js && node scripts/test-pack-declined-path.js && node scripts/test-webhook-record.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.2",
