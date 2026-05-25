@@ -21,15 +21,57 @@ Code layout:
 Set these in `server/.env` for local dev and in the **Render dashboard →
 Environment** for production.
 
-| Variable                     | Required | Default                                  | Notes |
-| ---------------------------- | -------- | ---------------------------------------- | ----- |
-| `DOCUSIGN_INTEGRATION_KEY`   | yes      | —                                        | a.k.a. Client ID; from Apps & Keys. |
-| `DOCUSIGN_USER_ID`           | yes      | —                                        | API user GUID (Users → User → API Username). |
-| `DOCUSIGN_ACCOUNT_ID`        | yes      | —                                        | Account ID (Apps & Keys). |
-| `DOCUSIGN_OAUTH_HOST`        | no       | `account-d.docusign.com`                 | `account.docusign.com` for prod. |
-| `DOCUSIGN_BASE_PATH`         | no       | `https://demo.docusign.net/restapi`      | For prod, use the per-account base URI from `/oauth/userinfo`. |
-| `DOCUSIGN_PRIVATE_KEY`       | yes      | —                                        | RSA PEM. Multi-line in `.env` (wrap in `"…"`), or single-line with `\n` for Render. |
-| `DOCUSIGN_WEBHOOK_SECRET`    | yes (for Connect) | —                                | Shared secret used by DocuSign Connect HMAC. |
+There is **one set of env-var names** but their values change between
+demo and production. The two cells in each row below show the
+demo value vs. the production value.
+
+| Variable                     | Required | Demo value                                | Production value                                 |
+| ---------------------------- | -------- | ----------------------------------------- | ------------------------------------------------ |
+| `DOCUSIGN_INTEGRATION_KEY`   | yes      | from demo Apps & Keys (a GUID)            | from prod Apps & Keys — usually **same GUID** as demo, but verify per integration |
+| `DOCUSIGN_USER_ID`           | yes      | demo API user **API Username** (GUID)     | prod API user **API Username** (GUID) — **DIFFERS** from demo (different user record) |
+| `DOCUSIGN_ACCOUNT_ID`        | yes      | demo Account ID (GUID)                    | prod Account ID (GUID) — **DIFFERS** from demo |
+| `DOCUSIGN_OAUTH_HOST`        | no (defaulted) | `account-d.docusign.com`             | `account.docusign.com` (no `-d`) |
+| `DOCUSIGN_BASE_PATH`         | **no — auto-discovered** | `https://demo.docusign.net/restapi` (fallback) | leave blank or any value; **base path is auto-discovered per request via /oauth/userinfo** |
+| `DOCUSIGN_PRIVATE_KEY`       | yes      | demo RSA private key (PEM)                | prod RSA private key (PEM) — **generate a new keypair, do not reuse demo's** |
+| `DOCUSIGN_WEBHOOK_SECRET`    | yes (for Connect) | demo Connect HMAC secret           | prod Connect HMAC secret — set when you create the prod Connect config (Phase E in the go-live checklist) |
+
+### Base path auto-discovery
+
+Since the production switchover, `DOCUSIGN_BASE_PATH` is no longer
+authoritative. After minting a JWT, the auth module calls
+`https://{OAUTH_HOST}/oauth/userinfo`, finds the account that matches
+`DOCUSIGN_ACCOUNT_ID`, and uses **that** account's `base_uri` for the
+session. This means:
+
+- **Demo**: the discovered URI will always be `https://demo.docusign.net/restapi`
+  for every account.
+- **Production**: it could be `https://na1.docusign.net`, `na2`,
+  `na3`, `na4`, `eu`, or `au` depending on where DocuSign provisions
+  the account. You no longer have to know which one in advance.
+
+If `/oauth/userinfo` fails (network blip, account ID typo), the server
+logs a warning and falls back to whatever `DOCUSIGN_BASE_PATH` is set
+to. So leaving the env var in place as a safety net is fine.
+
+### Switching environments — exactly what changes
+
+When promoting demo → production, **five env vars must change**:
+
+1. `DOCUSIGN_INTEGRATION_KEY` (usually same value, but verify)
+2. `DOCUSIGN_USER_ID`
+3. `DOCUSIGN_ACCOUNT_ID`
+4. `DOCUSIGN_OAUTH_HOST` (`account-d.docusign.com` → `account.docusign.com`)
+5. `DOCUSIGN_PRIVATE_KEY`
+
+`DOCUSIGN_BASE_PATH` does not change (auto-discovered).
+
+`DOCUSIGN_WEBHOOK_SECRET` may or may not change depending on whether
+you generate a fresh secret when configuring the production Connect
+listener. If you re-use the demo secret, leave it alone.
+
+The full operational walkthrough (consent, Connect config, Render
+deployment order) lives in
+[`docusign-go-live-checklist.md`](./docusign-go-live-checklist.md).
 
 ### Private-key handling
 
@@ -124,37 +166,24 @@ positioning is whatever you set up inside the DocuSign template.
 
 ## Demo → production switchover
 
-1. **Re-grant consent** against production:
+Follow [`docusign-go-live-checklist.md`](./docusign-go-live-checklist.md)
+end-to-end. It walks through generating the demo API traffic DocuSign
+requires (≥20 calls / ≥5 method types), submitting the Go-Live review,
+creating prod credentials, granting prod consent, configuring the prod
+Connect webhook, switching the Render env vars, and verifying.
 
-   ```
-   https://account.docusign.com/oauth/auth?response_type=code
-     &scope=signature%20impersonation
-     &client_id={PROD_INTEGRATION_KEY}
-     &redirect_uri=https://www.docusign.com
-   ```
+Two scripts support the API-traffic generation phase:
 
-2. **Submit Go-Live review** in DocuSign Admin (Apps & Keys → your
-   integration → Actions → Start Promotion). Anthropic-side, this is
-   gated on at least 20 successful demo API calls in the last 30 days.
+- `scripts/docusign-smoke-test.js` — one run, six API method types,
+  <30 seconds. Sends one envelope to `TEST_RECIPIENT_EMAIL`.
+- `scripts/docusign-generate-golive-traffic.js` — runs the smoke test
+  five times in sequence. One full pass = 30 successful API calls
+  across 6 method types, well over DocuSign's bar.
 
-3. **Flip env vars**:
-
-   ```env
-   DOCUSIGN_OAUTH_HOST=account.docusign.com
-   # Discover the prod base URI by calling https://account.docusign.com/oauth/userinfo
-   # with a prod access token; use the matching `base_uri/restapi` value.
-   DOCUSIGN_BASE_PATH=https://na2.docusign.net/restapi   # example
-   DOCUSIGN_INTEGRATION_KEY=<prod key — usually same as demo>
-   DOCUSIGN_USER_ID=<prod user GUID>
-   DOCUSIGN_ACCOUNT_ID=<prod account ID>
-   DOCUSIGN_PRIVATE_KEY=<prod RSA private key>
-   ```
-
-4. **Update the Connect listener URL** in the prod DocuSign Admin to
-   point at `https://exceed-properties.onrender.com/api/webhooks/docusign`.
-
-5. **Run `scripts/test-docusign-auth.js`** against the new env vars
-   before anything tries to send envelopes.
+Both honour `TEST_RECIPIENT_EMAIL` and `TEST_RECIPIENT_NAME` env vars;
+use an inbox you control. The base path discovery (above) means **the
+same scripts work against demo or prod** — only the env vars decide
+which account they hit.
 
 ## Troubleshooting
 
