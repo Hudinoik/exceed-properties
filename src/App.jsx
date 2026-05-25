@@ -4539,7 +4539,113 @@ const PdfDropzone = ({ kind, state, error, filename, aiReady, onFile, onNavigate
 };
 
 const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integrations, debtors = [], onNavigateToSettings }) => {
+  // Pack-bound vs standalone mode. window.__draftingPackId is set
+  // by the LeasingSection's "Start Draft" / "Continue Drafting"
+  // buttons just before navigating here (existing pattern -- this
+  // app uses nav state, not URL routing, so we piggyback off the
+  // window object). Cleared on unmount so the next standalone
+  // entry doesn't accidentally re-bind to the previous pack.
+  const initialPackId = (typeof window !== 'undefined') ? (window.__draftingPackId || null) : null;
+  const [boundPack, setBoundPack] = useState(null);
+  const [boundPackLoading, setBoundPackLoading] = useState(!!initialPackId);
+  const [boundPackErr, setBoundPackErr] = useState(null);
+  const isStandalone = !initialPackId && !boundPack;
+  // Standalone-mode admin check. systemRole === 'director' is the
+  // only true-admin role today; everyone else uses the pipeline.
+  const isAdmin = (currentUser?.systemRole || currentUser?.role) === 'director';
+
   const [form, setForm] = useState(() => blankLeaseForm());
+
+  // On mount: if we arrived via a pack action, fetch the pack and
+  // pre-fill the form with its tenant / property / rent / term info.
+  // The user can still edit anything before saving.
+  useEffect(() => {
+    if (!initialPackId) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const pack = await api.packs.get(initialPackId);
+        if (cancelled) return;
+        setBoundPack(pack);
+        // Pre-fill form fields from pack data. We only set fields
+        // where the pack has a value -- avoids stomping on the
+        // template's defaults for fields the pack doesn't track
+        // (e.g. landlord banking details).
+        setForm(prev => ({
+          ...prev,
+          tenant: {
+            ...prev.tenant,
+            companyName: pack.tenantName || prev.tenant.companyName,
+            email: pack.tenantEmail || prev.tenant.email,
+          },
+          premises: {
+            ...prev.premises,
+            buildingName: pack.property || prev.premises.buildingName,
+            unitNumber: pack.unit || prev.premises.unitNumber,
+          },
+          initialPeriod: {
+            ...prev.initialPeriod,
+            commencementDate: pack.leaseStartDate || prev.initialPeriod.commencementDate,
+            ...(pack.leaseTerm > 0 ? {
+              years: Math.floor(pack.leaseTerm / 12),
+              months: pack.leaseTerm % 12,
+            } : {}),
+          },
+          monthlyRental: {
+            ...prev.monthlyRental,
+            years: [
+              { ...prev.monthlyRental.years[0], rentExVat: pack.monthlyRent || prev.monthlyRental.years[0].rentExVat },
+              ...prev.monthlyRental.years.slice(1),
+            ],
+          },
+          deposit: { amount: pack.depositAmount || prev.deposit.amount },
+        }));
+      } catch (err) {
+        if (cancelled) return;
+        setBoundPackErr(err.message || 'Failed to load pack');
+      } finally {
+        if (!cancelled) setBoundPackLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // Clear the signal so a subsequent direct visit lands in standalone mode
+      if (typeof window !== 'undefined') window.__draftingPackId = null;
+    };
+  }, [initialPackId]);
+
+  // Save the current form to the bound pack as a new draft version.
+  // If goToChecking=true, also transition the pack to lease_checking.
+  // No-op if not pack-bound.
+  const handleSaveDraftToPack = async (goToChecking = false) => {
+    if (!boundPack) {
+      showToast('Not pack-bound -- use Save Draft (localStorage)', 'error');
+      return;
+    }
+    try {
+      const blob = await buildLeaseBlob();
+      const docxBase64 = await blobToBase64(blob);
+      await api.packs.saveDraft(boundPack.packId, { docxBase64 });
+      if (goToChecking) {
+        await api.packs.transition(boundPack.packId, 'lease_checking', 'draft complete');
+      }
+      logAction(
+        `Saved draft to pack ${boundPack.packId}` +
+        (goToChecking ? ' and sent to Lease Checking' : ''),
+      );
+      showToast(goToChecking ? 'Saved & sent to Lease Checking' : 'Draft saved to pack', 'success');
+      if (goToChecking && onClose) {
+        // Return to the pipeline so the user sees the pack move.
+        onClose();
+      } else {
+        // Refresh the bound pack so hasDraft updates locally.
+        const refreshed = await api.packs.get(boundPack.packId);
+        setBoundPack(refreshed);
+      }
+    } catch (err) {
+      showToast(`Save to pack failed: ${err.message}`, 'error');
+    }
+  };
   const [dirtyPaths, setDirtyPaths] = useState(() => new Set());
   const [flashPaths, setFlashPaths] = useState(() => new Set());
   const [uploadState, setUploadState] = useState({ leaseControl: 'idle', invoice: 'idle', cipc: 'idle', id: 'idle', tax: 'idle' }); // idle | loading | success | error
@@ -5397,6 +5503,48 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
         </div>
       </div>
 
+      {/* Pack-bound banner -- shows when the drafter was launched from
+          a pipeline card. Tells the user which pack their work goes back
+          to and exposes the Save-to-Pack / Save-and-Send-to-Checking
+          buttons that close the loop. */}
+      {boundPack && (
+        <div className="px-4 md:px-6 py-3 -mx-4 md:-mx-8 flex items-center justify-between gap-2 flex-wrap" style={{ backgroundColor: '#F0EBFA', color: '#3F2A8C', borderBottom: `1px solid ${brand.border}` }}>
+          <div>
+            <p className="text-sm font-semibold">Drafting lease for {boundPack.tenantName || '(unnamed tenant)'}</p>
+            <p className="text-xs">Pack <code className="font-mono">{boundPack.packId}</code> · stage <strong>{LEASE_STAGES[boundPack.stage]?.label || boundPack.stage}</strong></p>
+          </div>
+          <div className="flex gap-2">
+            <Button size="sm" variant="ghost" onClick={() => handleSaveDraftToPack(false)} disabled={generating !== null}>
+              Save Draft to Pack
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => handleSaveDraftToPack(true)} disabled={generating !== null}>
+              Save and Send to Checking →
+            </Button>
+          </div>
+        </div>
+      )}
+      {boundPackLoading && (
+        <div className="px-4 py-2 -mx-4 md:-mx-8 text-xs" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
+          Loading pack {initialPackId}...
+        </div>
+      )}
+      {boundPackErr && (
+        <div className="px-4 py-2 -mx-4 md:-mx-8 text-xs" style={{ backgroundColor: brand.dangerLight, color: brand.danger }}>
+          Failed to load pack {initialPackId}: {boundPackErr}. Continuing in standalone mode.
+        </div>
+      )}
+      {isStandalone && !isAdmin && (
+        <div className="px-4 py-3 -mx-4 md:-mx-8 text-sm" style={{ backgroundColor: brand.dangerLight, color: brand.danger }}>
+          <strong>Standalone drafter is admin-only.</strong> Open a pack from the Leasing pipeline and click "Start Draft" instead.
+        </div>
+      )}
+      {isStandalone && isAdmin && (
+        <div className="px-4 py-2 -mx-4 md:-mx-8 text-xs flex items-center gap-2" style={{ backgroundColor: brand.goldPale, color: brand.gold }}>
+          <strong>Standalone Drafter (Admin)</strong>
+          <span style={{ color: brand.textMuted }}>· not bound to a pipeline pack; the resulting envelope won't be tracked through the pipeline</span>
+        </div>
+      )}
+
       {/* Action bar */}
       <div className="px-4 md:px-6 py-3 -mx-4 md:-mx-8" style={{ backgroundColor: '#fff', borderBottom: `1px solid ${brand.border}` }}>
         <div className="flex items-center gap-2 flex-wrap">
@@ -5406,16 +5554,22 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
           <Button size="sm" variant="primary" icon={Download} onClick={handleGenerateWord} disabled={generating !== null}>
             {generating === 'word' ? 'Generating…' : 'Generate Word'}
           </Button>
+          {/* "Send via DocuSign" is hidden in pack-bound mode -- packs
+              send through the pipeline ("Approve & Send to DocuSign"
+              button on the lease_checking card). Standalone mode keeps
+              the direct-send button for admins. */}
+          {!boundPack && (
           <Button
             size="sm"
             variant="gold"
             icon={Send}
             onClick={handleSendToDocuSign}
-            disabled={generating !== null || !integrations?.docusign?.connected}
-            title={integrations?.docusign?.connected ? 'Send for e-signature' : 'Connect DocuSign in Settings first'}
+            disabled={generating !== null || !integrations?.docusign?.connected || !isAdmin}
+            title={!isAdmin ? 'Admin only' : (integrations?.docusign?.connected ? 'Send for e-signature' : 'Connect DocuSign in Settings first')}
           >
             {generating === 'docusign' ? 'Sending…' : 'Send via DocuSign'}
           </Button>
+          )}
           <Button size="sm" variant="ghost" icon={FileText} onClick={() => generateSinglePart('partA')} disabled={generating !== null}>
             {generating === 'partA' ? 'Part A…' : 'Part A only'}
           </Button>

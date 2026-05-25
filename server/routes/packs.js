@@ -162,8 +162,8 @@ router.post('/:packId/stage', async (req, res) => {
 // distinct actions).
 router.post('/:packId/draft', async (req, res) => {
   const { docxBase64, pdfBase64 } = req.body || {};
-  if (!docxBase64 || !pdfBase64) {
-    return res.status(400).json({ error: 'Both docxBase64 and pdfBase64 are required' });
+  if (!docxBase64 && !pdfBase64) {
+    return res.status(400).json({ error: 'At least one of docxBase64 or pdfBase64 is required' });
   }
   try {
     const updated = await packs.saveDraft(req.params.packId, {
@@ -210,9 +210,19 @@ router.post('/:packId/send-to-docusign', async (req, res) => {
     if (!pack.tenantName || !pack.tenantEmail) {
       return res.status(400).json({ error: 'Pack is missing tenantName or tenantEmail' });
     }
-    const pdfBase64 = await packs.readDraftFile(pack.packId, { format: 'pdf' });
+    // Prefer PDF when both formats are present (DocuSign serves PDF
+    // back to signers faster). Fall back to DOCX which DocuSign
+    // accepts natively. Either way we end up with a document the
+    // tenant can sign.
+    let pdfBase64 = await packs.readDraftFile(pack.packId, { format: 'pdf' });
+    let docxBase64 = null;
+    let fileExtension = 'pdf';
     if (!pdfBase64) {
-      return res.status(400).json({ error: 'No saved draft PDF on this pack' });
+      docxBase64 = await packs.readDraftFile(pack.packId, { format: 'docx' });
+      if (!docxBase64) {
+        return res.status(400).json({ error: 'No saved draft on this pack (neither PDF nor DOCX)' });
+      }
+      fileExtension = 'docx';
     }
 
     // Lazy import so the DocuSign module isn't loaded by any other
@@ -228,9 +238,10 @@ router.post('/:packId/send-to-docusign', async (req, res) => {
           role: 'tenant',
           routingOrder: 1,
         }],
-        pdfBuffer: Buffer.from(pdfBase64, 'base64'),
+        pdfBuffer: Buffer.from(pdfBase64 || docxBase64, 'base64'),
         emailSubject: `Lease Agreement for ${pack.property || 'Exceed Properties'} -- Please Sign`,
-        documentName: `Lease - ${pack.tenantName}.pdf`,
+        documentName: `Lease - ${pack.tenantName}.${fileExtension}`,
+        fileExtension,
         enableReminders: true,
       });
     } catch (sendErr) {

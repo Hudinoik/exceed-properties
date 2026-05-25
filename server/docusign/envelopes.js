@@ -143,6 +143,9 @@ export const sendLeaseForSignature = async ({
   emailSubject,
   documentName = 'Lease Agreement',
   enableReminders = true,
+  // Parameter is named pdfBuffer for historical reasons but DocuSign
+  // accepts other formats natively. Pass fileExtension to override.
+  fileExtension = 'pdf',
 }) => {
   if (!Array.isArray(signers) || signers.length === 0) {
     throw new Error('signers[] is required (at least one signer)');
@@ -170,7 +173,7 @@ export const sendLeaseForSignature = async ({
   const doc = new docusign.Document();
   doc.documentBase64 = buf.toString('base64');
   doc.name = documentName;
-  doc.fileExtension = 'pdf';
+  doc.fileExtension = fileExtension;
   doc.documentId = '1';
   envDef.documents = [doc];
 

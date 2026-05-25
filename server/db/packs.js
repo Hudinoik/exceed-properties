@@ -196,20 +196,26 @@ export const transition = async (packId, toStage, { by, reason, viaWebhook = fal
 // Save a new draft version. Updates the canonical draftedLease pointer
 // AND appends to draftedLeaseHistory (oldest pruned at MAX_DRAFT_HISTORY).
 // Files are passed as base64 strings; we don't write to disk.
+//
+// Either docxBase64 or pdfBase64 (or both) must be present. The
+// SPA's drafter today generates DOCX only via docxtemplater +
+// docx-merger; DocuSign accepts DOCX natively, so PDF is optional.
+// send-to-docusign uses whichever format is available, preferring
+// PDF when both are present.
 export const saveDraft = async (packId, { docxBase64, pdfBase64, by }) => {
   const db = await dbReady();
   const row = (db.data.packs || []).find(p => p.packId === packId);
   if (!row) throw new Error(`Pack not found: ${packId}`);
-  if (!docxBase64 || !pdfBase64) {
-    throw new Error('saveDraft requires both docxBase64 and pdfBase64');
+  if (!docxBase64 && !pdfBase64) {
+    throw new Error('saveDraft requires docxBase64 or pdfBase64 (or both)');
   }
   const version = (row.draftedLeaseHistory?.length || 0) + 1;
   const entry = {
     version,
-    docxBase64,
-    pdfBase64,
-    docxSize: Math.floor(docxBase64.length * 3 / 4),
-    pdfSize: Math.floor(pdfBase64.length * 3 / 4),
+    docxBase64: docxBase64 || null,
+    pdfBase64: pdfBase64 || null,
+    docxSize: docxBase64 ? Math.floor(docxBase64.length * 3 / 4) : 0,
+    pdfSize: pdfBase64 ? Math.floor(pdfBase64.length * 3 / 4) : 0,
     draftedAt: now(),
     draftedBy: by || null,
   };
