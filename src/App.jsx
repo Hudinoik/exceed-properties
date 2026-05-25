@@ -6534,6 +6534,28 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
     }
   };
   const sendPackToDocusign = async (pack) => {
+    // Sanity checks before we email a real tenant. The backend
+    // enforces these too (400/409 responses) but catching them in
+    // the SPA gives a friendlier error message.
+    if (!pack.tenantName || !pack.tenantEmail) {
+      showToast('Pack is missing tenantName or tenantEmail -- edit the pack first.', 'error');
+      return;
+    }
+    if (!pack.draftedLease) {
+      showToast('No saved draft on this pack. Save a draft from the drafter first.', 'error');
+      return;
+    }
+    // Confirmation -- this fires a real DocuSign envelope at a real
+    // human inbox. Once sent, voiding is the only undo and DocuSign
+    // logs the void in the recipient's history. Make sure the user
+    // means it.
+    const confirmMsg =
+      `Send the drafted lease to ${pack.tenantEmail} for signature?\n\n` +
+      `Tenant:    ${pack.tenantName}\n` +
+      `Property:  ${pack.property || '(unspecified)'}\n` +
+      `Unit:      ${pack.unit || '(unspecified)'}\n\n` +
+      'DocuSign will email them immediately. Cancel here if anything looks wrong.';
+    if (!window.confirm(confirmMsg)) return;
     try {
       const r = await api.packs.sendToDocusign(pack.packId);
       logAction(`Sent pack ${pack.packId} to DocuSign (envelope ${r.envelopeId})`);
