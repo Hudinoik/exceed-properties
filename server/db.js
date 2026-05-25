@@ -30,8 +30,50 @@ const DEFAULT_DATA = {
 };
 
 let db;
-const ready = JSONFilePreset(DB_PATH, DEFAULT_DATA).then((instance) => {
+// Schema migration on load. JSONFilePreset's `defaults` argument is only
+// applied when the file is being created from scratch — if the file
+// already exists, lowdb loads it as-is and never merges new top-level
+// keys you added to DEFAULT_DATA later. That's how we ended up with
+// `db.data.webhookEvents === undefined` on production: the file
+// pre-dates the webhook-events table, so writes against it crashed
+// with "Cannot read properties of undefined (reading 'unshift')".
+//
+// Fix: after load, walk DEFAULT_DATA and fill any missing top-level
+// key (and any missing nextId sub-key) with the default. Idempotent;
+// runs on every boot. Persists only if it changed something.
+const migrateSchema = async () => {
+  const filled = [];
+  for (const [key, defaultValue] of Object.entries(DEFAULT_DATA)) {
+    if (key === 'nextId') continue; // handled below
+    if (db.data[key] === undefined) {
+      // Deep-clone the default so the in-memory db doesn't share a
+      // reference with DEFAULT_DATA (would let later mutations leak
+      // into the constant).
+      db.data[key] = Array.isArray(defaultValue) ? [] : { ...defaultValue };
+      filled.push(key);
+    }
+  }
+  if (!db.data.nextId || typeof db.data.nextId !== 'object') {
+    db.data.nextId = { ...DEFAULT_DATA.nextId };
+    filled.push('nextId');
+  } else {
+    for (const [subkey, defaultValue] of Object.entries(DEFAULT_DATA.nextId)) {
+      if (db.data.nextId[subkey] === undefined) {
+        db.data.nextId[subkey] = defaultValue;
+        filled.push(`nextId.${subkey}`);
+      }
+    }
+  }
+  if (filled.length > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[db] schema migration filled missing keys: ${filled.join(', ')}`);
+    await db.write();
+  }
+};
+
+const ready = JSONFilePreset(DB_PATH, DEFAULT_DATA).then(async (instance) => {
   db = instance;
+  await migrateSchema();
   return db;
 });
 
@@ -164,13 +206,23 @@ export const audit = {
 // only sees their own events. Bounded list — we keep the most recent
 // 500 events per user to avoid unbounded growth on the JSON file.
 
+// Belt-and-braces: even though migrateSchema() runs on boot, defend
+// the table here so a hot-reload or programmatic db.data reassignment
+// can't trip the call sites with "Cannot read properties of undefined
+// (reading 'unshift')" again.
+const ensureWebhookEventsArray = () => {
+  if (!Array.isArray(db.data.webhookEvents)) db.data.webhookEvents = [];
+};
+
 export const webhookEvents = {
   list(userId, integration, limit = 100) {
+    ensureWebhookEventsArray();
     return db.data.webhookEvents
       .filter(e => e.userId === userId && (!integration || e.integration === integration))
       .slice(0, limit);
   },
   async record({ userId, integration, headers, body, ip }) {
+    ensureWebhookEventsArray();
     const event = {
       id: nextId('webhook'),
       userId,
@@ -190,9 +242,15 @@ export const webhookEvents = {
       db.data.webhookEvents = db.data.webhookEvents.filter(e => e.userId !== userId || keep.has(e.id));
     }
     await persist();
+    // Pairs with the "[webhook] DocuSign <type> envelope=<id>" line in
+    // routes/webhooks.js. Together: one log when the event arrived,
+    // one when it landed in storage.
+    // eslint-disable-next-line no-console
+    console.log(`[webhook] saved event-id=${event.id} integration=${integration}`);
     return event;
   },
   async clear(userId, integration) {
+    ensureWebhookEventsArray();
     const before = db.data.webhookEvents.length;
     db.data.webhookEvents = db.data.webhookEvents.filter(e => !(e.userId === userId && (!integration || e.integration === integration)));
     if (db.data.webhookEvents.length !== before) await persist();
