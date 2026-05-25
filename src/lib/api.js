@@ -119,20 +119,50 @@ export const proxy = {
       body: messageBody,
     });
   },
-  async docusignExchangeCode(code) {
-    return request('/api/proxy/docusign/exchange-code', {
+  // DocuSign now uses a single JWT service account (see server/docusign/).
+  // The per-user OAuth helpers (docusignExchangeCode etc.) have been removed.
+  async docusignSendLease({ signerName, signerEmail, pdfBase64, emailSubject, documentName }) {
+    return request('/api/docusign/send-lease', {
       method: 'POST',
-      body: { code },
+      body: { signerName, signerEmail, pdfBase64, emailSubject, documentName },
     });
   },
-  async docusignCreateEnvelope(envelope) {
-    return request('/api/proxy/docusign/create-envelope', {
+  async docusignSendFromTemplate({ templateId, signerName, signerEmail, roleName, emailSubject }) {
+    return request('/api/docusign/send-from-template', {
       method: 'POST',
-      body: { envelope },
+      body: { templateId, signerName, signerEmail, roleName, emailSubject },
     });
   },
-  async docusignGetEnvelope(id) {
-    return request(`/api/proxy/docusign/envelope/${encodeURIComponent(id)}`);
+  async docusignGetEnvelope(envelopeId) {
+    return request(`/api/docusign/envelopes/${encodeURIComponent(envelopeId)}`);
+  },
+  // Returns a Blob of the signed PDF — use FileSaver/etc. to hand it to
+  // the user. We don't use request() here because the response isn't JSON.
+  async docusignDownloadEnvelopeDocument(envelopeId, documentId = 'combined') {
+    const csrf = (() => {
+      if (typeof document === 'undefined') return '';
+      const m = document.cookie.split('; ').find(r => r.startsWith('ep.csrf='));
+      return m ? decodeURIComponent(m.split('=')[1]) : '';
+    })();
+    const url = `/api/docusign/envelopes/${encodeURIComponent(envelopeId)}/document?documentId=${encodeURIComponent(documentId)}`;
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: { 'X-CSRF-Token': csrf },
+    });
+    if (!res.ok) {
+      let msg;
+      try { const j = await res.json(); msg = j?.error || `HTTP ${res.status}`; }
+      catch { msg = `HTTP ${res.status}`; }
+      throw new ApiError(msg, res.status, null);
+    }
+    return res.blob();
+  },
+  async docusignWebhookEvents(limit = 100) {
+    const r = await request(`/api/webhooks/docusign/events?limit=${limit}`);
+    return r.events || [];
+  },
+  async docusignWebhookClear() {
+    return request('/api/webhooks/docusign/events', { method: 'DELETE' });
   },
   async piExchangeCode(code) {
     return request('/api/proxy/property-inspect/exchange-code', {

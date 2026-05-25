@@ -26,6 +26,7 @@ import { csrfMiddleware } from './middleware/csrf.js';
 import authRouter from './routes/auth.js';
 import secretsRouter from './routes/secrets.js';
 import proxyRouter from './routes/proxy.js';
+import docusignRouter from './routes/docusign.js';
 import { publicRouter as webhookPublicRouter, apiRouter as webhookApiRouter } from './routes/webhooks.js';
 import { seedIfEmpty } from './seed.js';
 
@@ -69,15 +70,23 @@ app.use(cors({
   credentials: true,
 }));
 
-// --- body + cookies ---
-app.use(express.json({ limit: '20mb' })); // lease DOCX base64 can be large
 app.use(cookieParser());
 
-// --- public webhook receiver — mounted BEFORE rate limit / CSRF / session
-//     so external services (PI etc.) can POST without our auth cookie. The
-//     URL itself contains a per-user random token that authenticates and
-//     identifies which user the event belongs to.
+// --- public webhook receiver — mounted BEFORE the global JSON parser, rate
+//     limit, CSRF, and session. External services (PI, DocuSign) can POST
+//     without our auth cookie. PI uses a per-user URL token; DocuSign uses
+//     HMAC signature verification.
+//
+//     CRITICAL: this must come before app.use(express.json()) below — the
+//     DocuSign webhook needs the RAW body bytes for HMAC verification, and
+//     its route registers its own express.raw() parser. If the global JSON
+//     parser ran first, the body stream would already be consumed.
+//     The webhook router attaches its own express.json() to handle every
+//     route other than /docusign (PI etc.).
 app.use('/api/webhooks', webhookPublicRouter);
+
+// --- body + cookies — global parser for everything except webhooks above ---
+app.use(express.json({ limit: '20mb' })); // lease DOCX base64 can be large
 
 // --- sessions ---
 app.use(session({
@@ -111,6 +120,7 @@ app.use('/api/', csrfMiddleware);
 app.use('/api/auth', authRouter);
 app.use('/api/secrets', secretsRouter);
 app.use('/api/proxy', proxyRouter);
+app.use('/api/docusign', docusignRouter);
 // Authenticated mgmt endpoints for webhooks (list events, clear, etc.).
 // The public receiver is mounted earlier, before CSRF/session.
 app.use('/api/webhooks', webhookApiRouter);

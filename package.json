@@ -18,6 +18,7 @@
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
+    "docusign-esign": "^9.0.0",
     "docx-merger": "^1.2.2",
     "docxtemplater": "^3.68.7",
     "dotenv": "^16.4.5",

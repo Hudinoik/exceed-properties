@@ -14,13 +14,131 @@
 // size limit than the rest of the app.
 // ============================================================
 import express from 'express';
-import { dbReady, webhookEvents } from '../db.js';
+import { dbReady, webhookEvents, audit } from '../db.js';
 import { requireAuth } from './auth.js';
+import { verifyDocusignHmac } from '../docusign/webhook.js';
 
 // ---- PUBLIC (unauthenticated) ----------------------------------------
 // External services POST here. Uses a dedicated body parser so the main
 // app's CSRF/auth pipeline doesn't block these requests.
 export const publicRouter = express.Router();
+
+// ---- DocuSign Connect webhook (MUST register BEFORE the JSON parser).
+// We need the RAW request bytes to compute HMAC — JSON.parse + re-stringify
+// will reorder keys and break the signature. So we attach express.raw ONLY
+// to this route, and do JSON.parse manually inside the handler after the
+// signature is verified.
+publicRouter.post(
+  '/docusign',
+  express.raw({ type: 'application/json', limit: '5mb' }),
+  async (req, res) => {
+    // ALWAYS respond 200 quickly — DocuSign will hammer-retry on non-2xx,
+    // and any internal failure is recoverable from our event log.
+    // Acknowledge BEFORE doing any DB work below.
+    const rawBody = req.body; // Buffer because of express.raw()
+    const sigCandidates = [];
+    // Connect can be configured with multiple HMAC keys; headers are
+    // numbered X-DocuSign-Signature-1, -2, ... Collect them all.
+    Object.keys(req.headers).forEach((h) => {
+      if (h.toLowerCase().startsWith('x-docusign-signature-')) {
+        const v = req.headers[h];
+        if (Array.isArray(v)) sigCandidates.push(...v);
+        else if (v) sigCandidates.push(v);
+      }
+    });
+    const isValid = verifyDocusignHmac(rawBody, sigCandidates);
+    if (!isValid) {
+      // Log + 401 — DocuSign won't retry on 401, but invalid signatures
+      // shouldn't reach our event store either way.
+      // eslint-disable-next-line no-console
+      console.warn('[webhook] DocuSign HMAC verification failed', {
+        ip: req.ip, hasSig: sigCandidates.length > 0,
+      });
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+    // Respond fast, then process out-of-band so a slow DB write can't
+    // trigger DocuSign retries.
+    res.status(200).json({ ok: true });
+
+    // ---- post-ack processing -----------------------------------------
+    let body;
+    try {
+      body = JSON.parse(rawBody.toString('utf8'));
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[webhook] DocuSign body was not JSON:', err.message);
+      return;
+    }
+
+    // Connect "aggregate" / REST v2.1 envelope events carry:
+    //   body.event = 'envelope-completed' | 'envelope-declined' | 'envelope-voided'
+    //                | 'recipient-completed' | ...
+    //   body.data.envelopeId / body.data.envelopeSummary  (depending on format)
+    const eventType = body?.event || 'unknown';
+    const envelopeId = body?.data?.envelopeId
+      || body?.data?.envelopeSummary?.envelopeId
+      || body?.envelopeId
+      || null;
+
+    // eslint-disable-next-line no-console
+    console.log(`[webhook] DocuSign ${eventType} envelope=${envelopeId || 'n/a'}`);
+
+    // Persist the raw event for visibility / replay.
+    try {
+      await webhookEvents.record({
+        // No per-user binding for DocuSign — this is a system-account
+        // integration. userId is null intentionally.
+        userId: null,
+        integration: 'docusign',
+        headers: req.headers,
+        body,
+        ip: req.ip,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[webhook] DocuSign record failed:', err.message);
+    }
+
+    try {
+      await audit.log({
+        userId: null, userEmail: null,
+        action: `docusign.webhook.${eventType}`,
+        details: { envelopeId },
+        ip: req.ip,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[webhook] DocuSign audit failed:', err.message);
+    }
+
+    // ------------------------------------------------------------------
+    // TODO(lease-pipeline): hook envelope events into the lease state
+    //   machine. The project uses lowdb (server/db.js) for persistence.
+    //   When you add lease records, branch here and update them:
+    //
+    //     switch (eventType) {
+    //       case 'envelope-completed':
+    //         await leases.markSigned(envelopeId, body.data);
+    //         break;
+    //       case 'envelope-declined':
+    //         await leases.markDeclined(envelopeId, body.data);
+    //         break;
+    //       case 'envelope-voided':
+    //         await leases.markVoided(envelopeId);
+    //         break;
+    //       case 'recipient-completed':
+    //         await leases.markRecipientCompleted(envelopeId, body.data);
+    //         break;
+    //     }
+    //
+    //   For now we just log + record above; the SPA can poll the webhook
+    //   event store via /api/webhooks/docusign/events (added below).
+    // ------------------------------------------------------------------
+  },
+);
+
+// Now the JSON parser for everything ELSE on this router (PI webhook
+// below). DocuSign is already handled above with its own raw parser.
 publicRouter.use(express.json({ limit: '1mb' }));
 
 const safeJsonParse = (s) => { try { return JSON.parse(s); } catch { return s; } };
@@ -77,5 +195,35 @@ apiRouter.get('/property-inspect/events', (req, res) => {
 
 apiRouter.delete('/property-inspect/events', async (req, res) => {
   const removed = await webhookEvents.clear(req.session.userId, 'propertyInspect');
+  res.json({ ok: true, removed });
+});
+
+// ---- DocuSign webhook event log (system-scoped, not per-user) --------
+// DocuSign is a single-tenant integration for Exceed Props, so events
+// aren't keyed to a user. List the most recent N for any authenticated
+// admin to inspect. Filtering happens here rather than in db.js because
+// webhookEvents.list() expects a userId.
+apiRouter.get('/docusign/events', async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+  const db = await dbReady();
+  const list = db.data.webhookEvents
+    .filter(e => e.integration === 'docusign')
+    .slice(0, limit);
+  const events = list.map(e => ({
+    id: e.id,
+    receivedAt: e.receivedAt,
+    ip: e.ip,
+    headers: e.headers ? safeJsonParse(e.headers) : null,
+    body: e.body ? safeJsonParse(e.body) : null,
+  }));
+  res.json({ events });
+});
+
+apiRouter.delete('/docusign/events', async (req, res) => {
+  const db = await dbReady();
+  const before = db.data.webhookEvents.length;
+  db.data.webhookEvents = db.data.webhookEvents.filter(e => e.integration !== 'docusign');
+  const removed = before - db.data.webhookEvents.length;
+  if (removed) await db.write();
   res.json({ ok: true, removed });
 });
