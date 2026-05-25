@@ -6599,7 +6599,113 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
   const [summaryLease, setSummaryLease] = useState(null);
   const [docusignSending, setDocusignSending] = useState(false);
 
-  const docusignConnected = integrations?.docusign?.connected;
+  // DocuSign now uses a JWT service account — there's no per-user
+  // "connected" flag. Poll /api/docusign/status on mount to gate the
+  // send-flow UI. {configured: true|false, environment, accountId, ...}
+  const [docusignStatus, setDocusignStatus] = useState(null);
+  const docusignConnected = docusignStatus?.configured === true;
+  useEffect(() => {
+    let alive = true;
+    api.proxy.docusignGetStatus()
+      .then(r => { if (alive) setDocusignStatus(r); })
+      .catch(() => { if (alive) setDocusignStatus({ configured: false }); });
+    return () => { alive = false; };
+  }, []);
+
+  // Cache of envelope statuses keyed by envelopeId, refreshed every
+  // 30s while LeasingSection is mounted. Drives the status badges and
+  // the "view signed PDF" / "resend reminder" affordances per lease.
+  // Source of truth: GET /api/docusign/envelopes?fromDate=<lastPoll>.
+  // We only ask DocuSign for envelopes that changed recently — webhook
+  // events already update us out-of-band; this is the fallback.
+  const [envelopeStatuses, setEnvelopeStatuses] = useState({}); // { [envId]: { status, statusChangedDateTime, recipients } }
+  const lastPollRef = useRef(null);
+  useEffect(() => {
+    if (!docusignConnected) return undefined;
+    let alive = true;
+    const poll = async () => {
+      try {
+        // First poll: look back 7 days. Subsequent polls: only since
+        // last poll. Keeps the response small.
+        const fromDate = lastPollRef.current
+          ? new Date(lastPollRef.current).toISOString()
+          : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const r = await api.proxy.docusignListEnvelopes({ fromDate });
+        if (!alive) return;
+        const envs = Array.isArray(r?.results?.envelopes) ? r.results.envelopes : [];
+        if (envs.length) {
+          setEnvelopeStatuses(prev => {
+            const next = { ...prev };
+            for (const e of envs) {
+              next[e.envelopeId] = {
+                status: e.status,
+                statusChangedDateTime: e.statusChangedDateTime,
+                emailSubject: e.emailSubject,
+              };
+            }
+            return next;
+          });
+        }
+        lastPollRef.current = Date.now();
+      } catch {
+        // Swallow — next tick will retry. Network blips shouldn't
+        // spam toasts.
+      }
+    };
+    poll(); // immediate
+    const t = setInterval(poll, 30_000);
+    return () => { alive = false; clearInterval(t); };
+  }, [docusignConnected]);
+
+  // Best-effort: extract a friendly badge label for a lease whose
+  // envelope status we know.
+  const leaseSigningBadge = (lease) => {
+    if (!lease?.docusignEnvelopeId) return null;
+    const s = envelopeStatuses[lease.docusignEnvelopeId];
+    if (!s) {
+      // We know an envelope was sent but haven't heard back yet.
+      return lease.docusignSentAt ? 'Awaiting Signature' : null;
+    }
+    switch (s.status) {
+      case 'sent':       return 'Awaiting Signature';
+      case 'delivered':  return 'Opened';
+      case 'completed':  return 'Signed';
+      case 'declined':   return 'Declined';
+      case 'voided':     return 'Voided';
+      default:           return s.status;
+    }
+  };
+
+  const downloadSignedLease = async (lease) => {
+    if (!lease?.docusignEnvelopeId) return;
+    try {
+      const blob = await api.proxy.docusignDownloadEnvelopeDocument(lease.docusignEnvelopeId, 'combined');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `lease-${lease.tenant.replace(/\s+/g, '-')}-${lease.docusignEnvelopeId.slice(0, 8)}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      logAction(`Downloaded signed lease "${lease.tenant}"`);
+    } catch (err) {
+      showToast(`Download failed: ${err.message}`, 'error');
+    }
+  };
+
+  const remindLeaseSigner = async (lease) => {
+    if (!lease?.docusignEnvelopeId) return;
+    try {
+      const r = await api.proxy.docusignRemindEnvelope(lease.docusignEnvelopeId);
+      logAction(`Sent reminder for lease "${lease.tenant}" (${r.resent || 0} recipient(s))`);
+      showToast(r.resent > 0
+        ? `Reminder sent to ${r.resent} recipient(s)`
+        : 'No pending signers to remind', 'success');
+    } catch (err) {
+      showToast(`Reminder failed: ${err.message}`, 'error');
+    }
+  };
 
   const schema = {
     tenant: [validators.required],
@@ -6748,73 +6854,59 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
       showToast('Enter a valid email address', 'error');
       return;
     }
+    if (!docusignDocFile) {
+      showToast('Upload the lease document (.docx or .pdf) to send.', 'error');
+      return;
+    }
+    if (!docusignConnected) {
+      showToast('DocuSign is not configured. Check Settings → Integrations.', 'error');
+      return;
+    }
     setDocusignSending(true);
 
-    const ds = integrations?.docusign || {};
-    let envelopeId = null;
-    let realEnvelope = false;
+    try {
+      // The SPA's lease drafter generates the document client-side
+      // (docxtemplater + docx-merger). Whatever the user uploads here
+      // is what we send. Backend requires base64 — Render's filesystem
+      // is ephemeral so we never write the file to disk.
+      const pdfBase64 = await blobToBase64(docusignDocFile);
+      const r = await api.proxy.docusignSendLease({
+        signers: [{
+          name: docusignLease.tenant,
+          email: docusignEmail,
+          role: 'tenant',
+          routingOrder: 1,
+        }],
+        pdfBase64,
+        emailSubject: `Lease Agreement — ${docusignLease.tenant}`,
+        documentName: docusignDocFile.name || `${docusignLease.tenant}-lease.pdf`,
+      });
+      const envelopeId = r.envelopeId;
 
-    // If DocuSign is connected AND the user has uploaded a DOCX for this lease
-    // (docusignDocFile state from the modal), create a real envelope. Otherwise
-    // mark the lease as on-DocuSign with a tracking placeholder (no real call).
-    if (ds.connected && ds.accountId && ds.baseUri && docusignDocFile) {
-      try {
-        const { accessToken, updates } = await docusignAPI.ensureAccessToken(ds);
-        if (updates) setIntegrations({ ...integrations, docusign: { ...ds, ...updates } });
-
-        const documentBase64 = await blobToBase64(docusignDocFile);
-        const envelopeRequest = {
-          emailSubject: `Lease Agreement — ${docusignLease.tenant}`,
-          emailBlurb: 'Please review and sign the attached lease agreement.',
-          status: 'sent',
-          documents: [{
-            documentBase64,
-            name: docusignDocFile.name || `${docusignLease.tenant}.docx`,
-            fileExtension: (docusignDocFile.name || 'x.docx').split('.').pop().toLowerCase() || 'docx',
-            documentId: '1',
-          }],
-          recipients: {
-            signers: [{
-              recipientId: '1',
-              routingOrder: '1',
-              name: docusignLease.tenant,
-              email: docusignEmail,
-              tabs: buildSignerTabs(DOCUSIGN_ANCHORS.tenant),
-            }],
-          },
-        };
-        const env = await docusignAPI.createEnvelope({
-          baseUri: ds.baseUri,
-          accountId: ds.accountId,
-          envelope: envelopeRequest,
-          accessToken,
-        });
-        envelopeId = env.envelopeId;
-        realEnvelope = true;
-      } catch (err) {
-        showToast('DocuSign send failed: ' + err.message, 'error');
-        setDocusignSending(false);
-        return;
-      }
-    } else {
-      // No real send — generate a tracking placeholder
-      envelopeId = `ENV-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 99999)).padStart(5, '0')}`;
+      setLeases(leases.map(l => l.id === docusignLease.id ? {
+        ...l,
+        pipelineStage: 'docusign',
+        status: 'Pending',
+        stageEntered: todayISO(),
+        docusignEnvelopeId: envelopeId,
+        docusignRecipient: docusignEmail,
+        docusignSentAt: new Date().toISOString(),
+      } : l));
+      // Seed the local status cache so the badge updates immediately
+      // (don't wait the up-to-30s for the next poll).
+      setEnvelopeStatuses(prev => ({
+        ...prev,
+        [envelopeId]: { status: r.status || 'sent', statusChangedDateTime: new Date().toISOString() },
+      }));
+      logAction(`Sent lease "${docusignLease.tenant}" to DocuSign (${envelopeId})`);
+      showToast(`Sent to DocuSign · envelope ${envelopeId.slice(0, 8)}…`, 'success');
+      setDocusignModalOpen(false);
+      setDocusignDocFile(null);
+    } catch (err) {
+      showToast(`DocuSign send failed: ${err.message}`, 'error');
+    } finally {
+      setDocusignSending(false);
     }
-
-    setLeases(leases.map(l => l.id === docusignLease.id ? {
-      ...l,
-      pipelineStage: 'docusign',
-      status: 'Pending',
-      stageEntered: todayISO(),
-      docusignEnvelopeId: envelopeId,
-      docusignRecipient: docusignEmail,
-      docusignSentAt: new Date().toISOString(),
-    } : l));
-    logAction(`Sent lease "${docusignLease.tenant}" to DocuSign (${envelopeId})${realEnvelope ? ' [real]' : ' [placeholder]'}`);
-    showToast(realEnvelope ? `Sent to DocuSign · envelope ${envelopeId}` : (docusignConnected ? `Marked as sent — upload the lease DOCX in this modal to create a real envelope` : `Marked as sent (DocuSign not connected — configure in Settings)`), 'success');
-    setDocusignSending(false);
-    setDocusignModalOpen(false);
-    setDocusignDocFile(null);
   };
 
   const markDocuSignSigned = (lease) => {
@@ -6873,11 +6965,32 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
           </p>
         )}
 
-        {lease.docusignEnvelopeId && (
-          <div className="text-xs p-1.5 rounded mb-2 flex items-center gap-1" style={{ backgroundColor: '#F0EBFA', color: '#7B61FF' }}>
-            <FileSignature size={11} /> {lease.docusignEnvelopeId}
-          </div>
-        )}
+        {lease.docusignEnvelopeId && (() => {
+          const signingBadge = leaseSigningBadge(lease);
+          // Color the chip by signing status:
+          //   Signed       → green   (success)
+          //   Declined     → red     (danger)
+          //   Voided       → muted
+          //   anything else (Awaiting Signature, Opened, ...) → purple (in-progress)
+          const chipColors = signingBadge === 'Signed'
+            ? { bg: brand.successLight, fg: brand.success }
+            : signingBadge === 'Declined'
+            ? { bg: brand.dangerLight, fg: brand.danger }
+            : signingBadge === 'Voided'
+            ? { bg: brand.cream, fg: brand.textMuted }
+            : { bg: '#F0EBFA', fg: '#7B61FF' };
+          return (
+            <div className="text-xs p-1.5 rounded mb-2 flex items-center gap-1 flex-wrap" style={{ backgroundColor: chipColors.bg, color: chipColors.fg }}>
+              <FileSignature size={11} />
+              <span className="font-mono truncate" style={{ maxWidth: '8rem' }}>{String(lease.docusignEnvelopeId).slice(0, 12)}…</span>
+              {signingBadge && (
+                <span className="ml-auto font-semibold" style={{ fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+                  {signingBadge}
+                </span>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Inline lease summary — shown once the workflow has completed (active/expiring). */}
         {summary && summary.monthsTotal > 0 && (
@@ -6911,13 +7024,41 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
 
         <div className="flex gap-1 flex-wrap pt-2" style={{ borderTop: `1px solid ${brand.border}` }}>
           {isDocuSign ? (
-            <button
-              onClick={() => markDocuSignSigned(lease)}
-              className="flex-1 text-xs px-2 py-1 rounded btn-press"
-              style={{ color: brand.success, border: `1px solid ${brand.success}` }}
-            >
-              Mark Signed
-            </button>
+            <>
+              {/* Resend reminder: only meaningful when we have a real
+                  DocuSign envelope (UUID-looking ID) and the envelope
+                  is not yet completed/declined/voided. */}
+              {lease.docusignEnvelopeId
+                && /^[0-9a-f-]{36}$/i.test(String(lease.docusignEnvelopeId))
+                && !['Signed', 'Declined', 'Voided'].includes(leaseSigningBadge(lease) || '') && (
+                <button
+                  onClick={() => remindLeaseSigner(lease)}
+                  className="text-xs px-2 py-1 rounded btn-press"
+                  style={{ color: '#7B61FF', border: '1px solid #7B61FF' }}
+                  title="Resend signing email & enable reminders"
+                >
+                  <Bell size={11} className="inline mr-0.5" /> Remind
+                </button>
+              )}
+              {/* View signed PDF: only when the envelope is complete. */}
+              {leaseSigningBadge(lease) === 'Signed' && (
+                <button
+                  onClick={() => downloadSignedLease(lease)}
+                  className="text-xs px-2 py-1 rounded btn-press"
+                  style={{ color: brand.gold, border: `1px solid ${brand.gold}` }}
+                  title="Download the signed PDF"
+                >
+                  <FileText size={11} className="inline mr-0.5" /> View PDF
+                </button>
+              )}
+              <button
+                onClick={() => markDocuSignSigned(lease)}
+                className="flex-1 text-xs px-2 py-1 rounded btn-press"
+                style={{ color: brand.success, border: `1px solid ${brand.success}` }}
+              >
+                Mark Signed
+              </button>
+            </>
           ) : canAdvance ? (
             <button
               onClick={() => advanceStage(lease)}
@@ -6941,6 +7082,20 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
               title="Lease summary"
             >
               Summary
+            </button>
+          )}
+          {/* View signed PDF available on completed/active leases too,
+              once the envelope is fully signed. */}
+          {isCompleted && lease.docusignEnvelopeId
+            && /^[0-9a-f-]{36}$/i.test(String(lease.docusignEnvelopeId))
+            && leaseSigningBadge(lease) === 'Signed' && (
+            <button
+              onClick={() => downloadSignedLease(lease)}
+              className="text-xs px-2 py-1 rounded btn-press"
+              style={{ color: brand.navy, border: `1px solid ${brand.border}` }}
+              title="Download signed PDF"
+            >
+              <FileText size={11} />
             </button>
           )}
           <button
@@ -9962,201 +10117,237 @@ const JibbleIntegrationCard = ({ showToast, logAction }) => {
 };
 
 // ============================================================
-// DOCUSIGN INTEGRATION CARD
+// DOCUSIGN INTEGRATION CARD (JWT service-account)
 // ============================================================
+// DocuSign is now configured via server-side env vars
+// (DOCUSIGN_INTEGRATION_KEY etc.) and uses JWT Grant authentication.
+// This card is a STATUS panel — no Integration Key / Client Secret
+// / Redirect URI fields. Users can verify configuration, send a
+// test envelope, and inspect recent envelopes.
+//
+// Signature kept (integrations, setIntegrations, showToast, logAction)
+// so the call site doesn't need updating. integrations/setIntegrations
+// are unused here but tolerated.
+// eslint-disable-next-line no-unused-vars
 const DocuSignIntegrationCard = ({ integrations, setIntegrations, showToast, logAction }) => {
-  const ds = integrations.docusign || {};
-  const defaultRedirect = typeof window !== 'undefined'
-    ? `${window.location.origin}/oauth/docusign-callback`
-    : 'http://localhost:5173/oauth/docusign-callback';
-  const [form, setForm] = useState({
-    environment: ds.environment || 'demo',
-    integrationKey: ds.integrationKey || '',
-    clientSecret: ds.clientSecret || '',
-    redirectUri: ds.redirectUri || defaultRedirect,
-  });
-  const [showSecret, setShowSecret] = useState(false);
-  const [dirty, setDirty] = useState(false);
+  const [status, setStatus] = useState(null);   // null = loading, {configured:bool,...}
+  const [statusErr, setStatusErr] = useState(null);
+  const [recent, setRecent] = useState([]);     // last 10 envelopes
+  const [recentErr, setRecentErr] = useState(null);
+  const [testForm, setTestForm] = useState({ name: '', email: '' });
+  const [testBusy, setTestBusy] = useState(false);
+  const [testResult, setTestResult] = useState(null); // {envelopeId, status}
 
-  useEffect(() => {
-    setForm({
-      environment: ds.environment || 'demo',
-      integrationKey: ds.integrationKey || '',
-      clientSecret: ds.clientSecret || '',
-      redirectUri: ds.redirectUri || defaultRedirect,
-    });
-    setDirty(false);
-  }, [ds.environment, ds.integrationKey, ds.clientSecret, ds.redirectUri]);
-
-  const updateField = (key, value) => { setForm(f => ({ ...f, [key]: value })); setDirty(true); };
-
-  const save = () => {
-    const cleaned = Object.fromEntries(
-      Object.entries(form).map(([k, v]) => [k, typeof v === 'string' ? v.trim() : v])
-    );
-    setForm(cleaned);
-    setIntegrations({
-      ...integrations,
-      docusign: {
-        ...ds,
-        ...cleaned,
-        // Clear cached tokens whenever credentials change
-        cachedAccessToken: '',
-        cachedAccessTokenExpiry: null,
-        cachedRefreshToken: '',
-      },
-    });
-    logAction('Updated DocuSign integration credentials');
-    showToast('DocuSign credentials saved', 'success');
-    setDirty(false);
-  };
-
-  const handleConnect = () => {
-    if (!form.integrationKey || !form.clientSecret) {
-      showToast('Integration Key and Secret are required', 'error');
-      return;
-    }
-    if (!form.redirectUri) {
-      showToast('Redirect URI is required', 'error');
-      return;
-    }
-    const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const refreshStatus = useCallback(async () => {
     try {
-      sessionStorage.setItem('ep:ds-oauth-pending', JSON.stringify({
-        state,
-        environment: form.environment,
-        integrationKey: form.integrationKey,
-        clientSecret: form.clientSecret,
-        redirectUri: form.redirectUri,
-        startedAt: Date.now(),
-      }));
+      const r = await api.proxy.docusignGetStatus();
+      setStatus(r);
+      setStatusErr(null);
     } catch (err) {
-      showToast(`Could not start OAuth flow: ${err.message}`, 'error');
+      setStatus({ configured: false });
+      setStatusErr(err.message || 'Unable to reach server');
+    }
+  }, []);
+
+  const refreshRecent = useCallback(async () => {
+    try {
+      const fromDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const r = await api.proxy.docusignListEnvelopes({ fromDate });
+      const list = Array.isArray(r?.results?.envelopes) ? r.results.envelopes : [];
+      // Newest first, cap at 10.
+      list.sort((a, b) => String(b.statusChangedDateTime || b.lastModifiedDateTime || '')
+        .localeCompare(String(a.statusChangedDateTime || a.lastModifiedDateTime || '')));
+      setRecent(list.slice(0, 10));
+      setRecentErr(null);
+    } catch (err) {
+      setRecent([]);
+      setRecentErr(err.message || 'Unable to list envelopes');
+    }
+  }, []);
+
+  // Poll status every 60s. Recent envelopes refresh on mount + after
+  // any test send (no need to poll — admins reload manually).
+  useEffect(() => {
+    refreshStatus();
+    refreshRecent();
+    const t = setInterval(refreshStatus, 60_000);
+    return () => clearInterval(t);
+  }, [refreshStatus, refreshRecent]);
+
+  const sendTest = async () => {
+    if (!testForm.name.trim() || !testForm.email.trim()) {
+      showToast('Name and email are required', 'error');
       return;
     }
-    const authUrl = docusignAPI.buildAuthorizeUrl({
-      environment: form.environment,
-      clientId: form.integrationKey,
-      redirectUri: form.redirectUri,
-      state,
-    });
-    logAction('Initiated DocuSign OAuth flow');
-    window.location.href = authUrl;
+    setTestBusy(true);
+    setTestResult(null);
+    try {
+      const r = await api.proxy.docusignSendTestEnvelope({
+        name: testForm.name.trim(),
+        email: testForm.email.trim(),
+      });
+      setTestResult({ envelopeId: r.envelopeId, status: r.status });
+      logAction(`Sent DocuSign test envelope to ${testForm.email}`);
+      showToast('Test envelope sent', 'success');
+      // Refresh recent list so the new envelope appears.
+      refreshRecent();
+    } catch (err) {
+      showToast(`Test envelope failed: ${err.message}`, 'error');
+    } finally {
+      setTestBusy(false);
+    }
   };
 
-  const handleDisconnect = () => {
-    setIntegrations({
-      ...integrations,
-      docusign: {
-        ...ds,
-        connected: false,
-        cachedAccessToken: '',
-        cachedAccessTokenExpiry: null,
-        cachedRefreshToken: '',
-        accountId: '',
-        baseUri: '',
-        userId: '',
-        userEmail: '',
-        lastSyncStatus: null,
-        lastSyncError: null,
-      },
-    });
-    logAction('Disconnected DocuSign');
-    showToast('Disconnected from DocuSign', 'success');
-  };
-
-  const envHost = form.environment === 'prod' ? 'https://account.docusign.com' : 'https://account-d.docusign.com';
+  const isConfigured = status?.configured === true;
+  const dsConsoleHost = status?.environment === 'PRODUCTION'
+    ? 'https://apps.docusign.com'
+    : 'https://appdemo.docusign.com';
 
   return (
     <Card className="p-6 animate-fade-in-up">
       <div className="flex items-start gap-4">
-        <div className="w-12 h-12 rounded flex items-center justify-center font-bold text-white text-lg flex-shrink-0" style={{ backgroundColor: '#FFCC22', color: '#000' }}>DS</div>
+        <div className="w-12 h-12 rounded flex items-center justify-center font-bold text-lg flex-shrink-0" style={{ backgroundColor: '#FFCC22', color: '#000' }}>DS</div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
-            <h3 className="text-base font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>DocuSign</h3>
-            <StatusBadge status={ds.connected ? 'Active' : 'Inactive'} />
+            <h3 className="text-base font-semibold" style={{ fontFamily: 'Georgia, serif', color: brand.navy }}>DocuSign (configured server-side)</h3>
+            <StatusBadge status={status === null ? 'Pending' : (isConfigured ? 'Active' : 'Inactive')} />
           </div>
           <p className="text-xs mb-3" style={{ color: brand.textMuted }}>
-            Send leases for electronic signature. Create an app in{' '}
-            <a href="https://admindemo.docusign.com/api-integrator-key" target="_blank" rel="noopener noreferrer" className="underline" style={{ color: brand.gold }}>
-              DocuSign Admin &rsaquo; Apps &amp; Keys
-            </a>{' '}
-            and register the Redirect URI shown below.
+            DocuSign is configured via server environment variables. All leases are sent from a single Exceed Props service account. No per-user OAuth is needed.
           </p>
 
-          {ds.connected && ds.accountId && (
+          {/* ----- status panel ----- */}
+          {status === null && (
+            <div className="p-3 rounded mb-4 text-xs" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
+              Loading status…
+            </div>
+          )}
+          {status && isConfigured && (
             <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.successLight, color: brand.success }}>
               <CheckCircle2 size={14} className="flex-shrink-0 mt-0.5" />
-              <div>
-                <p><strong>Connected.</strong> Account <code>{ds.accountId}</code>{ds.userEmail && <> · {ds.userEmail}</>}</p>
-                <p className="mt-0.5">Base URI: <code>{ds.baseUri}</code></p>
+              <div className="flex-1 min-w-0">
+                <p><strong>Configured</strong> · Environment: <strong>{status.environment}</strong></p>
+                <p className="mt-0.5">Account: <code className="break-all">{status.accountId}</code>{status.accountName && <> · {status.accountName}</>}</p>
+                {status.apiUsername && <p className="mt-0.5">API user: <code>{status.apiUsername}</code></p>}
+                {status.baseUri && <p className="mt-0.5">Base URI: <code className="break-all">{status.baseUri}</code></p>}
               </div>
             </div>
           )}
-
-          <div className="space-y-3 mb-4">
-            <Field label="Environment" hint="Use Demo while developing — keys do not cross between environments">
-              <Select value={form.environment} onChange={(e) => updateField('environment', e.target.value)}>
-                <option value="demo">{DOCUSIGN_ENVIRONMENTS.demo.label}</option>
-                <option value="prod">{DOCUSIGN_ENVIRONMENTS.prod.label}</option>
-              </Select>
-            </Field>
-            <Field label="Integration Key (Client ID)" required hint={ds.connected ? 'UUID from Apps & Keys → your app — Disconnect to edit' : 'UUID — from Apps & Keys → your app'}>
-              <Input value={form.integrationKey} onChange={(e) => updateField('integrationKey', e.target.value)} placeholder="e.g. 1d4a2b8e-..." autoComplete="off" disabled={ds.connected} />
-            </Field>
-            <Field label="Client Secret" required hint={ds.connected ? 'Stored in this browser — Disconnect to edit' : 'Generate a secret key in your DocuSign app. Stored in this browser.'}>
-              <div className="flex gap-2">
-                <input
-                  type={showSecret ? 'text' : 'password'}
-                  value={form.clientSecret}
-                  onChange={(e) => updateField('clientSecret', e.target.value)}
-                  placeholder="Paste your secret here..."
-                  className="flex-1 px-3 py-2 text-sm rounded outline-none font-mono"
-                  style={{ backgroundColor: ds.connected ? brand.cream : '#fff', border: `1px solid ${brand.border}`, color: brand.text, cursor: ds.connected ? 'not-allowed' : 'text' }}
-                  autoComplete="off" spellCheck="false"
-                  disabled={ds.connected}
-                />
-                <button type="button" onClick={() => setShowSecret(!showSecret)} className="px-3 py-2 text-xs rounded btn-press" style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}>
-                  {showSecret ? 'Hide' : 'Show'}
-                </button>
-              </div>
-            </Field>
-            <Field label="Redirect URI" required hint={ds.connected ? "Disconnect to edit — must remain registered in your DocuSign app's Redirect URIs list" : "MUST be added to your DocuSign app's Redirect URIs list"}>
-              <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={defaultRedirect} disabled={ds.connected} />
-            </Field>
-          </div>
-
-          {ds.lastSyncStatus === 'error' && ds.lastSyncError && (
-            <div className="p-3 rounded mb-3 text-xs flex items-start gap-2" style={{ backgroundColor: brand.dangerLight, color: brand.danger }}>
+          {status && !isConfigured && (
+            <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.dangerLight, color: brand.danger }}>
               <AlertCircle size={14} className="flex-shrink-0 mt-0.5" />
               <div className="flex-1">
-                <p><strong>Last error:</strong></p>
-                <pre className="mt-1 whitespace-pre-wrap text-xs" style={{ fontFamily: 'inherit' }}>{ds.lastSyncError}</pre>
+                <p><strong>Not configured.</strong></p>
+                {(status.error || statusErr) && (
+                  <pre className="mt-1 whitespace-pre-wrap text-xs" style={{ fontFamily: 'inherit' }}>{status.error || statusErr}</pre>
+                )}
+                <p className="mt-2">Set <code>DOCUSIGN_INTEGRATION_KEY</code>, <code>DOCUSIGN_USER_ID</code>, <code>DOCUSIGN_ACCOUNT_ID</code>, <code>DOCUSIGN_OAUTH_HOST</code>, <code>DOCUSIGN_PRIVATE_KEY</code> in the server environment.</p>
               </div>
             </div>
           )}
 
-          <div className="flex gap-2 flex-wrap">
-            <Button size="sm" variant="primary" icon={Save} onClick={save} disabled={!dirty}>Save</Button>
-            {!ds.connected ? (
-              <Button size="sm" variant="gold" icon={ExternalLink} onClick={handleConnect} disabled={!form.integrationKey || !form.clientSecret || !form.redirectUri || dirty}>
-                Connect with DocuSign
-              </Button>
-            ) : (
-              <Button size="sm" variant="gold" icon={RefreshCw} onClick={handleConnect} disabled={dirty}>
-                Re-Connect
-              </Button>
+          <div className="flex gap-2 flex-wrap mb-4">
+            <Button size="sm" variant="ghost" icon={RefreshCw} onClick={() => { refreshStatus(); refreshRecent(); }}>Refresh</Button>
+            <Button size="sm" variant="ghost" icon={ExternalLink} onClick={() => window.open(dsConsoleHost, '_blank')}>Open DocuSign</Button>
+          </div>
+
+          {/* ----- send test envelope ----- */}
+          <div className="mb-4 p-3 rounded" style={{ backgroundColor: brand.cream }}>
+            <p className="text-xs font-semibold mb-2" style={{ color: brand.text }}>Send Test Envelope</p>
+            <p className="text-xs mb-3" style={{ color: brand.textMuted }}>
+              Sends a one-page test PDF with <code>\sig_tenant\</code> / <code>\date_tenant\</code> anchors. No reminder schedule.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-2">
+              <Input
+                placeholder="Recipient name"
+                value={testForm.name}
+                onChange={(e) => setTestForm(f => ({ ...f, name: e.target.value }))}
+                disabled={!isConfigured || testBusy}
+              />
+              <Input
+                type="email"
+                placeholder="recipient@example.com"
+                value={testForm.email}
+                onChange={(e) => setTestForm(f => ({ ...f, email: e.target.value }))}
+                disabled={!isConfigured || testBusy}
+              />
+            </div>
+            <Button
+              size="sm"
+              variant="gold"
+              icon={Send}
+              onClick={sendTest}
+              disabled={!isConfigured || testBusy || !testForm.name.trim() || !testForm.email.trim()}
+            >
+              {testBusy ? 'Sending…' : 'Send Test Envelope'}
+            </Button>
+            {testResult && (
+              <div className="mt-3 p-2 rounded text-xs flex items-start gap-2" style={{ backgroundColor: brand.successLight, color: brand.success }}>
+                <CheckCircle2 size={12} className="flex-shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <p>Sent. Envelope ID: <code className="break-all">{testResult.envelopeId}</code></p>
+                  <a
+                    href={`${dsConsoleHost}/documents/details/${testResult.envelopeId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline"
+                    style={{ color: brand.success }}
+                  >View in DocuSign →</a>
+                </div>
+              </div>
             )}
-            <Button size="sm" variant="ghost" icon={ExternalLink} onClick={() => window.open(`${envHost}/`, '_blank')}>Open DocuSign</Button>
-            {ds.connected && (
-              <Button size="sm" variant="danger" icon={X} onClick={handleDisconnect}>Disconnect</Button>
+          </div>
+
+          {/* ----- recent envelopes ----- */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-xs font-semibold" style={{ color: brand.text }}>Recent Envelopes (last 7 days)</p>
+              {recentErr && <span className="text-xs" style={{ color: brand.danger }}>{recentErr}</span>}
+            </div>
+            {recent.length === 0 ? (
+              <p className="text-xs" style={{ color: brand.textMuted }}>No envelopes yet.</p>
+            ) : (
+              <div className="overflow-x-auto -mx-3">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ color: brand.textMuted }}>
+                      <th className="text-left px-3 py-1.5 font-medium">Envelope</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Subject</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Status</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recent.map((e) => (
+                      <tr key={e.envelopeId} style={{ borderTop: `1px solid ${brand.border}` }}>
+                        <td className="px-3 py-1.5">
+                          <a
+                            href={`${dsConsoleHost}/documents/details/${e.envelopeId}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="underline font-mono break-all"
+                            style={{ color: brand.gold }}
+                          >{String(e.envelopeId).slice(0, 8)}…</a>
+                        </td>
+                        <td className="px-3 py-1.5 truncate max-w-[16rem]" style={{ color: brand.text }}>{e.emailSubject || '—'}</td>
+                        <td className="px-3 py-1.5"><StatusBadge status={e.status || 'unknown'} /></td>
+                        <td className="px-3 py-1.5" style={{ color: brand.textMuted }}>
+                          {e.statusChangedDateTime
+                            ? new Date(e.statusChangedDateTime).toLocaleString()
+                            : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
 
           <div className="mt-4 p-3 rounded text-xs flex items-start gap-2" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
             <Info size={14} className="mt-0.5 flex-shrink-0" />
             <span>
-              <strong style={{ color: brand.text }}>How it works:</strong> Click <em>Connect with DocuSign</em>, sign in, approve the app. The lease drafter and Leasing section will then create real envelopes with sign/date/initial fields placed at the anchor strings embedded in the lease template (e.g. <code>\sig_landlord\</code>, <code>\sig_tenant\</code>). DocuSign emails the signers; on completion, the lease auto-advances to <em>Active</em>.
+              <strong style={{ color: brand.text }}>Anchor strings:</strong> The lease template must contain <code>\sig_landlord\</code>, <code>\sig_tenant\</code>, etc. (in white size-1 text). Backend places SignHere / DateSigned / FullName / InitialHere tabs at each anchor per signer role.
             </span>
           </div>
         </div>
