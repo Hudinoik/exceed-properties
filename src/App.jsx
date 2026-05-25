@@ -893,15 +893,26 @@ const seedInspections = [
   { id: 5, property: 'Bougainville Shopping Centre, Pretoria', unit: 'Parking Area', inspector: 'Hetty', scheduledDate: '2026-05-08', type: 'Quarterly', status: 'Completed', priority: 'Medium', score: 78 },
 ];
 
-// Lease pipeline stages
+// Lease pack pipeline stages. These mirror the server-side STAGES
+// constant in server/db/packs.js. The pipeline is FORWARD-ONLY in
+// the UI (with one exception: lease_checking can reject back to
+// lease_drafting, gated by the transition matrix in packs.js).
+// Webhook-driven transitions (envelope-declined / -voided) also
+// move docusign back to lease_drafting; that happens server-side
+// and the SPA picks it up on poll.
+//
+// Removed from the previous design: 'active' and 'expiring'. Packs
+// that finish their lifecycle move to 'loading' and get archived
+// when marked loaded into Property Inspect. Archived packs are
+// hidden from the kanban unless the "Show archived" toggle is on.
 const LEASE_STAGES = {
-  offer: { label: 'Offer Sent', color: '#B8924A', description: 'Initial offer extended to prospective tenant' },
-  draft: { label: 'Drafted', color: '#A86523', description: 'Lease agreement drafted, awaiting internal review' },
-  docusign: { label: 'On DocuSign', color: '#7B61FF', description: 'Sent for electronic signature' },
-  active: { label: 'Active', color: '#2D6A4F', description: 'Lease is signed and in effect' },
-  expiring: { label: 'Expiring Soon', color: '#A86523', description: 'Lease ends within 90 days' },
+  offer_sent:     { label: 'Offer Sent',     color: '#B8924A', description: 'Initial offer extended to prospective tenant' },
+  lease_drafting: { label: 'Lease Drafting', color: '#A86523', description: 'Agent drafting the lease document' },
+  lease_checking: { label: 'Lease Checking', color: '#D48A22', description: 'Senior review before DocuSign' },
+  docusign:       { label: 'DocuSign',       color: '#7B61FF', description: 'Sent for electronic signature' },
+  loading:        { label: 'Loading',        color: '#2D6A4F', description: 'Loading into Property Inspect' },
 };
-const LEASE_STAGE_ORDER = ['offer', 'draft', 'docusign', 'active', 'expiring'];
+const LEASE_STAGE_ORDER = ['offer_sent', 'lease_drafting', 'lease_checking', 'docusign', 'loading'];
 
 const seedLeases = [
   // === COMMERCIAL — Active ===
@@ -1828,7 +1839,17 @@ const Dashboard = ({ employees, properties, inspections, leases, debtors, activi
   const occupiedUnits = properties.reduce((s, p) => s + p.occupied, 0);
   const occupancyRate = ((occupiedUnits / totalUnits) * 100).toFixed(1);
   const pendingInspections = inspections.filter(i => i.status === 'Scheduled' || i.status === 'In Progress').length;
-  const expiringLeases = leases.filter(l => l.status === 'Expiring Soon').length;
+  // expiringLeases used to count leases at the 'expiring' pipeline
+  // stage. The pack rebuild removed that stage; expiry is now a
+  // derived computation on the lease end date (within 90 days).
+  // Legacy seed leases without leaseEndDate are ignored.
+  const expiringSoonCutoff = Date.now() + 90 * 24 * 60 * 60 * 1000;
+  const expiringLeases = leases.filter(l => {
+    const end = l.endDate || l.leaseEndDate;
+    if (!end) return false;
+    const t = new Date(end).getTime();
+    return t > Date.now() && t < expiringSoonCutoff;
+  }).length;
   const unpaidTenants = debtors.filter(d => d.status !== 'Paid').length;
   const overdueTenants = debtors.filter(d => d.status === 'Overdue').length;
 
@@ -6303,7 +6324,119 @@ const computeLeaseSummary = (lease, allLeases) => {
   };
 };
 
-const LeasingSection = ({ leases, setLeases, properties, employees, debtors, landlords = {}, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
+const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employees, debtors, landlords = {}, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
+  // Pack -> lease-shape compatibility shim. The pipeline rebuild
+  // (commit c/8) made packs the source of truth, but most of the
+  // existing rendering code (LeaseCard, edit modal, resolution
+  // editor, calculator, table view) reads pre-existing lease fields
+  // like `tenant`, `pipelineStage`, `deposit`, `docusignEnvelopeId`.
+  // Rather than churn every line, project each pack into the legacy
+  // lease shape on read. The compatibility shim keeps `id` as the
+  // numeric lowdb row id; `packId` is exposed too for any code that
+  // needs the stable string id.
+  //
+  // Mutations (advanceStage, sendToDocuSign, etc.) DO NOT go through
+  // the shim — they call api.packs.* directly and then refetchPacks().
+  const packToLeaseShape = (p) => ({
+    ...p,
+    id: p.id,
+    packId: p.packId,
+    tenant: p.tenantName || '',
+    type: p.propertyType || 'commercial',
+    pipelineStage: p.stage,
+    status: p.archived ? 'Archived' : (
+      p.envelopeStatus === 'completed' ? 'Signed' :
+      p.envelopeStatus === 'declined'  ? 'Declined' :
+      p.envelopeStatus === 'voided'    ? 'Voided' : 'Pending'
+    ),
+    deposit: p.depositAmount,
+    startDate: p.leaseStartDate,
+    endDate: null, // computed-on-demand if anything needs it
+    docusignEnvelopeId: p.envelopeId,
+    docusignRecipient: p.tenantEmail,
+    docusignSentAt: p.envelopeSentAt,
+    docusignSignedAt: p.signedPdfAt,
+    stageEntered: p.updatedAt,
+    monthlyRent: p.monthlyRent,
+  });
+  // Hide archived by default; toggle exposes them.
+  const [showArchived, setShowArchived] = useState(false);
+  useEffect(() => {
+    refetchPacks({ archived: showArchived });
+  }, [showArchived, refetchPacks]);
+  const leases = useMemo(() => (packs || []).map(packToLeaseShape), [packs]);
+
+  // Pack-aware mutators -- all go through the backend. After each
+  // successful action we refetch so the kanban reflects server state
+  // exactly (no client-side optimistic stale-data drift).
+  const transitionPack = async (packId, toStage, reason) => {
+    try {
+      await api.packs.transition(packId, toStage, reason);
+      await refetchPacks({ archived: showArchived });
+      return true;
+    } catch (err) {
+      showToast(`Stage change failed: ${err.message}`, 'error');
+      return false;
+    }
+  };
+  const sendPackToDocusign = async (pack) => {
+    try {
+      const r = await api.packs.sendToDocusign(pack.packId);
+      logAction(`Sent pack ${pack.packId} to DocuSign (envelope ${r.envelopeId})`);
+      showToast(`Sent to DocuSign -- envelope ${String(r.envelopeId).slice(0, 8)}...`, 'success');
+      await refetchPacks({ archived: showArchived });
+    } catch (err) {
+      showToast(`DocuSign send failed: ${err.message}`, 'error');
+    }
+  };
+  const remindPackSigner = async (pack) => {
+    try {
+      const r = await api.packs.resendReminder(pack.packId);
+      logAction(`Sent reminder on pack ${pack.packId}`);
+      showToast(r.resent > 0 ? `Reminder sent to ${r.resent} recipient(s)` : 'No pending signers', 'success');
+    } catch (err) {
+      showToast(`Reminder failed: ${err.message}`, 'error');
+    }
+  };
+  const voidPackEnvelope = async (pack) => {
+    const reason = window.prompt('Reason for voiding this envelope? (visible to the agent on the pack)');
+    if (reason === null) return; // cancelled
+    try {
+      await api.packs.voidEnvelope(pack.packId, reason || '(no reason given)');
+      logAction(`Voided envelope on pack ${pack.packId}`);
+      showToast('Envelope voided -- pack returned to Lease Drafting', 'success');
+      await refetchPacks({ archived: showArchived });
+    } catch (err) {
+      showToast(`Void failed: ${err.message}`, 'error');
+    }
+  };
+  const markPackLoaded = async (pack) => {
+    const ref = window.prompt('Property Inspect reference (optional):') || null;
+    try {
+      await api.packs.markLoaded(pack.packId, ref);
+      logAction(`Marked pack ${pack.packId} as loaded into Property Inspect${ref ? ` (ref ${ref})` : ''}`);
+      showToast('Pack marked loaded -- archived from pipeline', 'success');
+      await refetchPacks({ archived: showArchived });
+    } catch (err) {
+      showToast(`Mark-loaded failed: ${err.message}`, 'error');
+    }
+  };
+  const downloadPackPdf = async (pack, fileType) => {
+    try {
+      const blob = await api.packs.downloadFile(pack.packId, fileType);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${pack.tenantName || pack.packId}-${fileType}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      showToast(`Download failed: ${err.message}`, 'error');
+    }
+  };
+
   // Top-level tab: pipeline view vs Lease Learner. Lease Drafter now lives
   // at its own nav target ('leaseDrafter') so the sidebar stays visible.
   const [subTab, setSubTab] = useState('pipeline');
@@ -6513,7 +6646,7 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
     setErrors({}); setTouched({}); setModalOpen(true);
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     const allTouched = Object.keys(schema).reduce((a, k) => ({ ...a, [k]: true }), {});
     setTouched(allTouched);
     const newErrors = validateForm(form, schema);
@@ -6525,149 +6658,115 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
       showToast('Please fix the errors before saving', 'error');
       return;
     }
-    if (editingId) {
-      setLeases(leases.map(l => l.id === editingId ? {
-        ...l, ...form,
-        monthlyRent: Number(form.monthlyRent),
-        deposit: Number(form.deposit),
-      } : l));
-      logAction(`Updated lease: ${form.tenant}`);
-      showToast('Lease updated', 'success');
-    } else {
-      const newId = Math.max(0, ...leases.map(l => l.id)) + 1;
-      const status = form.pipelineStage === 'active' ? 'Active'
-        : form.pipelineStage === 'expiring' ? 'Expiring Soon'
-        : 'Pending';
-      setLeases([...leases, {
-        ...form, id: newId, status,
-        monthlyRent: Number(form.monthlyRent),
-        deposit: Number(form.deposit),
-        stageEntered: todayISO(),
-      }]);
-      logAction(`Created ${form.type} lease for ${form.tenant} (${LEASE_STAGES[form.pipelineStage].label})`);
-      showToast('Lease created', 'success');
+    // Map the form's legacy lease shape onto the pack shape. Fields
+    // not yet present on the form (tenantCode, tenantEmail, packType)
+    // default to safe placeholders -- the user can backfill via the
+    // edit modal once it surfaces those inputs (commit d).
+    const leaseTermMonths = form.startDate && form.endDate
+      ? Math.max(1, Math.round((new Date(form.endDate) - new Date(form.startDate)) / (1000 * 60 * 60 * 24 * 30)))
+      : 0;
+    const packPatch = {
+      tenantName: form.tenant,
+      property: form.property,
+      unit: form.unit,
+      propertyType: form.type,
+      leaseStartDate: form.startDate || null,
+      leaseTerm: leaseTermMonths,
+      monthlyRent: Number(form.monthlyRent) || 0,
+      depositAmount: Number(form.deposit) || 0,
+      assignedAgent: form.assignedTo || null,
+    };
+    try {
+      if (editingId) {
+        // Match by lowdb numeric id -> packId via the lease shim.
+        const target = leases.find(l => l.id === editingId);
+        if (!target?.packId) throw new Error('Pack id missing on this row');
+        await api.packs.update(target.packId, packPatch);
+        logAction(`Updated pack ${target.packId}`);
+        showToast('Pack updated', 'success');
+      } else {
+        const created = await api.packs.create({
+          ...packPatch,
+          tenantCode: form.tenantCode || '',
+          tenantEmail: form.tenantEmail || '',
+          packType: form.packType || 'new',
+          stage: 'offer_sent',
+        });
+        logAction(`Created pack ${created.packId} for ${created.tenantName}`);
+        showToast('Pack created', 'success');
+      }
+      await refetchPacks({ archived: showArchived });
+    } catch (err) {
+      showToast(`Save failed: ${err.message}`, 'error');
+      return;
     }
     setModalOpen(false);
   };
 
-  const advanceStage = (lease) => {
+  // Stage transitions. Replaces the old setLeases-based mutators:
+  // every advance/back-step goes through the backend, which enforces
+  // the transition matrix from server/db/packs.js. The matrix is
+  // forward-only with one exception (lease_checking can reject back
+  // to lease_drafting).
+  //
+  // The "draft -> docusign" special case (which used to open the
+  // upload modal) is GONE -- DocuSign send is now a stage transition
+  // from lease_checking, handled by sendPackToDocusign() at the top
+  // of the component.
+  const advanceStage = async (lease) => {
     const currentIdx = LEASE_STAGE_ORDER.indexOf(lease.pipelineStage);
     if (currentIdx === -1 || currentIdx === LEASE_STAGE_ORDER.length - 1) return;
     const nextStage = LEASE_STAGE_ORDER[currentIdx + 1];
-
-    // Special case: draft → docusign should open DocuSign modal
-    if (lease.pipelineStage === 'draft' && nextStage === 'docusign') {
-      setDocusignLease(lease);
-      setDocusignEmail('');
-      setDocusignModalOpen(true);
+    // lease_checking -> docusign uses the dedicated send endpoint, not the
+    // plain transition route (that endpoint reads the draft PDF + posts to
+    // /api/docusign/send-lease + advances the pack itself).
+    if (lease.pipelineStage === 'lease_checking' && nextStage === 'docusign') {
+      await sendPackToDocusign(lease);
       return;
     }
-
-    const newStatus = nextStage === 'active' ? 'Active'
-      : nextStage === 'expiring' ? 'Expiring Soon'
-      : 'Pending';
-    setLeases(leases.map(l => l.id === lease.id ? {
-      ...l, pipelineStage: nextStage, status: newStatus, stageEntered: todayISO(),
-    } : l));
-    logAction(`Advanced lease "${lease.tenant}" to ${LEASE_STAGES[nextStage].label}`);
-    showToast(`Moved to ${LEASE_STAGES[nextStage].label}`, 'success');
-  };
-
-  const moveBackStage = (lease) => {
-    const currentIdx = LEASE_STAGE_ORDER.indexOf(lease.pipelineStage);
-    if (currentIdx <= 0) return;
-    const prevStage = LEASE_STAGE_ORDER[currentIdx - 1];
-    setLeases(leases.map(l => l.id === lease.id ? {
-      ...l, pipelineStage: prevStage, status: 'Pending', stageEntered: todayISO(),
-    } : l));
-    logAction(`Moved lease "${lease.tenant}" back to ${LEASE_STAGES[prevStage].label}`);
-    showToast(`Moved back to ${LEASE_STAGES[prevStage].label}`, 'success');
-  };
-
-  const sendToDocuSign = async () => {
-    if (!docusignEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(docusignEmail)) {
-      showToast('Enter a valid email address', 'error');
-      return;
-    }
-    if (!docusignDocFile) {
-      showToast('Upload the lease document (.docx or .pdf) to send.', 'error');
-      return;
-    }
-    if (!docusignConnected) {
-      showToast('DocuSign is not configured. Check Settings → Integrations.', 'error');
-      return;
-    }
-    setDocusignSending(true);
-
-    try {
-      // The SPA's lease drafter generates the document client-side
-      // (docxtemplater + docx-merger). Whatever the user uploads here
-      // is what we send. Backend requires base64 — Render's filesystem
-      // is ephemeral so we never write the file to disk.
-      const pdfBase64 = await blobToBase64(docusignDocFile);
-      const r = await api.proxy.docusignSendLease({
-        signers: [{
-          name: docusignLease.tenant,
-          email: docusignEmail,
-          role: 'tenant',
-          routingOrder: 1,
-        }],
-        pdfBase64,
-        emailSubject: `Lease Agreement — ${docusignLease.tenant}`,
-        documentName: docusignDocFile.name || `${docusignLease.tenant}-lease.pdf`,
-      });
-      const envelopeId = r.envelopeId;
-
-      setLeases(leases.map(l => l.id === docusignLease.id ? {
-        ...l,
-        pipelineStage: 'docusign',
-        status: 'Pending',
-        stageEntered: todayISO(),
-        docusignEnvelopeId: envelopeId,
-        docusignRecipient: docusignEmail,
-        docusignSentAt: new Date().toISOString(),
-      } : l));
-      // Seed the local status cache so the badge updates immediately
-      // (don't wait the up-to-30s for the next poll).
-      setEnvelopeStatuses(prev => ({
-        ...prev,
-        [envelopeId]: { status: r.status || 'sent', statusChangedDateTime: new Date().toISOString() },
-      }));
-      logAction(`Sent lease "${docusignLease.tenant}" to DocuSign (${envelopeId})`);
-      showToast(`Sent to DocuSign · envelope ${envelopeId.slice(0, 8)}…`, 'success');
-      setDocusignModalOpen(false);
-      setDocusignDocFile(null);
-    } catch (err) {
-      showToast(`DocuSign send failed: ${err.message}`, 'error');
-    } finally {
-      setDocusignSending(false);
+    const ok = await transitionPack(lease.packId, nextStage);
+    if (ok) {
+      logAction(`Advanced pack ${lease.packId} to ${LEASE_STAGES[nextStage].label}`);
+      showToast(`Moved to ${LEASE_STAGES[nextStage].label}`, 'success');
     }
   };
 
-  const markDocuSignSigned = (lease) => {
-    setLeases(leases.map(l => l.id === lease.id ? {
-      ...l,
-      pipelineStage: 'active',
-      status: 'Active',
-      stageEntered: todayISO(),
-      docusignSignedAt: new Date().toISOString(),
-    } : l));
-    logAction(`Marked lease "${lease.tenant}" as signed via DocuSign`);
-    showToast('Lease marked as signed and activated', 'success');
+  const moveBackStage = async (lease) => {
+    // Only one back-transition is allowed in the matrix today:
+    // lease_checking -> lease_drafting (reject path). Any other
+    // attempt returns 409 from the backend.
+    if (lease.pipelineStage !== 'lease_checking') {
+      showToast('This stage cannot be moved back manually.', 'error');
+      return;
+    }
+    const reason = window.prompt('Reason for sending back to drafting? (optional, saved as a comment on the pack)') || null;
+    const ok = await transitionPack(lease.packId, 'lease_drafting', reason);
+    if (ok) {
+      if (reason) {
+        try { await api.packs.addComment(lease.packId, reason); } catch { /* best-effort */ }
+      }
+      logAction(`Sent pack ${lease.packId} back to Lease Drafting`);
+      showToast('Pack returned to Lease Drafting', 'success');
+    }
   };
 
-  // Render a single lease card
+  // Render a single pack card. (Variable is still named `lease` because
+  // it's the lease-shaped projection of the pack via packToLeaseShape;
+  // the underlying record is a pack with a `packId`.)
   const LeaseCard = ({ lease, stageIdx, cardIdx }) => {
-    const stage = LEASE_STAGES[lease.pipelineStage] || LEASE_STAGES.active;
+    const stage = LEASE_STAGES[lease.pipelineStage] || LEASE_STAGES.offer_sent;
     const daysInStage = lease.stageEntered ?
       Math.floor((Date.now() - new Date(lease.stageEntered).getTime()) / 86400000) : null;
-    const canAdvance = LEASE_STAGE_ORDER.indexOf(lease.pipelineStage) < LEASE_STAGE_ORDER.length - 1
-                      && lease.pipelineStage !== 'docusign';
-    const isDocuSign = lease.pipelineStage === 'docusign';
-    const isExpiring = lease.pipelineStage === 'expiring';
-    // Show summary once the lease has completed the workflow (signed → active).
-    const isCompleted = lease.pipelineStage === 'active' || lease.pipelineStage === 'expiring';
-    const summary = isCompleted ? computeLeaseSummary(lease, leases) : null;
+    const isOfferSent = lease.pipelineStage === 'offer_sent';
+    const isDrafting  = lease.pipelineStage === 'lease_drafting';
+    const isChecking  = lease.pipelineStage === 'lease_checking';
+    const isDocuSign  = lease.pipelineStage === 'docusign';
+    const isLoading   = lease.pipelineStage === 'loading';
+    const hasDraft    = !!lease.draftedLease;
+    const envStatus   = lease.envelopeStatus;
+    const docusignDeclined = isDocuSign && (envStatus === 'declined' || envStatus === 'voided');
+    const docusignCompleted = isDocuSign && envStatus === 'completed';
+    const summary = null; // legacy lease summary removed -- packs use detail page
 
     return (
       <Card className={`p-3 mb-2 card-lift animate-fade-in-up stagger-${Math.min(cardIdx + 1, 8)}`} style={{ borderLeft: `3px solid ${stage.color}` }}>
@@ -6758,16 +6857,75 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
         )}
 
         <div className="flex gap-1 flex-wrap pt-2" style={{ borderTop: `1px solid ${brand.border}` }}>
-          {isDocuSign ? (
+          {/* Per-stage primary actions per the spec §3 table. Buttons
+              that depend on data we don't yet have on the pack (e.g.
+              hasDraft for "Send to Checking") guard themselves and
+              fall back to disabled states. */}
+          {isOfferSent && (
+            <button
+              onClick={async () => {
+                // Move to drafting first, then open the drafter
+                // pre-filled. The drafter pre-fill itself is commit
+                // (d) -- this commit just transitions and navigates.
+                const ok = await transitionPack(lease.packId, 'lease_drafting');
+                if (ok) {
+                  window.__draftingPackId = lease.packId;
+                  onNavigate?.('leaseDrafter');
+                }
+              }}
+              className="flex-1 text-xs px-2 py-1 rounded btn-press"
+              style={{ backgroundColor: '#7B61FF', color: '#fff' }}
+            >
+              Start Draft →
+            </button>
+          )}
+          {isDrafting && (
             <>
-              {/* Resend reminder: only meaningful when we have a real
-                  DocuSign envelope (UUID-looking ID) and the envelope
-                  is not yet completed/declined/voided. */}
-              {lease.docusignEnvelopeId
-                && /^[0-9a-f-]{36}$/i.test(String(lease.docusignEnvelopeId))
-                && !['Signed', 'Declined', 'Voided'].includes(leaseSigningBadge(lease) || '') && (
+              <button
+                onClick={() => { window.__draftingPackId = lease.packId; onNavigate?.('leaseDrafter'); }}
+                className="flex-1 text-xs px-2 py-1 rounded btn-press"
+                style={{ backgroundColor: brand.navy, color: '#fff' }}
+              >
+                {hasDraft ? 'Continue Drafting →' : 'Open Drafter →'}
+              </button>
+              {hasDraft && (
                 <button
-                  onClick={() => remindLeaseSigner(lease)}
+                  onClick={() => transitionPack(lease.packId, 'lease_checking')}
+                  className="text-xs px-2 py-1 rounded btn-press"
+                  style={{ color: brand.success, border: `1px solid ${brand.success}` }}
+                  title="Send to Lease Checking"
+                >
+                  Send to Checking →
+                </button>
+              )}
+            </>
+          )}
+          {isChecking && (
+            <>
+              <button
+                onClick={() => advanceStage(lease)}
+                className="flex-1 text-xs px-2 py-1 rounded btn-press"
+                style={{ backgroundColor: '#7B61FF', color: '#fff' }}
+                title="Approve & send the drafted PDF to DocuSign for signature"
+              >
+                Approve & Send to DocuSign →
+              </button>
+              <button
+                onClick={() => moveBackStage(lease)}
+                className="text-xs px-2 py-1 rounded btn-press"
+                style={{ color: brand.danger, border: `1px solid ${brand.danger}` }}
+                title="Reject and send back to drafting"
+              >
+                Send Back ←
+              </button>
+            </>
+          )}
+          {isDocuSign && !docusignDeclined && !docusignCompleted && (
+            <>
+              {lease.docusignEnvelopeId
+                && /^[0-9a-f-]{36}$/i.test(String(lease.docusignEnvelopeId)) && (
+                <button
+                  onClick={() => remindPackSigner(lease)}
                   className="text-xs px-2 py-1 rounded btn-press"
                   style={{ color: '#7B61FF', border: '1px solid #7B61FF' }}
                   title="Resend signing email & enable reminders"
@@ -6775,64 +6933,55 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
                   <Bell size={11} className="inline mr-0.5" /> Remind
                 </button>
               )}
-              {/* View signed PDF: only when the envelope is complete. */}
-              {leaseSigningBadge(lease) === 'Signed' && (
-                <button
-                  onClick={() => downloadSignedLease(lease)}
-                  className="text-xs px-2 py-1 rounded btn-press"
-                  style={{ color: brand.gold, border: `1px solid ${brand.gold}` }}
-                  title="Download the signed PDF"
-                >
-                  <FileText size={11} className="inline mr-0.5" /> View PDF
-                </button>
-              )}
               <button
-                onClick={() => markDocuSignSigned(lease)}
-                className="flex-1 text-xs px-2 py-1 rounded btn-press"
-                style={{ color: brand.success, border: `1px solid ${brand.success}` }}
+                onClick={() => voidPackEnvelope(lease)}
+                className="text-xs px-2 py-1 rounded btn-press"
+                style={{ color: brand.danger, border: `1px solid ${brand.danger}` }}
+                title="Void the envelope and return the pack to Lease Drafting"
               >
-                Mark Signed
+                Void
               </button>
             </>
-          ) : canAdvance ? (
+          )}
+          {isDocuSign && docusignDeclined && (
             <button
-              onClick={() => advanceStage(lease)}
-              className="flex-1 text-xs px-2 py-1 rounded btn-press transition-all"
-              style={{
-                backgroundColor: lease.pipelineStage === 'draft' ? '#7B61FF' : brand.navy,
-                color: '#fff',
-              }}
+              onClick={() => transitionPack(lease.packId, 'lease_drafting', 'Re-drafting after decline')}
+              className="flex-1 text-xs px-2 py-1 rounded btn-press"
+              style={{ color: brand.warning, border: `1px solid ${brand.warning}` }}
             >
-              {lease.pipelineStage === 'offer' ? 'Start Draft →' :
-               lease.pipelineStage === 'draft' ? 'Send to DocuSign →' :
-               lease.pipelineStage === 'active' && isExpiring ? '' :
-               'Advance →'}
-            </button>
-          ) : null}
-          {isCompleted && (
-            <button
-              onClick={() => setSummaryLease(lease)}
-              className="text-xs px-2 py-1 rounded btn-press flex-1"
-              style={{ color: brand.gold, border: `1px solid ${brand.gold}` }}
-              title="Lease summary"
-            >
-              Summary
+              Back to Drafting →
             </button>
           )}
-          {/* View signed PDF available on completed/active leases too,
-              once the envelope is fully signed. */}
-          {isCompleted && lease.docusignEnvelopeId
-            && /^[0-9a-f-]{36}$/i.test(String(lease.docusignEnvelopeId))
-            && leaseSigningBadge(lease) === 'Signed' && (
+          {isDocuSign && docusignCompleted && (
+            <>
+              <button
+                onClick={() => downloadPackPdf(lease, 'signed.pdf')}
+                className="text-xs px-2 py-1 rounded btn-press"
+                style={{ color: brand.gold, border: `1px solid ${brand.gold}` }}
+                title="Download the signed PDF"
+              >
+                <FileText size={11} className="inline mr-0.5" /> View PDF
+              </button>
+              <button
+                onClick={() => transitionPack(lease.packId, 'loading')}
+                className="flex-1 text-xs px-2 py-1 rounded btn-press"
+                style={{ backgroundColor: brand.success, color: '#fff' }}
+              >
+                Move to Loading →
+              </button>
+            </>
+          )}
+          {isLoading && (
             <button
-              onClick={() => downloadSignedLease(lease)}
-              className="text-xs px-2 py-1 rounded btn-press"
-              style={{ color: brand.navy, border: `1px solid ${brand.border}` }}
-              title="Download signed PDF"
+              onClick={() => markPackLoaded(lease)}
+              className="flex-1 text-xs px-2 py-1 rounded btn-press"
+              style={{ backgroundColor: brand.success, color: '#fff' }}
             >
-              <FileText size={11} />
+              Mark Loaded into Property Inspect
             </button>
           )}
+
+          {/* Resolution + edit -- present on every card per spec §3. */}
           <button
             onClick={() => {
               const landlordForCentre = landlords[lease.property]
@@ -6855,16 +7004,6 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
           >
             <Edit2 size={11} />
           </button>
-          {LEASE_STAGE_ORDER.indexOf(lease.pipelineStage) > 0 && (
-            <button
-              onClick={() => moveBackStage(lease)}
-              className="text-xs px-2 py-1 rounded btn-press"
-              style={{ color: brand.textMuted, border: `1px solid ${brand.border}` }}
-              title="Move back"
-            >
-              ←
-            </button>
-          )}
         </div>
       </Card>
     );
@@ -6903,6 +7042,20 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
                 <button onClick={() => setViewMode('pipeline')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'pipeline' ? brand.navy : '#fff', color: viewMode === 'pipeline' ? '#fff' : brand.text }}>Pipeline</button>
                 <button onClick={() => setViewMode('table')} className="px-3 py-1.5 text-xs font-medium transition-all" style={{ backgroundColor: viewMode === 'table' ? brand.navy : '#fff', color: viewMode === 'table' ? '#fff' : brand.text }}>Table</button>
               </div>
+              {/* Show Archived toggle -- archived packs (legacy migrated
+                  + Property-Inspect-loaded) are hidden by default. */}
+              <button
+                onClick={() => setShowArchived(v => !v)}
+                className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                style={{
+                  backgroundColor: showArchived ? brand.gold : '#fff',
+                  color: showArchived ? '#fff' : brand.text,
+                  border: `1px solid ${showArchived ? brand.gold : brand.border}`,
+                }}
+                title={showArchived ? 'Hide archived packs' : 'Show archived packs'}
+              >
+                {showArchived ? 'Hiding non-archived' : 'Show archived'}
+              </button>
               <Button variant="gold" icon={Sparkles} onClick={() => onNavigate?.('leaseDrafter')}>Draft Lease</Button>
               <Button variant="primary" icon={Plus} onClick={() => openCreate(activeCategory === 'residential' ? 'residential' : 'commercial')}>New Pack</Button>
             </>
@@ -7169,10 +7322,15 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
               {resolutionLease.resolution && (
                 <Button
                   variant="ghost"
-                  onClick={() => {
-                    setLeases(leases.map(l => l.id === resolutionLease.id ? { ...l, resolution: '' } : l));
-                    logAction(`Removed resolution from lease "${resolutionLease.tenant}"`);
-                    showToast('Resolution cleared', 'success');
+                  onClick={async () => {
+                    try {
+                      await api.packs.update(resolutionLease.packId, { resolution: '' });
+                      await refetchPacks({ archived: showArchived });
+                      logAction(`Removed resolution from pack ${resolutionLease.packId}`);
+                      showToast('Resolution cleared', 'success');
+                    } catch (err) {
+                      showToast(`Clear failed: ${err.message}`, 'error');
+                    }
                     setResolutionLease(null);
                   }}
                   style={{ color: brand.danger }}
@@ -7183,10 +7341,15 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
               <Button
                 variant="primary"
                 icon={Save}
-                onClick={() => {
-                  setLeases(leases.map(l => l.id === resolutionLease.id ? { ...l, resolution: resolutionDraft.trim() } : l));
-                  logAction(`Saved resolution for lease "${resolutionLease.tenant}"`);
-                  showToast('Resolution saved', 'success');
+                onClick={async () => {
+                  try {
+                    await api.packs.update(resolutionLease.packId, { resolution: resolutionDraft.trim() });
+                    await refetchPacks({ archived: showArchived });
+                    logAction(`Saved resolution for pack ${resolutionLease.packId}`);
+                    showToast('Resolution saved', 'success');
+                  } catch (err) {
+                    showToast(`Save failed: ${err.message}`, 'error');
+                  }
                   setResolutionLease(null);
                 }}
               >
@@ -7337,108 +7500,12 @@ const LeasingSection = ({ leases, setLeases, properties, employees, debtors, lan
         })()}
       </Modal>
 
-      <Modal open={docusignModalOpen} onClose={() => !docusignSending && setDocusignModalOpen(false)} title="Send Lease to DocuSign" size="md">
-        {docusignLease && (
-          <>
-            {/* Lease summary header */}
-            <div className="mb-4 p-3 rounded" style={{ backgroundColor: brand.cream }}>
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-sm font-semibold" style={{ color: brand.navy }}>{docusignLease.tenant}</p>
-                <span className="text-xs px-2 py-0.5 rounded" style={{ backgroundColor: docusignLease.type === 'commercial' ? brand.goldPale : '#D8E8DE', color: docusignLease.type === 'commercial' ? brand.gold : brand.success }}>
-                  {docusignLease.type === 'commercial' ? 'Commercial' : 'Residential'}
-                </span>
-              </div>
-              <p className="text-xs" style={{ color: brand.textMuted }}>{docusignLease.property} · {docusignLease.unit}</p>
-              <p className="text-xs mt-1" style={{ color: brand.textMuted }}>
-                R {Number(docusignLease.monthlyRent).toLocaleString()}/mo · {formatDate(docusignLease.startDate)} → {formatDate(docusignLease.endDate)}
-              </p>
-            </div>
-
-            {/* Connection status banner */}
-            {docusignConnected ? (
-              <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.successLight, color: brand.success }}>
-                <CheckCircle2 size={14} className="flex-shrink-0 mt-0.5" />
-                <span>
-                  <strong>DocuSign connected.</strong> {integrations?.docusign?.environment === 'prod' ? 'Production' : 'Demo'} account · {integrations?.docusign?.userEmail || integrations?.docusign?.accountId}
-                </span>
-              </div>
-            ) : (
-              <div className="p-3 rounded mb-4 text-xs flex items-start gap-2" style={{ backgroundColor: brand.warningLight, color: brand.warning }}>
-                <AlertCircle size={14} className="flex-shrink-0 mt-0.5" />
-                <span><strong>DocuSign isn't connected.</strong> The lease will move to "On DocuSign" with a placeholder tracking ID, but no real envelope is created. Configure in Settings → Integrations.</span>
-              </div>
-            )}
-
-            <Field label="Signer Email" required hint="The tenant will receive a DocuSign envelope at this address">
-              <Input
-                type="email"
-                value={docusignEmail}
-                onChange={(e) => setDocusignEmail(e.target.value)}
-                placeholder="signer@example.com"
-                autoFocus
-              />
-            </Field>
-
-            {docusignConnected && (
-              <Field label="Lease document (.docx)" hint="Upload the lease — anchor strings inside the doc (\\sig_tenant\\, \\date_tenant\\, etc.) determine where signature fields appear">
-                <div
-                  className="rounded p-4 text-center cursor-pointer"
-                  style={{
-                    border: `2px dashed ${docusignDocFile ? brand.gold : brand.border}`,
-                    backgroundColor: docusignDocFile ? brand.goldPale : '#FAFAF6',
-                  }}
-                  onClick={() => document.getElementById('ds-doc-file-input')?.click()}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const f = e.dataTransfer?.files?.[0];
-                    if (f) setDocusignDocFile(f);
-                  }}
-                >
-                  <input
-                    id="ds-doc-file-input"
-                    type="file"
-                    accept=".docx,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf"
-                    className="hidden"
-                    onChange={(e) => { const f = e.target.files?.[0]; if (f) setDocusignDocFile(f); e.target.value = ''; }}
-                  />
-                  {docusignDocFile ? (
-                    <>
-                      <FileCheck size={20} style={{ color: brand.gold }} className="mx-auto mb-1" />
-                      <p className="text-xs font-medium" style={{ color: brand.text }}>{docusignDocFile.name}</p>
-                      <p className="text-[10px] mt-0.5" style={{ color: brand.textMuted }}>{Math.round(docusignDocFile.size / 1024)} KB — click to replace</p>
-                    </>
-                  ) : (
-                    <>
-                      <Upload size={20} style={{ color: brand.textMuted }} className="mx-auto mb-1" />
-                      <p className="text-xs" style={{ color: brand.textMuted }}>Click or drop the lease .docx (or .pdf) here</p>
-                      <p className="text-[10px] mt-0.5" style={{ color: brand.textMuted }}>Without a file, this just marks the lease as on-DocuSign locally — no envelope is created</p>
-                    </>
-                  )}
-                </div>
-              </Field>
-            )}
-
-            {docusignSending && (
-              <div className="p-3 rounded mb-3 text-xs flex items-center gap-2" style={{ backgroundColor: brand.cream, color: brand.text }}>
-                <RefreshCw size={14} className="animate-spin" style={{ color: brand.gold }} />
-                <span>
-                  {docusignConnected && docusignDocFile
-                    ? 'Encoding document, creating envelope on DocuSign, emailing signer…'
-                    : 'Recording on-DocuSign stage…'}
-                </span>
-              </div>
-            )}
-
-            <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
-              <Button variant="ghost" onClick={() => { setDocusignDocFile(null); setDocusignModalOpen(false); }} disabled={docusignSending}>Cancel</Button>
-              <Button variant="primary" icon={docusignSending ? RefreshCw : Send} onClick={sendToDocuSign} disabled={docusignSending || !docusignEmail}>
-                {docusignSending ? 'Sending…' : (docusignConnected && docusignDocFile ? 'Send Real Envelope' : 'Send to DocuSign')}
-              </Button>
-            </div>
-          </>
-        )}
-      </Modal>
+      {/* The legacy "Send Lease to DocuSign" upload modal was removed
+          in the pack pipeline rebuild (commit c/8). DocuSign send is
+          now driven by the "Approve & Send to DocuSign" button on
+          lease-checking-stage cards -- the backend reads the pack's
+          saved draft PDF and posts it to /api/docusign/send-lease.
+          No browser-side file upload step. */}
 
         </>
       )}
@@ -13811,6 +13878,31 @@ export default function ExceedProperties() {
   const [properties, setProperties] = useStoredState('ep:properties', seedProperties);
   const [inspections, setInspections] = useStoredState('ep:inspections', seedInspections);
   const [leases, setLeases] = useStoredState('ep:leases', seedLeases);
+  // Lease packs -- server-sourced via /api/packs, NOT localStorage.
+  // The kanban (LeasingSection) reads from this; AISection / backup /
+  // drafter-standalone still read from `leases` (the localStorage
+  // demo data) until commit (h) of the pack rebuild migrates them.
+  const [packs, setPacks] = useState([]);
+  const [packsLoaded, setPacksLoaded] = useState(false);
+  const refetchPacks = useCallback(async ({ archived = false } = {}) => {
+    try {
+      const list = await api.packs.list({ archived });
+      setPacks(list);
+      setPacksLoaded(true);
+    } catch (err) {
+      // Pre-auth: GET /api/packs returns 401 until the user logs in.
+      // That's expected on first render -- once auth completes the
+      // effect below re-runs.
+      if (err?.status !== 401) {
+        // eslint-disable-next-line no-console
+        console.error('[packs] fetch failed:', err.message);
+      }
+      setPacksLoaded(true);
+    }
+  }, []);
+  useEffect(() => {
+    refetchPacks();
+  }, [refetchPacks]);
   const [debtors, setDebtors] = useStoredState('ep:debtors', seedDebtors);
   const [tenancies, setTenancies] = useStoredState('ep:tenancies', []);
   // Landlord records keyed by centre/property name. Holds entity details, banking,
@@ -14076,7 +14168,7 @@ export default function ExceedProperties() {
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'tenancy': return checkPerm(PERMISSIONS.VIEW_TENANCY) || <TenancyActivitySection inspections={inspections} integrations={integrations} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'projections': return checkPerm(PERMISSIONS.VIEW_PROJECTIONS) || <ProjectionsSection showToast={showToast} logAction={logAction} />;
-      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection leases={leases} setLeases={setLeases} properties={properties} employees={employees} debtors={debtors} landlords={landlords} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
+      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection packs={packs} packsLoaded={packsLoaded} refetchPacks={refetchPacks} properties={properties} employees={employees} debtors={debtors} landlords={landlords} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
       case 'ai': return checkPerm(PERMISSIONS.VIEW_AI) || <AISection employees={employees} setEmployees={setEmployees} properties={properties} setProperties={setProperties} leases={leases} setLeases={setLeases} debtors={debtors} maintenance={maintenance} outages={outages} tenancies={tenancies} landlords={landlords} integrations={integrations} showToast={showToast} logAction={logAction} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'leaseDrafter': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeaseDrafter currentUser={currentUser} showToast={showToast} logAction={logAction} integrations={integrations} debtors={debtors} onNavigateToSettings={() => setActiveNav('settings')} onClose={() => setActiveNav('leasing')} />;
       case 'debtors': return checkPerm(PERMISSIONS.VIEW_DEBTORS) || <DebtorsSection debtors={debtors} setDebtors={setDebtors} debtorAccounts={debtorAccounts} setDebtorAccounts={setDebtorAccounts} debtorNotes={debtorNotes} setDebtorNotes={setDebtorNotes} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
