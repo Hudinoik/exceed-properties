@@ -2674,6 +2674,9 @@ const pairClockEvents = (rawEntries, projectsMap = {}) => {
   if (alreadyPaired) {
     return rawEntries.map((entry, i) => ({
       id: entry.id || `e-${i}`,
+      inEventId: entry.inId || entry.id || null,
+      outEventId: entry.outId || null,
+      projectId: entry.projectId || null,
       employee: entry.person?.fullName || entry.personName || 'Unknown',
       personId: entry.person?.id || entry.personId,
       date: entry.belongsToDate || entry.date || (entry.in ? String(entry.in).split('T')[0] : ''),
@@ -2733,6 +2736,9 @@ const makePaired = (inEv, outEv, idx, projectsMap = {}) => {
   const outTime = outEv?.time;
   return {
     id: `${inEv?.id || 'open'}-${outEv?.id || 'open'}-${idx}`,
+    inEventId: inEv?.id || null,
+    outEventId: outEv?.id || null,
+    projectId: inEv?.projectId || outEv?.projectId || null,
     employee: inEv?.person?.fullName || inEv?.personName || 'Unknown',
     personId: inEv?.person?.id || inEv?.personId,
     date: inEv?.belongsToDate || inEv?.date || (inTime ? String(inTime).split('T')[0] : ''),
@@ -2792,9 +2798,17 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [rawEntries, setRawEntries] = useState([]);
   const [rawLiveEntries, setRawLiveEntries] = useState([]);
   const [projectsMap, setProjectsMap] = useState({});
+  const [peopleList, setPeopleList] = useState([]); // [{ id, fullName }]
   const [loading, setLoading] = useState(false);
   const [liveLastRefresh, setLiveLastRefresh] = useState(null);
   const [syncError, setSyncError] = useState(null);
+
+  // Adjust Time Entry modal state. `adjust` carries the row being edited
+  // (or null for create-mode), plus form fields + saving/error flags.
+  const [adjust, setAdjust] = useState(null);
+  const [adjustSaving, setAdjustSaving] = useState(false);
+  const [adjustError, setAdjustError] = useState(null);
+  const [adjustConfirmDelete, setAdjustConfirmDelete] = useState(false);
 
   const entries = useMemo(() => pairClockEvents(rawEntries, projectsMap), [rawEntries, projectsMap]);
   const liveEntries = useMemo(
@@ -2868,6 +2882,26 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return () => { cancelled = true; };
   }, [isConfigured]);
 
+  // Pull people once so the Add Entry form can pick a person by name.
+  useEffect(() => {
+    if (!isConfigured) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await api.proxy.jibbleGet('/People?$top=500', 'workspace');
+        if (cancelled) return;
+        const people = (data?.value || [])
+          .map(p => ({ id: p.id, fullName: p.fullName || p.name || p.email || p.id }))
+          .filter(p => p.id && !isJibbleExcluded({ person: { fullName: p.fullName } }))
+          .sort((a, b) => a.fullName.localeCompare(b.fullName));
+        setPeopleList(people);
+      } catch {
+        // Quiet — Add Entry just falls back to the people we've already seen in entries.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isConfigured]);
+
   const fetchLive = useCallback(async () => {
     if (!isConfigured) return;
     try {
@@ -2913,6 +2947,192 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   // Builders Warehouse isn't a tracked centre — strip from the By Centre rollup.
   const isBuildersWarehouse = (centre) => /builders\s*warehouse/i.test(String(centre || ''));
 
+  // --- Adjust Time Entry helpers ----------------------------------
+  // Convert ISO (UTC) datetime to the local-tz string a <input type="datetime-local">
+  // expects: YYYY-MM-DDTHH:mm. We strip seconds and timezone — Jibble's
+  // resolution is per-minute, and the form is implicitly in the user's local tz.
+  const isoToLocalInput = (iso) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  // Inverse: a local-tz YYYY-MM-DDTHH:mm string is parsed by Date() as local
+  // and serialized as UTC ISO -- which is what Jibble's /TimeEntries expects.
+  const localInputToIso = (local) => {
+    if (!local) return null;
+    const d = new Date(local);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
+  };
+
+  // People list used by the Add Entry person picker. Prefer the live Jibble
+  // /People pull; fall back to people we've already seen in the entry set.
+  const peopleForPicker = useMemo(() => {
+    if (peopleList.length > 0) return peopleList;
+    const seen = new Map();
+    rawEntries.forEach(e => {
+      const id = e.person?.id || e.personId;
+      const fullName = e.person?.fullName || e.personName;
+      if (id && fullName && !seen.has(id)) seen.set(id, { id, fullName });
+    });
+    return Array.from(seen.values()).sort((a, b) => a.fullName.localeCompare(b.fullName));
+  }, [peopleList, rawEntries]);
+
+  const projectsForPicker = useMemo(() => Object.entries(projectsMap)
+    .map(([id, name]) => ({ id, name }))
+    .sort((a, b) => a.name.localeCompare(b.name)), [projectsMap]);
+
+  const openAdjustModal = (row) => {
+    setAdjustError(null);
+    setAdjustConfirmDelete(false);
+    if (row) {
+      // Edit mode
+      setAdjust({
+        mode: 'edit',
+        row,
+        form: {
+          personId: row.personId || '',
+          in: isoToLocalInput(row.inIso),
+          out: isoToLocalInput(row.outIso),
+          projectId: row.projectId || '',
+        },
+      });
+    } else {
+      // Create mode — default to today + 08:00→17:00
+      const today = todayISO();
+      setAdjust({
+        mode: 'create',
+        row: null,
+        form: {
+          personId: peopleForPicker[0]?.id || '',
+          in: `${today}T08:00`,
+          out: `${today}T17:00`,
+          projectId: '',
+        },
+      });
+    }
+  };
+  const closeAdjustModal = () => {
+    setAdjust(null);
+    setAdjustError(null);
+    setAdjustConfirmDelete(false);
+  };
+  const updateAdjustForm = (field, value) => {
+    setAdjust(prev => prev ? { ...prev, form: { ...prev.form, [field]: value } } : prev);
+  };
+
+  const saveAdjust = async () => {
+    if (!adjust) return;
+    setAdjustSaving(true);
+    setAdjustError(null);
+    try {
+      const { mode, row, form } = adjust;
+      const inIso = localInputToIso(form.in);
+      const outIso = localInputToIso(form.out);
+      if (!form.personId) throw new Error('Please pick a person');
+      if (!inIso) throw new Error('Clock-in time is required');
+      if (outIso && inIso && new Date(outIso) <= new Date(inIso)) {
+        throw new Error('Clock-out must be after clock-in');
+      }
+
+      const projectIdOrNull = form.projectId || null;
+
+      if (mode === 'create') {
+        await api.proxy.jibbleWrite({
+          method: 'POST', path: '/TimeEntries', svc: 'time',
+          body: { personId: form.personId, type: 'In', time: inIso, projectId: projectIdOrNull },
+        });
+        if (outIso) {
+          await api.proxy.jibbleWrite({
+            method: 'POST', path: '/TimeEntries', svc: 'time',
+            body: { personId: form.personId, type: 'Out', time: outIso, projectId: projectIdOrNull },
+          });
+        }
+      } else {
+        // Edit mode -- diff each field and PATCH only what changed.
+        const originalIn = isoToLocalInput(row.inIso);
+        const originalOut = isoToLocalInput(row.outIso);
+        const originalProject = row.projectId || '';
+
+        if (form.in !== originalIn && row.inEventId) {
+          await api.proxy.jibbleWrite({
+            method: 'PATCH', path: `/TimeEntries/${row.inEventId}`, svc: 'time',
+            body: { time: inIso },
+          });
+        }
+        if (form.out !== originalOut) {
+          if (row.outEventId) {
+            if (outIso) {
+              await api.proxy.jibbleWrite({
+                method: 'PATCH', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
+                body: { time: outIso },
+              });
+            } else {
+              await api.proxy.jibbleWrite({
+                method: 'DELETE', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
+              });
+            }
+          } else if (outIso) {
+            await api.proxy.jibbleWrite({
+              method: 'POST', path: '/TimeEntries', svc: 'time',
+              body: { personId: row.personId, type: 'Out', time: outIso, projectId: projectIdOrNull },
+            });
+          }
+        }
+        if (form.projectId !== originalProject) {
+          if (row.inEventId) {
+            await api.proxy.jibbleWrite({
+              method: 'PATCH', path: `/TimeEntries/${row.inEventId}`, svc: 'time',
+              body: { projectId: projectIdOrNull },
+            });
+          }
+          if (row.outEventId) {
+            await api.proxy.jibbleWrite({
+              method: 'PATCH', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
+              body: { projectId: projectIdOrNull },
+            });
+          }
+        }
+      }
+
+      showToast(mode === 'create' ? 'Time entry added' : 'Time entry updated', 'success');
+      closeAdjustModal();
+      fetchEntries();
+    } catch (err) {
+      setAdjustError(err.message || 'Save failed');
+    } finally {
+      setAdjustSaving(false);
+    }
+  };
+
+  const deleteAdjust = async () => {
+    if (!adjust || adjust.mode !== 'edit') return;
+    const { row } = adjust;
+    setAdjustSaving(true);
+    setAdjustError(null);
+    try {
+      if (row.inEventId) {
+        await api.proxy.jibbleWrite({
+          method: 'DELETE', path: `/TimeEntries/${row.inEventId}`, svc: 'time',
+        });
+      }
+      if (row.outEventId) {
+        await api.proxy.jibbleWrite({
+          method: 'DELETE', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
+        });
+      }
+      showToast('Time entry deleted', 'success');
+      closeAdjustModal();
+      fetchEntries();
+    } catch (err) {
+      setAdjustError(err.message || 'Delete failed');
+    } finally {
+      setAdjustSaving(false);
+    }
+  };
+
   // Empty state when Jibble isn't configured
   if (!isConfigured) {
     return (
@@ -2947,6 +3167,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           </p>
         </div>
         <div className="flex gap-2">
+          <Button variant="primary" icon={Plus} onClick={() => openAdjustModal(null)}>Add Entry</Button>
           <Button variant="ghost" icon={RefreshCw} onClick={fetchEntries} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </Button>
@@ -3294,6 +3515,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                         <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
                         <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
                         <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
+                        <th className="px-2 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '60px' }}>Adjust</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3303,17 +3525,28 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                           <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
                           <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
                           <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+                          <td className="px-2 py-2 text-center" style={{ border: `1px solid ${brand.border}` }}>
+                            <button
+                              onClick={() => openAdjustModal(row)}
+                              className="p-1.5 rounded btn-press transition-all hover:bg-black hover:bg-opacity-5"
+                              title="Edit entry"
+                            >
+                              <Edit2 size={14} style={{ color: brand.gold }} />
+                            </button>
+                          </td>
                         </tr>
                       ))}
                       <tr style={{ backgroundColor: '#f8f8f8' }}>
                         <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
                         <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
                         <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
+                        <td style={{ border: `1px solid ${brand.border}` }} />
                       </tr>
                       <tr style={{ backgroundColor: '#f8f8f8' }}>
                         <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
                         <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
                         <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
+                        <td style={{ border: `1px solid ${brand.border}` }} />
                       </tr>
                     </tbody>
                   </table>
@@ -3350,6 +3583,133 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         );
       })()}
 
+      {/* Adjust Time Entry modal (edit + create + delete) */}
+      <Modal
+        open={!!adjust}
+        onClose={adjustSaving ? () => {} : closeAdjustModal}
+        title={adjust?.mode === 'create' ? 'Add Time Entry' : 'Adjust Time Entry'}
+        size="md"
+      >
+        {adjust && (() => {
+          const isCreate = adjust.mode === 'create';
+          const row = adjust.row;
+          const personName = isCreate
+            ? (peopleForPicker.find(p => p.id === adjust.form.personId)?.fullName || '—')
+            : (row?.employee || '—');
+          return (
+            <div className="space-y-4">
+              {/* Person picker (create) or read-only display (edit) */}
+              <div>
+                <label className="block text-xs font-medium tracking-wider uppercase mb-1.5" style={{ color: brand.textMuted }}>
+                  Person
+                </label>
+                {isCreate ? (
+                  <Select
+                    value={adjust.form.personId}
+                    onChange={(e) => updateAdjustForm('personId', e.target.value)}
+                    disabled={adjustSaving}
+                  >
+                    <option value="">— Select person —</option>
+                    {peopleForPicker.map(p => (
+                      <option key={p.id} value={p.id}>{p.fullName}</option>
+                    ))}
+                  </Select>
+                ) : (
+                  <p className="text-sm py-2" style={{ color: brand.text }}>{personName}</p>
+                )}
+              </div>
+
+              {/* Clock-in / Clock-out */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium tracking-wider uppercase mb-1.5" style={{ color: brand.textMuted }}>
+                    Clock In
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={adjust.form.in}
+                    onChange={(e) => updateAdjustForm('in', e.target.value)}
+                    disabled={adjustSaving}
+                    className="w-full px-3 py-2 text-sm rounded outline-none"
+                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium tracking-wider uppercase mb-1.5" style={{ color: brand.textMuted }}>
+                    Clock Out
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={adjust.form.out}
+                    onChange={(e) => updateAdjustForm('out', e.target.value)}
+                    disabled={adjustSaving}
+                    className="w-full px-3 py-2 text-sm rounded outline-none"
+                    style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text }}
+                  />
+                  {!isCreate && !row?.outEventId && (
+                    <p className="text-[11px] mt-1" style={{ color: brand.textMuted }}>
+                      Currently clocked in. Filling this clocks the person out.
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* Project picker */}
+              <div>
+                <label className="block text-xs font-medium tracking-wider uppercase mb-1.5" style={{ color: brand.textMuted }}>
+                  Project / Location
+                </label>
+                <Select
+                  value={adjust.form.projectId}
+                  onChange={(e) => updateAdjustForm('projectId', e.target.value)}
+                  disabled={adjustSaving}
+                >
+                  <option value="">— No project —</option>
+                  {projectsForPicker.map(p => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </Select>
+              </div>
+
+              {/* Error banner */}
+              {adjustError && (
+                <div className="p-3 rounded text-xs" style={{ backgroundColor: brand.dangerLight, color: brand.danger, border: `1px solid ${brand.danger}` }}>
+                  {adjustError}
+                </div>
+              )}
+
+              {/* Footer actions */}
+              <div className="flex items-center justify-between gap-2 pt-2 flex-wrap" style={{ borderTop: `1px solid ${brand.border}` }}>
+                <div>
+                  {!isCreate && (
+                    adjustConfirmDelete ? (
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs" style={{ color: brand.danger }}>Delete this entry?</span>
+                        <Button variant="ghost" size="sm" onClick={() => setAdjustConfirmDelete(false)} disabled={adjustSaving}>
+                          Cancel
+                        </Button>
+                        <Button variant="primary" size="sm" icon={Trash2} onClick={deleteAdjust} disabled={adjustSaving}>
+                          {adjustSaving ? 'Deleting…' : 'Confirm Delete'}
+                        </Button>
+                      </div>
+                    ) : (
+                      <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setAdjustConfirmDelete(true)} disabled={adjustSaving}>
+                        Delete
+                      </Button>
+                    )
+                  )}
+                </div>
+                <div className="flex gap-2 ml-auto">
+                  <Button variant="ghost" onClick={closeAdjustModal} disabled={adjustSaving}>Cancel</Button>
+                  <Button variant="primary" icon={Save} onClick={saveAdjust} disabled={adjustSaving}>
+                    {adjustSaving ? 'Saving…' : (isCreate ? 'Add Entry' : 'Save Changes')}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
     </div>
   );
 };

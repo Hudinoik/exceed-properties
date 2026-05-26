@@ -216,6 +216,12 @@ export const proxy = {
   async jibbleGet(path, svc = 'workspace') {
     return request(`/api/proxy/jibble/get?path=${encodeURIComponent(path)}&svc=${encodeURIComponent(svc)}`);
   },
+  async jibbleWrite({ method, path, body = {}, svc = 'time' }) {
+    return request('/api/proxy/jibble/write', {
+      method: 'POST',
+      body: { method, path, body, svc },
+    });
+  },
 };
 
 // --- Lease packs (the end-to-end leasing workflow) ---

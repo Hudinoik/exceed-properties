@@ -273,4 +273,47 @@ router.get('/jibble/get', async (req, res) => {
   }
 });
 
+// Jibble write forwarder. Used by the Time Tracking page's "Adjust" UI to
+// create / update / delete time entries. Restricted to TimeEntries paths so
+// we don't open up the whole Jibble surface area through the proxy.
+router.post('/jibble/write', async (req, res) => {
+  const { method = 'POST', path: targetPath = '/TimeEntries', svc = 'time', body = {} } = req.body || {};
+  const upperMethod = String(method).toUpperCase();
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(upperMethod)) {
+    return res.status(400).json({ error: `Method ${upperMethod} not allowed` });
+  }
+  if (
+    typeof targetPath !== 'string' ||
+    !targetPath.startsWith('/TimeEntries') ||
+    targetPath.includes('..') ||
+    /[\x00-\x1f]/.test(targetPath)
+  ) {
+    return res.status(400).json({ error: 'Invalid path (must start with /TimeEntries)' });
+  }
+  const base = svc === 'workspace' ? JIBBLE_API : JIBBLE_TIME;
+  try {
+    const accessToken = await ensureJibbleToken(req.session.userId);
+    const hasBody = upperMethod !== 'DELETE' && body && Object.keys(body).length > 0;
+    const upstream = await fetch(`${base}${targetPath}`, {
+      method: upperMethod,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+        ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: hasBody ? JSON.stringify(body) : undefined,
+    });
+    const text = await upstream.text();
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'proxy.jibble.write',
+      details: { method: upperMethod, path: targetPath, status: upstream.status },
+      ip: req.ip,
+    });
+    res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(text || '{}');
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 export default router;
