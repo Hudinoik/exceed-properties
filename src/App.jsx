@@ -2632,6 +2632,18 @@ const PropertiesSection = ({ properties, setProperties, tenancies = [], setTenan
 // against Jibble's `person.fullName`. Add/remove names here as needed.
 const JIBBLE_EXCLUDED_NAMES = ['zelda', 'john', 'yehuda noik'];
 
+// Whitelist of people shown in the Reporting tab's person picker.
+// Case-insensitive substring match against the full name. Anyone not
+// in this list is hidden -- so contractors, casuals, ex-staff still
+// in Jibble don't clutter the picker. Order in the list controls
+// nothing (the picker sorts A->Z).
+const JIBBLE_REPORTING_NAMES = ['don', 'giovanni', 'peter', 'shannon', 'terron'];
+const isJibbleReportablePerson = (fullName) => {
+  const name = String(fullName || '').toLowerCase().trim();
+  if (!name) return false;
+  return JIBBLE_REPORTING_NAMES.some(allowed => name.includes(allowed));
+};
+
 const isJibbleExcluded = (rawEntry) => {
   const name = (rawEntry?.person?.fullName || rawEntry?.personName || '').toLowerCase().trim();
   if (!name) return false;
@@ -3607,8 +3619,8 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         }
 
         // Person picker -- union of peopleForPicker + anyone seen in the last 7 days,
-        // sorted A->Z. peopleForPicker is built lower in the component scope, but
-        // we redefine here so this block only depends on report7Paired + peopleList.
+        // filtered against the JIBBLE_REPORTING_NAMES whitelist so the
+        // picker only shows the team members we care about, sorted A->Z.
         const peopleSeenInWindow = new Map();
         report7Paired.forEach(p => {
           if (p.personId && p.employee && !peopleSeenInWindow.has(p.personId)) {
@@ -3618,7 +3630,9 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         const reportPeople = [
           ...peopleList,
           ...Array.from(peopleSeenInWindow.values()).filter(p => !peopleList.some(x => x.id === p.id)),
-        ].sort((a, b) => a.fullName.localeCompare(b.fullName));
+        ]
+          .filter(p => isJibbleReportablePerson(p.fullName))
+          .sort((a, b) => a.fullName.localeCompare(b.fullName));
 
         const selectedPerson = reportPeople.find(p => p.id === reportPersonId) || null;
         const dayRows = (selectedPerson && reportDate)
