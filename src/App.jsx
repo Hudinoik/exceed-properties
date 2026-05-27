@@ -10709,12 +10709,20 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     }
     return stored;
   };
-  const DEFAULT_PI_SCOPES = 'read-inspections read-properties read-clients read-staff read-templates read-contacts';
-  // PI silently ignores the '*' wildcard — every endpoint then 403s with
-  // "Invalid scope(s) provided." If a previous build stored '*', swap it
-  // for the explicit-name default so the next Connect issues a real token.
+  // Scope handling. PI uses Laravel Passport, and Passport rejects the WHOLE
+  // request with `invalid_scope` if any scope name isn't registered -- it
+  // doesn't silently drop unknown values. So the safe default is to send NO
+  // scope at all, letting PI issue whichever scopes the OAuth app was set up
+  // with by default. Old builds saved either '*' or a `read-foo read-bar`
+  // string that PI doesn't recognize; rewrite those to empty so the next
+  // Connect actually reaches PI's consent page.
+  const KNOWN_BAD_SCOPES = new Set([
+    '*',
+    'read-inspections read-properties read-clients read-staff read-templates read-contacts',
+  ]);
   const resolveScope = (stored) => {
-    if (!stored || stored === '*') return DEFAULT_PI_SCOPES;
+    if (!stored) return '';
+    if (KNOWN_BAD_SCOPES.has(stored.trim())) return '';
     return stored;
   };
   const [form, setForm] = useState({
@@ -10724,12 +10732,6 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
     redirectUri: pi.redirectUri || propertyInspectAPI.defaultRedirectUri,
     clientId: pi.clientId || '',
     clientSecret: pi.clientSecret || '',
-    // PI silently ignores '*' (Passport wildcard), so we instead ask for
-    // a space-separated list of explicit read-* scopes that match the
-    // resources in PI's API docs sidebar (Clients, Properties, etc.).
-    // PI's authorize page accepts whichever it recognizes and drops the
-    // unknown ones. If the user finds the canonical names in PI's docs,
-    // they can override this list in the Scope field.
     scope: resolveScope(pi.scope),
   });
   const [showSecret, setShowSecret] = useState(false);
@@ -11335,8 +11337,8 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                 <Field label="Redirect URI" required hint={pi.connected ? "Disconnect to edit — must still match a Redirect URL registered in your PI API app" : "MUST exactly match a Redirect URL registered in your PI API app"}>
                   <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={propertyInspectAPI.defaultRedirectUri} disabled={pi.connected} />
                 </Field>
-                <Field label="OAuth Scope" hint={pi.connected ? "Disconnect to edit. '*' = all scopes (Passport wildcard)" : "'*' = all scopes the app has been granted (Passport wildcard). If PI rejects, try a specific name like 'inspections.read' or leave blank."}>
-                  <Input value={form.scope} onChange={(e) => updateField('scope', e.target.value)} placeholder="*" disabled={pi.connected} />
+                <Field label="OAuth Scope" hint={pi.connected ? "Disconnect to edit." : "Leave BLANK to use PI's default scopes (recommended). Only set a value if PI support has told you the exact scope names registered for your OAuth app -- any unknown scope makes PI reject the whole request with 'invalid_scope' before the consent page."}>
+                  <Input value={form.scope} onChange={(e) => updateField('scope', e.target.value)} placeholder="(leave blank)" disabled={pi.connected} />
                 </Field>
               </div>
             )}
@@ -11644,7 +11646,7 @@ ${Object.entries(diagResult.response.headers).map(([k, v]) => `${k}: ${v}`).join
             )}
             {!tokenClaims.scopes && !tokenClaims.scope && (
               <div className="p-3 rounded mb-3 text-xs" style={{ backgroundColor: brand.warningLight, color: brand.warning }}>
-                <strong>No scopes claim found.</strong> PI stripped your requested scope — try a different value in the Scope field.
+                <strong>No scopes claim found.</strong> The token has no scope claim, so PI's data endpoints will reject it. The fix is on PI's side -- your OAuth app needs default scopes registered. Ask PI support to enable scopes for your app.
               </div>
             )}
             <pre className="p-3 rounded text-xs overflow-auto max-h-64" style={{ backgroundColor: brand.cream, color: brand.text, fontFamily: 'monospace' }}>
@@ -14342,8 +14344,8 @@ export default function ExceedProperties() {
     if (error) {
       const errDesc = url.searchParams.get('error_description') || '';
       const msg = error === 'invalid_scope'
-        ? `Property Inspect rejected the requested scope. ${errDesc} — try a different value in the Scope field.`
-        : `Property Inspect connection cancelled: ${error}${errDesc ? ' — ' + errDesc : ''}`;
+        ? `Property Inspect rejected the requested scope. ${errDesc} -- clear the Scope field in Settings (leave it blank) so PI uses your app's default scopes, then Connect again.`
+        : `Property Inspect connection cancelled: ${error}${errDesc ? ' -- ' + errDesc : ''}`;
       showToast(msg, 'error');
       setIntegrations(prev => ({
         ...prev,
