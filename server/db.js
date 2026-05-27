@@ -181,6 +181,14 @@ export const secrets = {
     if (db.data.secrets.length !== before) await persist();
     return before - db.data.secrets.length;
   },
+  async deleteByKey(userId, integration, key) {
+    const before = db.data.secrets.length;
+    db.data.secrets = db.data.secrets.filter(
+      s => !(s.userId === userId && s.integration === integration && s.key === key),
+    );
+    if (db.data.secrets.length !== before) await persist();
+    return before - db.data.secrets.length;
+  },
 };
 
 // ----- Audit log --------------------------------------------------------

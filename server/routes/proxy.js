@@ -106,14 +106,101 @@ const isValidPIPath = (p) =>
   !p.startsWith('/oauth') &&
   !/[\x00-\x1f]/.test(p);
 
+// Refresh the PI access token if it has expired (or expires within 30s).
+// Returns the current/refreshed token, or null if no refresh is possible.
+// Persists refreshed tokens to the vault so the next request reuses them.
+const ensurePIToken = async (userId) => {
+  const cfg = readIntegration(userId, 'propertyInspect');
+  if (!cfg.accessToken) return { token: null, reason: 'no-token' };
+  const expiry = Number(cfg.tokenExpiry || 0);
+  // If the token still has more than 30s to live, reuse it.
+  if (expiry && Date.now() < expiry - 30 * 1000) {
+    return { token: cfg.accessToken, reason: 'cached' };
+  }
+  // Expired -- try the refresh_token flow.
+  if (!cfg.refreshToken || !cfg.clientId || !cfg.clientSecret) {
+    return { token: cfg.accessToken, reason: 'expired-no-refresh' };
+  }
+  const tokenUrl = cfg.tokenUrl || 'https://api.propertyinspect.com/oauth/token';
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: cfg.refreshToken,
+      client_id: cfg.clientId,
+      client_secret: cfg.clientSecret,
+    });
+    const r = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: body.toString(),
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      return { token: null, reason: `refresh-failed: HTTP ${r.status} ${text.slice(0, 200)}` };
+    }
+    const tokens = await r.json();
+    if (!tokens.access_token) return { token: null, reason: 'refresh-no-token' };
+    await writeSecret(userId, 'propertyInspect', 'accessToken', tokens.access_token);
+    if (tokens.refresh_token) await writeSecret(userId, 'propertyInspect', 'refreshToken', tokens.refresh_token);
+    const newExpiry = String(Date.now() + Math.max(60, (tokens.expires_in || 3600) - 30) * 1000);
+    await writeSecret(userId, 'propertyInspect', 'tokenExpiry', newExpiry);
+    return { token: tokens.access_token, reason: 'refreshed' };
+  } catch (err) {
+    return { token: null, reason: `refresh-error: ${err.message}` };
+  }
+};
+
+// Test connection: refresh-if-needed + hit /me (scope-less on Laravel
+// Passport). Returns enough info that the integration card can show
+// {connected: true, accountEmail, scopes?} or a precise error.
+router.post('/property-inspect/test', async (req, res) => {
+  const { token, reason } = await ensurePIToken(req.session.userId);
+  if (!token) {
+    return res.status(401).json({ ok: false, error: `No usable PI token (${reason}). Re-run Connect.` });
+  }
+  const cfg = readIntegration(req.session.userId, 'propertyInspect');
+  const base = cfg.baseUrl || 'https://api.propertyinspect.com';
+  try {
+    const upstream = await fetch(`${base}/me`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    const text = await upstream.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { /* keep raw */ }
+    if (!upstream.ok) {
+      const wwwAuth = upstream.headers.get('www-authenticate') || '';
+      return res.status(upstream.status).json({
+        ok: false,
+        error: body?.message || body?.error || `HTTP ${upstream.status}`,
+        wwwAuthenticate: wwwAuth || undefined,
+      });
+    }
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'proxy.pi.test', details: { ok: true, refreshReason: reason }, ip: req.ip,
+    });
+    res.json({
+      ok: true,
+      refreshReason: reason,
+      account: {
+        id: body?.id || body?.user?.id || null,
+        name: body?.name || body?.user?.name || null,
+        email: body?.email || body?.user?.email || null,
+      },
+    });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
 // Single-path GET forwarder. Path is sanitized to prevent access to
 // non-data endpoints (no `/oauth/*`, no traversal).
 router.get('/property-inspect/get', async (req, res) => {
-  const cfg = readIntegration(req.session.userId, 'propertyInspect');
-  if (!cfg.accessToken) {
-    return res.status(400).json({ error: 'No PI token available' });
+  const { token, reason } = await ensurePIToken(req.session.userId);
+  if (!token) {
+    return res.status(401).json({ error: `No usable PI token: ${reason}` });
   }
-  const token = cfg.accessToken;
+  const cfg = readIntegration(req.session.userId, 'propertyInspect');
   const targetPath = String(req.query.path || '/inspections');
   if (!isValidPIPath(targetPath)) {
     return res.status(400).json({ error: 'Invalid path' });
@@ -136,11 +223,11 @@ router.get('/property-inspect/get', async (req, res) => {
 // round-trips collapse into one, and the underlying PI calls run in
 // parallel server-side instead of being serialized by client awaits.
 router.post('/property-inspect/probe', async (req, res) => {
-  const cfg = readIntegration(req.session.userId, 'propertyInspect');
-  if (!cfg.accessToken) {
-    return res.status(400).json({ error: 'No PI token available' });
+  const { token, reason } = await ensurePIToken(req.session.userId);
+  if (!token) {
+    return res.status(401).json({ error: `No usable PI token: ${reason}` });
   }
-  const token = cfg.accessToken;
+  const cfg = readIntegration(req.session.userId, 'propertyInspect');
   const base = cfg.baseUrl || 'https://api.propertyinspect.com';
   const paths = Array.isArray(req.body?.paths) ? req.body.paths : [];
   if (paths.length === 0) return res.status(400).json({ error: 'paths[] required' });

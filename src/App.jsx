@@ -1426,7 +1426,10 @@ const defaultIntegrations = {
     connected: false,
     baseUrl: 'https://api.propertyinspect.com',
     tokenUrl: 'https://api.propertyinspect.com/oauth/token',
-    authorizeUrl: 'https://api.propertyinspect.com/oauth/authorize',
+    // PI's authorize page lives on the my.* host -- api.* returns JSON-only
+    // "Unauthenticated" for the same path. The integration card also auto-
+    // migrates anyone who still has the old api.* URL stored.
+    authorizeUrl: 'https://my.propertyinspect.com/oauth/authorize',
     redirectUri: '',
     clientId: '',
     clientSecret: '',
@@ -10732,6 +10735,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
   const [showSecret, setShowSecret] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [testResult, setTestResult] = useState(null);
+  const [testing, setTesting] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -11000,7 +11004,9 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       ...integrations,
       propertyInspect: {
         ...pi,
-        connected: true,
+        // Only mark connected when at least one endpoint actually returned
+        // 2xx -- otherwise the card claims success while everything 401s.
+        connected: successCount > 0 ? true : pi.connected,
         importedInspections: inspections,
         importedCount: inspections.length,
         endpointReport: report,
@@ -11008,7 +11014,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
         lastSyncStatus: successCount > 0 ? 'success' : 'error',
         lastSyncError: successCount > 0
           ? null
-          : `Every endpoint rejected the token. Most likely your PI OAuth app has no scopes assigned — needs to be enabled in your PI dev portal or via PI support.`,
+          : (probeError || `Every endpoint rejected the token. Most likely your PI OAuth app has no scopes assigned -- needs to be enabled in your PI dev portal or via PI support.`),
       },
     });
 
@@ -11025,6 +11031,49 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
       showToast('Live pull failed: every PI endpoint rejected the token. See report below.', 'error');
     }
     setFetching(false);
+  };
+
+  // Test Connection -- refreshes the access token if expired, then hits /me.
+  // Lightweight (scope-less on Laravel Passport) so it works even when the
+  // user's OAuth app has no scopes granted.
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await api.proxy.piTest();
+      setTestResult({
+        ok: true,
+        account: result.account,
+        refreshReason: result.refreshReason,
+      });
+      setIntegrations(prev => ({
+        ...prev,
+        propertyInspect: {
+          ...(prev.propertyInspect || {}),
+          connected: true,
+          lastSync: new Date().toISOString(),
+          lastSyncStatus: 'success',
+          lastSyncError: null,
+        },
+      }));
+      logAction(`Tested Property Inspect connection (${result.refreshReason})`);
+      showToast('Connected to Property Inspect', 'success');
+    } catch (err) {
+      const msg = err?.body?.error || err?.message || String(err);
+      setTestResult({ ok: false, error: msg });
+      setIntegrations(prev => ({
+        ...prev,
+        propertyInspect: {
+          ...(prev.propertyInspect || {}),
+          lastSync: new Date().toISOString(),
+          lastSyncStatus: 'error',
+          lastSyncError: msg,
+        },
+      }));
+      showToast(`Test failed: ${msg}`, 'error');
+    } finally {
+      setTesting(false);
+    }
   };
 
   // Run a single GET against PI and capture the exact request + response
@@ -11293,7 +11342,29 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
             )}
           </div>
 
-          {/* Pre-flight check failures (shown only when handleConnect refuses to redirect) */}
+          {/* Test result -- success (green) or failure (red). Set by either
+              handleConnect's pre-flight checks or by handleTest. */}
+          {testResult && testResult.ok && (
+            <div
+              className="p-3 rounded mb-4 text-xs flex items-start gap-2"
+              style={{ backgroundColor: brand.successLight, color: brand.success, border: `1px solid ${brand.success}` }}
+            >
+              <CheckCircle2 size={14} className="flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p><strong>Connection successful.</strong></p>
+                {testResult.account?.name || testResult.account?.email ? (
+                  <p className="mt-1" style={{ color: brand.text }}>
+                    Authenticated as {testResult.account.name || testResult.account.email}
+                    {testResult.refreshReason === 'refreshed' && ' (token refreshed)'}
+                  </p>
+                ) : (
+                  <p className="mt-1" style={{ color: brand.text }}>
+                    PI accepted the token. You can now Pull Inspections.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
           {testResult && !testResult.ok && (
             <div
               className="p-3 rounded mb-4 text-xs flex items-start gap-2"
@@ -11301,7 +11372,7 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
             >
               <AlertCircle size={14} className="flex-shrink-0 mt-0.5" />
               <div className="flex-1">
-                <p><strong>Can't start OAuth flow.</strong></p>
+                <p><strong>Connection failed.</strong></p>
                 <pre className="mt-1 whitespace-pre-wrap text-xs" style={{ fontFamily: 'inherit' }}>{testResult.error}</pre>
               </div>
             </div>
@@ -11438,6 +11509,16 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                 Re-Connect
               </Button>
             )}
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={CheckCircle2}
+              onClick={handleTest}
+              disabled={testing || dirty || !pi.connected}
+              title="Pings PI's /me endpoint -- works even with no scopes granted"
+            >
+              {testing ? 'Testing…' : 'Test Connection'}
+            </Button>
             <Button
               size="sm"
               variant="ghost"

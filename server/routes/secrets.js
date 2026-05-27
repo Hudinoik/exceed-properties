@@ -116,11 +116,10 @@ router.post('/:integration', async (req, res) => {
       });
     } else {
       if (value === '') {
-        // Empty sensitive value — delete the existing row.
-        const existing = secrets.byKey(req.session.userId, integration, key);
-        if (existing) {
-          await secrets.deleteByIntegration(req.session.userId, integration);
-        }
+        // Empty sensitive value -- delete ONLY that key's row.
+        // (Calling deleteByIntegration here used to nuke every credential
+        // for the integration -- including OAuth tokens -- on every save.)
+        await secrets.deleteByKey(req.session.userId, integration, key);
       } else {
         const { ciphertext, iv, authTag } = encrypt(value);
         await secrets.upsert({

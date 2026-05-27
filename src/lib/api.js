@@ -194,6 +194,9 @@ export const proxy = {
       body: { code },
     });
   },
+  async piTest() {
+    return request('/api/proxy/property-inspect/test', { method: 'POST', body: {} });
+  },
   async piGet(path) {
     return request(`/api/proxy/property-inspect/get?path=${encodeURIComponent(path)}`);
   },
