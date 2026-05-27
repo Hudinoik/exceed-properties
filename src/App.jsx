@@ -3093,17 +3093,28 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return { from: reportCustomFrom, to: reportCustomTo, kind: 'custom' };
   }, [reportGranularity, reportWeekStart, reportMonth, reportCustomFrom, reportCustomTo]);
 
+  // Loading + last-error state for the Reporting tab fetch. Surfaced in
+  // the UI so silent failures are visible.
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState(null);
+
   // Fetch the active Reporting tab range. Replaces the old hard-coded
   // 7-day-only fetch. Re-runs whenever reportRange changes.
   const fetchReport = useCallback(async () => {
     if (!isConfigured) return;
+    setReportLoading(true);
+    setReportError(null);
     try {
-      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(reportRange.from, reportRange.to, 5000), 'time');
+      // $top=1000 -- Jibble's OData implementation rejects very large
+      // values. 1000 covers ~3 months of entries for a small team.
+      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(reportRange.from, reportRange.to, 1000), 'time');
       const next = (data?.value || []).filter(e => !isJibbleExcluded(e));
       setReportEntries(next);
       jibbleCache.reportEntries = next;
-    } catch {
-      // Quiet -- the Reporting tab shows an empty state if this fails.
+    } catch (err) {
+      setReportError(err?.message || 'Failed to load reporting data');
+    } finally {
+      setReportLoading(false);
     }
   }, [isConfigured, reportRange.from, reportRange.to]);
 
@@ -3886,6 +3897,26 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                 </div>
               )}
             </Card>
+
+            {/* Loading / error banner */}
+            {reportLoading && (
+              <Card className="mb-4 p-3">
+                <p className="text-xs" style={{ color: brand.textMuted }}>Loading entries for {rangeLabel}...</p>
+              </Card>
+            )}
+            {reportError && (
+              <Card className="mb-4 p-3" style={{ backgroundColor: brand.dangerLight, borderColor: brand.danger }}>
+                <p className="text-xs font-semibold" style={{ color: brand.danger }}>Failed to load entries</p>
+                <p className="text-xs mt-1" style={{ color: brand.text }}>{reportError}</p>
+              </Card>
+            )}
+            {/* Small data counter so an empty body has a clear cause. */}
+            {!reportLoading && !reportError && (
+              <p className="text-[11px] mb-2" style={{ color: brand.textMuted }}>
+                Pulled {reportEntries.length} clock event{reportEntries.length === 1 ? '' : 's'} for {reportRange.from} to {reportRange.to}
+                {selectedPerson && ` -- ${personRows.length} row${personRows.length === 1 ? '' : 's'} for ${selectedPerson.fullName}`}
+              </p>
+            )}
 
             {/* Body */}
             {!selectedPerson ? (
