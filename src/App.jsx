@@ -2805,14 +2805,22 @@ const jibbleCache = {
   adjustments: [],
   dateRangeKey: null,
   fetchedAt: 0,
+  // 'unknown' | 'configured' | 'not_configured'. Persisted across mounts
+  // so navigating to Time Tracking after first load doesn't briefly show
+  // the "Connect Jibble first" screen while the vault check is in flight.
+  configStatus: 'unknown',
 };
 
 const TimeTrackingSection = ({ employees, showToast, integrations, setIntegrations, onNavigateToSettings }) => {
   const jibble = integrations?.jibble || {};
 
-  // Configured-ness now comes from the server vault — query on mount.
-  // The local integrations.jibble state only holds non-secret status flags.
-  const [isConfigured, setIsConfigured] = useState(false);
+  // Configured-ness comes from the server vault. Cached at module level
+  // so re-entering this section uses the cached verdict immediately
+  // instead of briefly flashing the "Connect Jibble first" screen.
+  // 'unknown' = never checked; render nothing until the first check
+  // resolves so the empty state can't flash on a configured user.
+  const [configStatus, setConfigStatus] = useState(jibbleCache.configStatus);
+  const isConfigured = configStatus === 'configured';
   useEffect(() => {
     let cancelled = false;
     api.secrets.get('jibble')
@@ -2820,9 +2828,17 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         if (cancelled) return;
         const hasClientId = rows.some(r => r.key === 'clientId' && r.hasValue);
         const hasSecret = rows.some(r => r.key === 'clientSecret' && r.hasValue);
-        setIsConfigured(hasClientId && hasSecret);
+        const next = hasClientId && hasSecret ? 'configured' : 'not_configured';
+        jibbleCache.configStatus = next;
+        setConfigStatus(next);
       })
-      .catch(() => { if (!cancelled) setIsConfigured(false); });
+      .catch(() => {
+        if (cancelled) return;
+        // Keep whatever the cache said -- a network blip shouldn't downgrade
+        // a known-configured user to the empty state. If we've never
+        // succeeded, leave configStatus at 'unknown' so the UI shows a
+        // neutral loading state rather than the empty CTA.
+      });
     return () => { cancelled = true; };
   }, []);
 
@@ -3400,8 +3416,23 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     }
   };
 
-  // Empty state when Jibble isn't configured
-  if (!isConfigured) {
+  // First-ever load: vault check hasn't resolved yet. Show a neutral
+  // loading shell instead of the "Connect Jibble first" CTA -- that CTA
+  // briefly flashed for users who actually had Jibble configured.
+  if (configStatus === 'unknown') {
+    return (
+      <div className="animate-fade-in-up">
+        <div className="mb-6">
+          <p className="text-xs tracking-[0.2em] uppercase mb-2" style={{ color: brand.gold }}>Time & Attendance</p>
+          <h1 className="text-3xl mb-1" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Time Tracking</h1>
+          <p className="text-sm" style={{ color: brand.textMuted }}>Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Empty state when Jibble actually isn't configured.
+  if (configStatus === 'not_configured') {
     return (
       <div className="animate-fade-in-up">
         <div className="mb-6">
