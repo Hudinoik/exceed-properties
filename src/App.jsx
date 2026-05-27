@@ -2799,7 +2799,7 @@ const JIBBLE_REFRESH_MS = 10 * 60 * 1000;
 const jibbleCache = {
   rawEntries: null,        // null = never loaded
   rawLiveEntries: [],
-  report7Entries: [],      // last 7 days, used by the Reporting tab
+  reportEntries: [],      // last 7 days, used by the Reporting tab
   projectsMap: {},
   peopleList: [],
   adjustments: [],
@@ -2836,11 +2836,31 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
 
   // Sub-page tabs inside Time Tracking.
   const [subPage, setSubPage] = useState('overview');
-  // Reporting tab picks: no person and today are the defaults. The 7-day
-  // chip row is rendered relative to today; the user clicks through to
-  // see what any one person worked any day in the last week.
+  // Reporting tab picks. Granularity drives which range picker is shown
+  // and what the body looks like (per-row for day, per-centre rollup for
+  // week/month/custom).
   const [reportPersonId, setReportPersonId] = useState('');
+  const [reportGranularity, setReportGranularity] = useState('day');
   const [reportDate, setReportDate] = useState(todayISO());
+  // Week picker: ISO of the Monday of the chosen week. Defaults to current week.
+  const [reportWeekStart, setReportWeekStart] = useState(() => {
+    const d = new Date();
+    const day = d.getDay() || 7;
+    if (day !== 1) d.setDate(d.getDate() - (day - 1));
+    return localDateISO(d);
+  });
+  // Month picker: ISO YYYY-MM-01 of the chosen month. Defaults to current.
+  const [reportMonth, setReportMonth] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
+  });
+  // Custom range picker.
+  const [reportCustomFrom, setReportCustomFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 13);
+    return localDateISO(d);
+  });
+  const [reportCustomTo, setReportCustomTo] = useState(todayISO());
 
   // Hydrate state from the module-level cache so navigating back to this
   // page shows the previously-loaded data immediately. fetchEntries() still
@@ -2848,7 +2868,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   // empty (cold start) -- otherwise it refreshes silently in the background.
   const [rawEntries, setRawEntries] = useState(jibbleCache.rawEntries || []);
   const [rawLiveEntries, setRawLiveEntries] = useState(jibbleCache.rawLiveEntries);
-  const [report7Entries, setReport7Entries] = useState(jibbleCache.report7Entries || []);
+  const [reportEntries, setReportEntries] = useState(jibbleCache.reportEntries || []);
   const [projectsMap, setProjectsMap] = useState(jibbleCache.projectsMap);
   const [peopleList, setPeopleList] = useState(jibbleCache.peopleList);
   const [adjustments, setAdjustments] = useState(jibbleCache.adjustments);
@@ -2863,14 +2883,20 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [adjustError, setAdjustError] = useState(null);
   const [adjustConfirmDelete, setAdjustConfirmDelete] = useState(false);
 
+  // History modal -- shows the audit-log entries for a single row when
+  // the user clicks its EDIT badge. { row, notes } shape (null = closed).
+  const [history, setHistory] = useState(null);
+  const openHistoryModal = (row, notes) => setHistory({ row, notes });
+  const closeHistoryModal = () => setHistory(null);
+
   const entries = useMemo(() => pairClockEvents(rawEntries, projectsMap), [rawEntries, projectsMap]);
   const liveEntries = useMemo(
     () => pairClockEvents(rawLiveEntries, projectsMap).filter(p => p.isOpen),
     [rawLiveEntries, projectsMap]
   );
-  const report7Paired = useMemo(
-    () => pairClockEvents(report7Entries, projectsMap),
-    [report7Entries, projectsMap]
+  const reportPaired = useMemo(
+    () => pairClockEvents(reportEntries, projectsMap),
+    [reportEntries, projectsMap]
   );
 
   // Map from a Jibble event id -> array of adjustments that reference it.
@@ -3042,31 +3068,52 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     }
   }, [isConfigured]);
 
-  // Fetch the last 7 days for the Reporting tab. Independent of the
-  // Overview tab's dateRange so the two views don't fight over the filter.
-  const fetch7Days = useCallback(async () => {
-    if (!isConfigured) return;
-    try {
-      const to = todayISO();
+  // Derive the active Reporting tab range (from / to / human label) from
+  // the granularity + picker state. The fetch + body render keys off this.
+  const reportRange = useMemo(() => {
+    if (reportGranularity === 'day') {
+      // For day view, fetch a week's worth so the day chips show data.
       const fromDate = new Date();
       fromDate.setDate(fromDate.getDate() - 6);
-      const from = localDateISO(fromDate);
-      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(from, to, 1000), 'time');
+      return { from: localDateISO(fromDate), to: todayISO(), kind: 'day' };
+    }
+    if (reportGranularity === 'week') {
+      const start = new Date(reportWeekStart + 'T00:00:00');
+      const end = new Date(start);
+      end.setDate(end.getDate() + 6);
+      return { from: localDateISO(start), to: localDateISO(end), kind: 'week' };
+    }
+    if (reportGranularity === 'month') {
+      const [y, m] = reportMonth.split('-').map(Number);
+      const start = new Date(y, m - 1, 1);
+      const end = new Date(y, m, 0); // last day of the month
+      return { from: localDateISO(start), to: localDateISO(end), kind: 'month' };
+    }
+    // custom
+    return { from: reportCustomFrom, to: reportCustomTo, kind: 'custom' };
+  }, [reportGranularity, reportWeekStart, reportMonth, reportCustomFrom, reportCustomTo]);
+
+  // Fetch the active Reporting tab range. Replaces the old hard-coded
+  // 7-day-only fetch. Re-runs whenever reportRange changes.
+  const fetchReport = useCallback(async () => {
+    if (!isConfigured) return;
+    try {
+      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(reportRange.from, reportRange.to, 5000), 'time');
       const next = (data?.value || []).filter(e => !isJibbleExcluded(e));
-      setReport7Entries(next);
-      jibbleCache.report7Entries = next;
+      setReportEntries(next);
+      jibbleCache.reportEntries = next;
     } catch {
       // Quiet -- the Reporting tab shows an empty state if this fails.
     }
-  }, [isConfigured]);
+  }, [isConfigured, reportRange.from, reportRange.to]);
 
-  // Mount + 10-minute background refresh for the 7-day Reporting set.
-  useEffect(() => { fetch7Days(); }, [fetch7Days]);
+  // Mount + range-change + 10-minute background refresh.
+  useEffect(() => { fetchReport(); }, [fetchReport]);
   useEffect(() => {
     if (!isConfigured) return undefined;
-    const id = setInterval(fetch7Days, JIBBLE_REFRESH_MS);
+    const id = setInterval(fetchReport, JIBBLE_REFRESH_MS);
     return () => clearInterval(id);
-  }, [isConfigured, fetch7Days]);
+  }, [isConfigured, fetchReport]);
 
   useEffect(() => {
     if (!isConfigured) return;
@@ -3292,7 +3339,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       showToast(mode === 'create' ? 'Time entry added' : 'Time entry updated', 'success');
       closeAdjustModal();
       fetchEntries();
-      fetch7Days();
+      fetchReport();
       refreshAdjustments();
     } catch (err) {
       setAdjustError(err.message || 'Save failed');
@@ -3333,7 +3380,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       showToast('Time entry deleted', 'success');
       closeAdjustModal();
       fetchEntries();
-      fetch7Days();
+      fetchReport();
       refreshAdjustments();
     } catch (err) {
       setAdjustError(err.message || 'Delete failed');
@@ -3377,7 +3424,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         </div>
         <div className="flex gap-2">
           <Button variant="primary" icon={Plus} onClick={() => openAdjustModal(null)}>Add Entry</Button>
-          <Button variant="ghost" icon={RefreshCw} onClick={() => { fetchEntries(); fetch7Days(); fetchLive(); refreshAdjustments(); }} disabled={loading}>
+          <Button variant="ghost" icon={RefreshCw} onClick={() => { fetchEntries(); fetchReport(); fetchLive(); refreshAdjustments(); }} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </Button>
           <Button variant="ghost" icon={ExternalLink} onClick={() => window.open('https://web.jibble.io', '_blank')}>Open Jibble</Button>
@@ -3598,31 +3645,15 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
 
       </>)}
 
-      {/* Reporting tab -- pick a person + a day from the last 7. */}
+      {/* Reporting tab -- pick a person + range. Granularity controls the
+          range picker AND the body shape: Day -> per-entry table,
+          Week/Month/Custom -> per-centre rollup. */}
       {subPage === 'reporting' && (() => {
         const TARGET_HOURS = 8;
 
-        // Build the last 7 calendar days, most recent first. localDateISO
-        // (not toISOString) so the key matches the user's local calendar
-        // day -- Jibble's belongsToDate is in the workspace's local day,
-        // not UTC.
-        const day7 = [];
-        for (let i = 0; i < 7; i++) {
-          const d = new Date();
-          d.setHours(0, 0, 0, 0);
-          d.setDate(d.getDate() - i);
-          day7.push({
-            iso: localDateISO(d),
-            weekday: d.toLocaleDateString('en-ZA', { weekday: 'short' }),
-            short: d.toLocaleDateString('en-ZA', { day: 'numeric', month: 'short' }),
-          });
-        }
-
-        // Person picker -- union of peopleForPicker + anyone seen in the last 7 days,
-        // filtered against the JIBBLE_REPORTING_NAMES whitelist so the
-        // picker only shows the team members we care about, sorted A->Z.
+        // ---- Person picker source ----
         const peopleSeenInWindow = new Map();
-        report7Paired.forEach(p => {
+        reportPaired.forEach(p => {
           if (p.personId && p.employee && !peopleSeenInWindow.has(p.personId)) {
             peopleSeenInWindow.set(p.personId, { id: p.personId, fullName: p.employee });
           }
@@ -3633,51 +3664,200 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         ]
           .filter(p => isJibbleReportablePerson(p.fullName))
           .sort((a, b) => a.fullName.localeCompare(b.fullName));
-
         const selectedPerson = reportPeople.find(p => p.id === reportPersonId) || null;
-        const dayRows = (selectedPerson && reportDate)
-          ? report7Paired
-              .filter(r => r.personId === selectedPerson.id && r.date === reportDate)
+
+        // ---- Range picker per granularity (also produces rangeLabel) ----
+        let rangePickerRow = null;
+        let rangeLabel = '';
+        if (reportGranularity === 'day') {
+          const day7 = [];
+          for (let i = 0; i < 7; i++) {
+            const d = new Date();
+            d.setHours(0, 0, 0, 0);
+            d.setDate(d.getDate() - i);
+            day7.push({
+              iso: localDateISO(d),
+              weekday: d.toLocaleDateString('en-ZA', { weekday: 'short' }),
+              short: d.toLocaleDateString('en-ZA', { day: 'numeric', month: 'short' }),
+            });
+          }
+          rangePickerRow = (
+            <div className="flex gap-1.5 flex-wrap">
+              {day7.map(d => (
+                <button
+                  key={d.iso}
+                  onClick={() => setReportDate(d.iso)}
+                  className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                  style={{
+                    backgroundColor: reportDate === d.iso ? brand.navy : 'transparent',
+                    color: reportDate === d.iso ? '#fff' : brand.text,
+                    border: `1px solid ${reportDate === d.iso ? brand.navy : brand.border}`,
+                  }}
+                >
+                  {d.weekday} {d.short}
+                </button>
+              ))}
+            </div>
+          );
+          const [yy, mm, dd] = reportDate.split('-').map(Number);
+          rangeLabel = new Date(yy, mm - 1, dd).toLocaleDateString('en-ZA', { weekday: 'long', day: 'numeric', month: 'long' });
+        } else if (reportGranularity === 'week') {
+          const weeks = [];
+          const cur = new Date();
+          const curDay = cur.getDay() || 7;
+          if (curDay !== 1) cur.setDate(cur.getDate() - (curDay - 1));
+          cur.setHours(0, 0, 0, 0);
+          for (let i = 0; i < 4; i++) {
+            const start = new Date(cur);
+            start.setDate(start.getDate() - i * 7);
+            const end = new Date(start);
+            end.setDate(end.getDate() + 6);
+            weeks.push({
+              iso: localDateISO(start),
+              label: i === 0 ? 'This week' : i === 1 ? 'Last week' : `${i} weeks ago`,
+              dates: `${start.toLocaleDateString('en-ZA', { day: 'numeric', month: 'short' })} - ${end.toLocaleDateString('en-ZA', { day: 'numeric', month: 'short' })}`,
+            });
+          }
+          rangePickerRow = (
+            <div className="flex gap-1.5 flex-wrap">
+              {weeks.map(w => (
+                <button
+                  key={w.iso}
+                  onClick={() => setReportWeekStart(w.iso)}
+                  className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all text-left"
+                  style={{
+                    backgroundColor: reportWeekStart === w.iso ? brand.navy : 'transparent',
+                    color: reportWeekStart === w.iso ? '#fff' : brand.text,
+                    border: `1px solid ${reportWeekStart === w.iso ? brand.navy : brand.border}`,
+                    minWidth: '140px',
+                  }}
+                >
+                  <div className="font-semibold">{w.label}</div>
+                  <div className="text-[10px] opacity-80">{w.dates}</div>
+                </button>
+              ))}
+            </div>
+          );
+          const start = new Date(reportWeekStart + 'T00:00:00');
+          const end = new Date(start); end.setDate(end.getDate() + 6);
+          rangeLabel = `Week of ${start.toLocaleDateString('en-ZA', { day: 'numeric', month: 'long' })} - ${end.toLocaleDateString('en-ZA', { day: 'numeric', month: 'long', year: 'numeric' })}`;
+        } else if (reportGranularity === 'month') {
+          const months = [];
+          const now = new Date();
+          for (let i = 0; i < 6; i++) {
+            const start = new Date(now.getFullYear(), now.getMonth() - i, 1);
+            months.push({
+              iso: localDateISO(start),
+              label: start.toLocaleDateString('en-ZA', { month: 'long', year: 'numeric' }),
+            });
+          }
+          rangePickerRow = (
+            <div className="flex gap-1.5 flex-wrap">
+              {months.map(m => (
+                <button
+                  key={m.iso}
+                  onClick={() => setReportMonth(m.iso)}
+                  className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                  style={{
+                    backgroundColor: reportMonth === m.iso ? brand.navy : 'transparent',
+                    color: reportMonth === m.iso ? '#fff' : brand.text,
+                    border: `1px solid ${reportMonth === m.iso ? brand.navy : brand.border}`,
+                  }}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          );
+          const [yy, mm] = reportMonth.split('-').map(Number);
+          rangeLabel = new Date(yy, mm - 1, 1).toLocaleDateString('en-ZA', { month: 'long', year: 'numeric' });
+        } else {
+          rangePickerRow = (
+            <div className="flex items-center gap-2 flex-wrap">
+              <input
+                type="date"
+                value={reportCustomFrom}
+                onChange={(e) => setReportCustomFrom(e.target.value)}
+                max={reportCustomTo}
+                className="px-2 py-1.5 text-xs rounded outline-none"
+                style={{ border: `1px solid ${brand.border}` }}
+              />
+              <span style={{ color: brand.textMuted }}>-</span>
+              <input
+                type="date"
+                value={reportCustomTo}
+                onChange={(e) => setReportCustomTo(e.target.value)}
+                min={reportCustomFrom}
+                max={todayISO()}
+                className="px-2 py-1.5 text-xs rounded outline-none"
+                style={{ border: `1px solid ${brand.border}` }}
+              />
+            </div>
+          );
+          rangeLabel = `${reportCustomFrom} to ${reportCustomTo}`;
+        }
+
+        // ---- Body data ----
+        const inRange = (dateISO) => dateISO >= reportRange.from && dateISO <= reportRange.to;
+        const personRows = selectedPerson
+          ? reportPaired
+              .filter(r => r.personId === selectedPerson.id && r.date && inRange(r.date))
               .sort((a, b) => {
+                if (a.date !== b.date) return a.date.localeCompare(b.date);
                 const ai = a.inIso ? new Date(a.inIso).getTime() : 0;
                 const bi = b.inIso ? new Date(b.inIso).getTime() : 0;
                 return ai - bi;
               })
           : [];
-        const total = dayRows.reduce((s, r) => s + (r.hours || 0), 0);
-        const balance = TARGET_HOURS - total;
-        const selectedDayLabel = (() => {
-          if (!reportDate) return '';
-          // Parse reportDate ("YYYY-MM-DD") as LOCAL midnight, not UTC, so
-          // the label stays consistent with the chip the user clicked.
-          // `new Date("2026-05-27")` alone parses as UTC midnight and
-          // shifts to the previous day in TZs west of GMT.
-          const [y, m, dd] = reportDate.split('-').map(Number);
-          const d = new Date(y, m - 1, dd);
-          return d.toLocaleDateString('en-ZA', { weekday: 'long', day: 'numeric', month: 'long' });
-        })();
+
+        // Day view: single-day per-entry table.
+        const dayRows = (reportGranularity === 'day')
+          ? personRows.filter(r => r.date === reportDate)
+          : [];
+        const dayTotal = dayRows.reduce((s, r) => s + (r.hours || 0), 0);
+        const dayBalance = TARGET_HOURS - dayTotal;
+
+        // Week/Month/Custom view: per-centre rollup.
+        const visitsByCentre = new Map();
+        personRows.forEach(r => {
+          const centre = r.location || '-';
+          const prev = visitsByCentre.get(centre) || { centre, visits: 0, hours: 0 };
+          prev.visits += 1;
+          prev.hours += r.hours || 0;
+          visitsByCentre.set(centre, prev);
+        });
+        const rollupRows = Array.from(visitsByCentre.values())
+          .sort((a, b) => b.hours - a.hours || b.visits - a.visits || a.centre.localeCompare(b.centre));
+        const rollupTotalHours = rollupRows.reduce((s, r) => s + (r.hours || 0), 0);
+        const rollupTotalVisits = rollupRows.reduce((s, r) => s + r.visits, 0);
 
         return (
           <>
-            {/* Date row -- last 7 days */}
+            {/* Granularity + range picker */}
             <Card className="mb-4 p-4">
-              <p className="text-xs font-medium tracking-wider uppercase mb-2" style={{ color: brand.textMuted }}>Day</p>
-              <div className="flex gap-1.5 flex-wrap">
-                {day7.map(d => (
+              <div className="flex items-center gap-2 flex-wrap mb-3">
+                <p className="text-xs font-medium tracking-wider uppercase" style={{ color: brand.textMuted }}>View</p>
+                {[
+                  { key: 'day', label: 'Day' },
+                  { key: 'week', label: 'Week' },
+                  { key: 'month', label: 'Month' },
+                  { key: 'custom', label: 'Custom' },
+                ].map(g => (
                   <button
-                    key={d.iso}
-                    onClick={() => setReportDate(d.iso)}
+                    key={g.key}
+                    onClick={() => setReportGranularity(g.key)}
                     className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
                     style={{
-                      backgroundColor: reportDate === d.iso ? brand.navy : 'transparent',
-                      color: reportDate === d.iso ? '#fff' : brand.text,
-                      border: `1px solid ${reportDate === d.iso ? brand.navy : brand.border}`,
+                      backgroundColor: reportGranularity === g.key ? brand.gold : 'transparent',
+                      color: reportGranularity === g.key ? '#fff' : brand.text,
+                      border: `1px solid ${reportGranularity === g.key ? brand.gold : brand.border}`,
                     }}
                   >
-                    {d.weekday} {d.short}
+                    {g.label}
                   </button>
                 ))}
               </div>
+              {rangePickerRow}
             </Card>
 
             {/* Person picker */}
@@ -3707,88 +3887,130 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
               )}
             </Card>
 
-            {/* Daily report body */}
+            {/* Body */}
             {!selectedPerson ? (
               <Card className="p-8">
                 <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
-                  Pick a person above to see their work for {selectedDayLabel}.
+                  Pick a person above to see their work for {rangeLabel}.
                 </p>
               </Card>
-            ) : dayRows.length === 0 ? (
-              <Card className="p-8">
-                <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
-                  {selectedPerson.fullName} has no clock events on {selectedDayLabel}.
-                </p>
-                <div className="flex justify-center mt-3">
-                  <Button variant="ghost" size="sm" icon={Plus} onClick={() => openAdjustModal(null, { personId: selectedPerson.id, date: reportDate })}>
-                    Add Entry for this Day
-                  </Button>
-                </div>
-              </Card>
-            ) : (
-              <Card className="p-5">
-                <h3 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
-                  {selectedPerson.fullName} -- Daily Work Report ({selectedDayLabel})
-                </h3>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
-                    <thead>
-                      <tr style={{ backgroundColor: brand.navy }}>
-                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
-                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
-                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
-                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
-                        <th className="px-2 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '90px' }}>Adjust</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {dayRows.map((row, idx) => {
-                        const rowNotes = rowAdjustments(row);
-                        return (
-                          <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
-                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
-                            <td className="px-2 py-2 text-center" style={{ border: `1px solid ${brand.border}` }}>
-                              <div className="flex items-center justify-center gap-1">
-                                {rowNotes.length > 0 && (
-                                  <span
-                                    title={rowNotes.map(n => `${new Date(n.createdAt).toLocaleString('en-ZA')} -- ${n.userEmail || 'user'}: ${n.note}`).join('\n\n')}
-                                    className="text-[10px] font-semibold rounded px-1.5 py-0.5"
-                                    style={{ backgroundColor: brand.warningLight, color: brand.warning, border: `1px solid ${brand.warning}` }}
+            ) : reportGranularity === 'day' ? (
+              dayRows.length === 0 ? (
+                <Card className="p-8">
+                  <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                    {selectedPerson.fullName} has no clock events on {rangeLabel}.
+                  </p>
+                  <div className="flex justify-center mt-3">
+                    <Button variant="ghost" size="sm" icon={Plus} onClick={() => openAdjustModal(null, { personId: selectedPerson.id, date: reportDate })}>
+                      Add Entry for this Day
+                    </Button>
+                  </div>
+                </Card>
+              ) : (
+                <Card className="p-5">
+                  <h3 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                    {selectedPerson.fullName} -- Daily Work Report ({rangeLabel})
+                  </h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr style={{ backgroundColor: brand.navy }}>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
+                          <th className="px-2 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '100px' }}>Adjust</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {dayRows.map((row, idx) => {
+                          const rowNotes = rowAdjustments(row);
+                          return (
+                            <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
+                              <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+                              <td className="px-2 py-2 text-center" style={{ border: `1px solid ${brand.border}` }}>
+                                <div className="flex items-center justify-center gap-1">
+                                  {rowNotes.length > 0 && (
+                                    <button
+                                      onClick={() => openHistoryModal(row, rowNotes)}
+                                      className="text-[10px] font-semibold rounded px-1.5 py-0.5 btn-press hover:opacity-80"
+                                      style={{ backgroundColor: brand.warningLight, color: brand.warning, border: `1px solid ${brand.warning}` }}
+                                      title="Click to see edit history"
+                                    >
+                                      EDIT x {rowNotes.length}
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => openAdjustModal(row)}
+                                    className="p-1.5 rounded btn-press transition-all hover:bg-black hover:bg-opacity-5"
+                                    title="Edit entry"
                                   >
-                                    EDIT × {rowNotes.length}
-                                  </span>
-                                )}
-                                <button
-                                  onClick={() => openAdjustModal(row)}
-                                  className="p-1.5 rounded btn-press transition-all hover:bg-black hover:bg-opacity-5"
-                                  title="Edit entry"
-                                >
-                                  <Edit2 size={14} style={{ color: brand.gold }} />
-                                </button>
-                              </div>
-                            </td>
+                                    <Edit2 size={14} style={{ color: brand.gold }} />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        <tr style={{ backgroundColor: '#f8f8f8' }}>
+                          <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(dayTotal)}</td>
+                          <td style={{ border: `1px solid ${brand.border}` }} />
+                        </tr>
+                        <tr style={{ backgroundColor: '#f8f8f8' }}>
+                          <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
+                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: dayBalance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(dayBalance)}</td>
+                          <td style={{ border: `1px solid ${brand.border}` }} />
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              )
+            ) : (
+              rollupRows.length === 0 ? (
+                <Card className="p-8">
+                  <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                    {selectedPerson.fullName} has no clock events in {rangeLabel}.
+                  </p>
+                </Card>
+              ) : (
+                <Card className="p-5">
+                  <h3 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                    {selectedPerson.fullName} -- {reportGranularity === 'week' ? 'Weekly' : reportGranularity === 'month' ? 'Monthly' : 'Custom'} Work Report ({rangeLabel})
+                  </h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
+                      <thead>
+                        <tr style={{ backgroundColor: brand.navy }}>
+                          <th className="px-4 py-2 text-left text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Property</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '120px' }}>Visits</th>
+                          <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '160px' }}>Total Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rollupRows.map((r, idx) => (
+                          <tr key={r.centre} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                            <td className="px-4 py-2" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{r.centre}</td>
+                            <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{r.visits}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.hours)}</td>
                           </tr>
-                        );
-                      })}
-                      <tr style={{ backgroundColor: '#f8f8f8' }}>
-                        <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
-                        <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
-                        <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(total)}</td>
-                        <td style={{ border: `1px solid ${brand.border}` }} />
-                      </tr>
-                      <tr style={{ backgroundColor: '#f8f8f8' }}>
-                        <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
-                        <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Balance ({TARGET_HOURS} - total):</td>
-                        <td className="px-4 py-2 text-center font-semibold" style={{ color: balance < 0 ? brand.success : brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(balance)}</td>
-                        <td style={{ border: `1px solid ${brand.border}` }} />
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </Card>
+                        ))}
+                        <tr style={{ backgroundColor: brand.cream }}>
+                          <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>Total</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>{rollupTotalVisits}</td>
+                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>{fmtHoursMin(rollupTotalHours)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              )
             )}
           </>
         );
@@ -3936,6 +4158,105 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                     {adjustSaving ? 'Saving…' : (isCreate ? 'Add Entry' : 'Save Changes')}
                   </Button>
                 </div>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      {/* Edit history modal -- shows every adjustment recorded against this
+          paired entry. Triggered by clicking the EDIT badge in the report. */}
+      <Modal
+        open={!!history}
+        onClose={closeHistoryModal}
+        title="Edit History"
+        size="md"
+      >
+        {history && (() => {
+          const sorted = [...(history.notes || [])].sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+          const row = history.row;
+          const fmtDiffTime = (v) => v ? new Date(v).toLocaleString('en-ZA', { hour12: false }) : '—';
+          return (
+            <div className="space-y-4">
+              {/* Header summary of the entry we're inspecting */}
+              <div className="p-3 rounded text-xs" style={{ backgroundColor: brand.cream, border: `1px solid ${brand.border}` }}>
+                <p style={{ color: brand.textMuted }}>
+                  <strong style={{ color: brand.text }}>{row.employee}</strong> at <strong style={{ color: brand.text }}>{row.location || '—'}</strong>
+                </p>
+                <p className="mt-1" style={{ color: brand.textMuted }}>
+                  {row.date} · {row.clockIn || '—'} → {row.clockOut || '—'} ({fmtHoursMin(row.hours)})
+                </p>
+                <p className="text-[10px] mt-1 font-mono" style={{ color: brand.textMuted, wordBreak: 'break-all' }}>
+                  in: {row.inEventId || '—'} · out: {row.outEventId || '—'}
+                </p>
+              </div>
+
+              {sorted.length === 0 ? (
+                <p className="text-sm italic text-center py-4" style={{ color: brand.textMuted }}>
+                  No edits recorded for this entry.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {sorted.map(n => {
+                    const actionBg = n.action === 'create' ? brand.successLight : n.action === 'delete' ? brand.dangerLight : brand.warningLight;
+                    const actionFg = n.action === 'create' ? brand.success : n.action === 'delete' ? brand.danger : brand.warning;
+                    return (
+                      <div key={n.id} className="p-3 rounded text-xs" style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}>
+                        <div className="flex items-center gap-2 flex-wrap mb-2">
+                          <span
+                            className="text-[10px] font-semibold uppercase tracking-wider rounded px-1.5 py-0.5"
+                            style={{ backgroundColor: actionBg, color: actionFg, border: `1px solid ${actionFg}` }}
+                          >
+                            {n.action}
+                          </span>
+                          <span style={{ color: brand.text }}>
+                            {new Date(n.createdAt).toLocaleString('en-ZA', { hour12: false })}
+                          </span>
+                          <span style={{ color: brand.textMuted }}>
+                            by {n.userEmail || 'unknown'}
+                          </span>
+                        </div>
+                        {n.diff && Object.keys(n.diff).length > 0 && (
+                          <div className="mb-2 grid grid-cols-1 gap-1" style={{ color: brand.text }}>
+                            {n.diff.in && (
+                              <div className="font-mono text-[11px]">
+                                <span style={{ color: brand.textMuted }}>In: </span>
+                                <span>{fmtDiffTime(n.diff.in.from)}</span>
+                                <span style={{ color: brand.textMuted }}> → </span>
+                                <span style={{ color: brand.navy, fontWeight: 600 }}>{fmtDiffTime(n.diff.in.to)}</span>
+                              </div>
+                            )}
+                            {n.diff.out && (
+                              <div className="font-mono text-[11px]">
+                                <span style={{ color: brand.textMuted }}>Out: </span>
+                                <span>{fmtDiffTime(n.diff.out.from)}</span>
+                                <span style={{ color: brand.textMuted }}> → </span>
+                                <span style={{ color: brand.navy, fontWeight: 600 }}>{fmtDiffTime(n.diff.out.to)}</span>
+                              </div>
+                            )}
+                            {n.diff.projectId && (
+                              <div className="font-mono text-[11px]">
+                                <span style={{ color: brand.textMuted }}>Project: </span>
+                                <span>{projectsMap[n.diff.projectId.from] || n.diff.projectId.from || '(none)'}</span>
+                                <span style={{ color: brand.textMuted }}> → </span>
+                                <span style={{ color: brand.navy, fontWeight: 600 }}>{projectsMap[n.diff.projectId.to] || n.diff.projectId.to || '(none)'}</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        <div className="p-2 rounded text-xs whitespace-pre-wrap" style={{ backgroundColor: brand.cream, color: brand.text }}>
+                          {n.note || <span style={{ color: brand.textMuted, fontStyle: 'italic' }}>(no reason given)</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="flex justify-end pt-2" style={{ borderTop: `1px solid ${brand.border}` }}>
+                <Button variant="ghost" onClick={closeHistoryModal}>Close</Button>
               </div>
             </div>
           );
