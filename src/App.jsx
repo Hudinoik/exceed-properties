@@ -11337,9 +11337,45 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
                 <Field label="Redirect URI" required hint={pi.connected ? "Disconnect to edit — must still match a Redirect URL registered in your PI API app" : "MUST exactly match a Redirect URL registered in your PI API app"}>
                   <Input value={form.redirectUri} onChange={(e) => updateField('redirectUri', e.target.value)} placeholder={propertyInspectAPI.defaultRedirectUri} disabled={pi.connected} />
                 </Field>
-                <Field label="OAuth Scope" hint={pi.connected ? "Disconnect to edit." : "Leave BLANK to use PI's default scopes (recommended). Only set a value if PI support has told you the exact scope names registered for your OAuth app -- any unknown scope makes PI reject the whole request with 'invalid_scope' before the consent page."}>
+                <Field
+                  label="OAuth Scope"
+                  hint={pi.connected
+                    ? "Disconnect to edit."
+                    : "PI's exact scope names are private (in their dev portal). Try the chips below in order -- after each Connect, run Test Connection then Pull Inspections. If all of them get rejected, your PI OAuth app has no scopes registered and PI support has to enable them on their side."}
+                >
                   <Input value={form.scope} onChange={(e) => updateField('scope', e.target.value)} placeholder="(leave blank)" disabled={pi.connected} />
                 </Field>
+                {!pi.connected && (
+                  <div className="md:col-span-2 -mt-3 mb-3">
+                    <p className="text-[11px] font-medium tracking-wider uppercase mb-1.5" style={{ color: brand.textMuted }}>Try preset:</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[
+                        { label: '(blank)', value: '' },
+                        { label: '*', value: '*' },
+                        { label: 'read', value: 'read' },
+                        { label: 'read write', value: 'read write' },
+                        { label: 'inspections:read properties:read clients:read', value: 'inspections:read properties:read clients:read' },
+                        { label: 'inspection.read property.read client.read', value: 'inspection.read property.read client.read' },
+                        { label: 'view-inspections view-properties view-clients', value: 'view-inspections view-properties view-clients' },
+                      ].map(p => (
+                        <button
+                          key={p.label}
+                          type="button"
+                          onClick={() => updateField('scope', p.value)}
+                          className="px-2 py-1 text-[11px] rounded btn-press"
+                          style={{
+                            backgroundColor: form.scope === p.value ? brand.gold : '#fff',
+                            color: form.scope === p.value ? '#fff' : brand.text,
+                            border: `1px solid ${form.scope === p.value ? brand.gold : brand.border}`,
+                            fontFamily: 'monospace',
+                          }}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -11477,27 +11513,47 @@ const PropertyInspectIntegrationCard = ({ integrations, setIntegrations, showToa
           {/* Per-endpoint pull report — shows which PI endpoints your token
               can actually reach. Anything red is being rejected by PI's scope
               middleware; anything green returned data. Updated on every Pull. */}
-          {pi.endpointReport && (
-            <div className="mb-4">
-              <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>Endpoint report (last pull)</p>
-              <div className="rounded overflow-hidden" style={{ border: `1px solid ${brand.border}` }}>
-                {Object.entries(pi.endpointReport).map(([path, r]) => (
-                  <div key={path} className="px-3 py-2 flex items-center gap-2 text-xs" style={{ borderTop: `1px solid ${brand.border}`, backgroundColor: r.ok ? brand.successLight : brand.dangerLight }}>
-                    {r.ok
-                      ? <CheckCircle2 size={14} style={{ color: brand.success, flexShrink: 0 }} />
-                      : <AlertCircle size={14} style={{ color: brand.danger, flexShrink: 0 }} />}
-                    <code className="font-mono" style={{ color: brand.text, minWidth: '120px' }}>{path}</code>
-                    {r.ok
-                      ? <span style={{ color: brand.success }}>{r.count} item{r.count === 1 ? '' : 's'}</span>
-                      : <span style={{ color: brand.danger }}>HTTP {r.status || '?'} · {r.message}</span>}
+          {pi.endpointReport && (() => {
+            const entries = Object.entries(pi.endpointReport);
+            const everyRejected = entries.length > 0 && entries.every(([, r]) => !r.ok);
+            const everyInvalidScope = everyRejected && entries.every(([, r]) =>
+              typeof r.message === 'string' && /invalid\s+scope/i.test(r.message)
+            );
+            return (
+              <div className="mb-4">
+                <p className="text-xs font-semibold tracking-wider uppercase mb-2" style={{ color: brand.navy }}>Endpoint report (last pull)</p>
+                {everyInvalidScope && (
+                  <div className="p-3 rounded mb-2 text-xs" style={{ backgroundColor: brand.warningLight, color: brand.warning, border: `1px solid ${brand.warning}` }}>
+                    <p><strong>Diagnosis:</strong> your PI token was issued with <em>no scopes</em>. Every scope-protected endpoint is rejecting it.</p>
+                    <p className="mt-2" style={{ color: brand.text }}>
+                      <strong>How to fix (in order):</strong>
+                    </p>
+                    <ol className="list-decimal ml-4 mt-1 space-y-1" style={{ color: brand.text }}>
+                      <li>Try the scope chips above the Scope field, Re-Connect after each. PI's exact scope names aren't public, so it's trial and error.</li>
+                      <li>If none of them work, email <code>api@propertyinspect.com</code> and ask them to assign default scopes (inspections, properties, clients, reports) to your OAuth app -- the app needs scopes registered in PI's dev portal before any token can reach the data endpoints.</li>
+                      <li>Use <strong>Load Sample Data</strong> in the meantime to prove the rest of the integration works end-to-end.</li>
+                    </ol>
                   </div>
-                ))}
+                )}
+                <div className="rounded overflow-hidden" style={{ border: `1px solid ${brand.border}` }}>
+                  {entries.map(([path, r]) => (
+                    <div key={path} className="px-3 py-2 flex items-center gap-2 text-xs" style={{ borderTop: `1px solid ${brand.border}`, backgroundColor: r.ok ? brand.successLight : brand.dangerLight }}>
+                      {r.ok
+                        ? <CheckCircle2 size={14} style={{ color: brand.success, flexShrink: 0 }} />
+                        : <AlertCircle size={14} style={{ color: brand.danger, flexShrink: 0 }} />}
+                      <code className="font-mono" style={{ color: brand.text, minWidth: '120px' }}>{path}</code>
+                      {r.ok
+                        ? <span style={{ color: brand.success }}>{r.count} item{r.count === 1 ? '' : 's'}</span>
+                        : <span style={{ color: brand.danger }}>HTTP {r.status || '?'} · {r.message}</span>}
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] mt-2" style={{ color: brand.textMuted }}>
+                  Green rows are endpoints your token reached. Red rows were rejected -- usually scope-protected endpoints your PI OAuth app hasn't been granted access to.
+                </p>
               </div>
-              <p className="text-[11px] mt-2" style={{ color: brand.textMuted }}>
-                Green rows are endpoints your token reached. Red rows were rejected — usually scope-protected endpoints your PI OAuth app hasn't been granted access to.
-              </p>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Actions */}
           <div className="flex gap-2 flex-wrap">
