@@ -311,6 +311,21 @@ export const packs = {
   },
 };
 
+// --- Jibble adjustments (per-user audit log of time-entry changes) ---
+export const jibbleAdjustments = {
+  async list(limit = 500) {
+    const r = await request(`/api/jibble/adjustments?limit=${limit}`);
+    return r.adjustments || [];
+  },
+  async create({ action, inEventId, outEventId, personId, note, diff }) {
+    const r = await request('/api/jibble/adjustments', {
+      method: 'POST',
+      body: { action, inEventId, outEventId, personId, note, diff },
+    });
+    return r.adjustment;
+  },
+};
+
 // Convenience: flatten a secrets array into an object {key: {hasValue, last4, ...}}
 // for easy access from React components.
 export const secretsToMap = (rows) => {

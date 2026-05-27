@@ -2769,6 +2769,24 @@ const startOfMonthISO = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
 };
 
+// ----- Module-level Jibble cache --------------------------------------
+// Survives mount/unmount of the section so navigating to Time Tracking
+// from another page doesn't re-pull. Refreshed automatically every
+// REFRESH_MS while the section is mounted. Stale-while-revalidate: we
+// render the cached payload immediately and only show "Refreshing" on
+// the first ever load.
+const JIBBLE_REFRESH_MS = 10 * 60 * 1000;
+const jibbleCache = {
+  rawEntries: null,        // null = never loaded
+  rawLiveEntries: [],
+  report7Entries: [],      // last 7 days, used by the Reporting tab
+  projectsMap: {},
+  peopleList: [],
+  adjustments: [],
+  dateRangeKey: null,
+  fetchedAt: 0,
+};
+
 const TimeTrackingSection = ({ employees, showToast, integrations, setIntegrations, onNavigateToSettings }) => {
   const jibble = integrations?.jibble || {};
 
@@ -2796,12 +2814,24 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [filterLocation, setFilterLocation] = useState('All');
   const [search, setSearch] = useState('');
 
-  const [reportGranularity, setReportGranularity] = useState('day');
+  // Sub-page tabs inside Time Tracking.
+  const [subPage, setSubPage] = useState('overview');
+  // Reporting tab picks: no person and today are the defaults. The 7-day
+  // chip row is rendered relative to today; the user clicks through to
+  // see what any one person worked any day in the last week.
+  const [reportPersonId, setReportPersonId] = useState('');
+  const [reportDate, setReportDate] = useState(todayISO());
 
-  const [rawEntries, setRawEntries] = useState([]);
-  const [rawLiveEntries, setRawLiveEntries] = useState([]);
-  const [projectsMap, setProjectsMap] = useState({});
-  const [peopleList, setPeopleList] = useState([]); // [{ id, fullName }]
+  // Hydrate state from the module-level cache so navigating back to this
+  // page shows the previously-loaded data immediately. fetchEntries() still
+  // runs on mount/range-change but it only flips `loading` if the cache is
+  // empty (cold start) -- otherwise it refreshes silently in the background.
+  const [rawEntries, setRawEntries] = useState(jibbleCache.rawEntries || []);
+  const [rawLiveEntries, setRawLiveEntries] = useState(jibbleCache.rawLiveEntries);
+  const [report7Entries, setReport7Entries] = useState(jibbleCache.report7Entries || []);
+  const [projectsMap, setProjectsMap] = useState(jibbleCache.projectsMap);
+  const [peopleList, setPeopleList] = useState(jibbleCache.peopleList);
+  const [adjustments, setAdjustments] = useState(jibbleCache.adjustments);
   const [loading, setLoading] = useState(false);
   const [liveLastRefresh, setLiveLastRefresh] = useState(null);
   const [syncError, setSyncError] = useState(null);
@@ -2818,6 +2848,37 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     () => pairClockEvents(rawLiveEntries, projectsMap).filter(p => p.isOpen),
     [rawLiveEntries, projectsMap]
   );
+  const report7Paired = useMemo(
+    () => pairClockEvents(report7Entries, projectsMap),
+    [report7Entries, projectsMap]
+  );
+
+  // Map from a Jibble event id -> array of adjustments that reference it.
+  // Used by row renderers to show an "edited" badge with the editor's notes.
+  const adjustmentsByEventId = useMemo(() => {
+    const map = new Map();
+    (adjustments || []).forEach(a => {
+      [a.inEventId, a.outEventId].filter(Boolean).forEach(id => {
+        if (!map.has(id)) map.set(id, []);
+        map.get(id).push(a);
+      });
+    });
+    return map;
+  }, [adjustments]);
+  const rowAdjustments = (row) => {
+    const out = [];
+    [row.inEventId, row.outEventId].filter(Boolean).forEach(id => {
+      const list = adjustmentsByEventId.get(id);
+      if (list) out.push(...list);
+    });
+    // De-dup by adjustment id (an edit touching both events shows once)
+    const seen = new Set();
+    return out.filter(a => {
+      if (seen.has(a.id)) return false;
+      seen.add(a.id);
+      return true;
+    });
+  };
 
   const dateRange = useMemo(() => {
     const today = todayISO();
@@ -2841,33 +2902,58 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return `/TimeEntries?${params.toString()}`;
   };
 
-  const fetchEntries = useCallback(async () => {
+  const fetchEntries = useCallback(async ({ silent = false } = {}) => {
     if (!isConfigured) return;
-    setLoading(true);
+    const currentRangeKey = `${dateRange.from}|${dateRange.to}`;
+    // If cache covers the current range and isn't silent-only, surface the
+    // cached payload immediately so the user sees data on first paint while
+    // the network call refreshes in the background.
+    const cacheMatchesRange = jibbleCache.dateRangeKey === currentRangeKey;
+    const haveAnyData = Array.isArray(jibbleCache.rawEntries) && cacheMatchesRange;
+    if (!silent && !haveAnyData) setLoading(true);
     setSyncError(null);
     try {
       const data = await api.proxy.jibbleGet(buildTimeEntriesPath(dateRange.from, dateRange.to, 500), 'time');
-      setRawEntries((data?.value || []).filter(e => !isJibbleExcluded(e)));
+      const next = (data?.value || []).filter(e => !isJibbleExcluded(e));
+      setRawEntries(next);
+      jibbleCache.rawEntries = next;
+      jibbleCache.dateRangeKey = currentRangeKey;
+      jibbleCache.fetchedAt = Date.now();
       setIntegrations(prev => ({
         ...prev,
         jibble: { ...prev.jibble, lastSync: new Date().toISOString(), lastSyncStatus: 'success', lastSyncError: null, connected: true },
       }));
     } catch (err) {
-      setSyncError(err.message);
+      // On a silent background refresh, never surface the error -- the
+      // user is on another page or otherwise not waiting for it.
+      if (!silent) setSyncError(err.message);
       setIntegrations(prev => ({
         ...prev,
         jibble: { ...prev.jibble, lastSyncStatus: 'error', lastSyncError: err.message },
       }));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [isConfigured, dateRange.from, dateRange.to, setIntegrations]);
 
+  // Mount + range-change fetch. The first call may be silent (rendered from
+  // cache) -- it still hits the network so a stale cache gets refreshed.
   useEffect(() => { fetchEntries(); }, [fetchEntries]);
 
-  // Pull projects once so we can map projectId → friendly name
+  // Background auto-refresh -- ticks every JIBBLE_REFRESH_MS while the
+  // section is mounted. Silent, so the user doesn't see a spinner or
+  // error banner every 10 min.
+  useEffect(() => {
+    if (!isConfigured) return undefined;
+    const id = setInterval(() => { fetchEntries({ silent: true }); }, JIBBLE_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [isConfigured, fetchEntries]);
+
+  // Pull projects once so we can map projectId → friendly name. Skip if
+  // the cache already has them.
   useEffect(() => {
     if (!isConfigured) return;
+    if (Object.keys(jibbleCache.projectsMap).length > 0) return;
     let cancelled = false;
     (async () => {
       try {
@@ -2878,6 +2964,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           if (p?.id) map[p.id] = p.name || p.title || p.code || p.id;
         });
         setProjectsMap(map);
+        jibbleCache.projectsMap = map;
       } catch {
         // Quiet — entries will fall back to address / '—'
       }
@@ -2885,9 +2972,11 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return () => { cancelled = true; };
   }, [isConfigured]);
 
-  // Pull people once so the Add Entry form can pick a person by name.
+  // Pull people once so the Reporting tab + Add Entry form can pick a
+  // person by name. Skip if the cache already has them.
   useEffect(() => {
     if (!isConfigured) return;
+    if (jibbleCache.peopleList.length > 0) return;
     let cancelled = false;
     (async () => {
       try {
@@ -2898,6 +2987,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           .filter(p => p.id && !isJibbleExcluded({ person: { fullName: p.fullName } }))
           .sort((a, b) => a.fullName.localeCompare(b.fullName));
         setPeopleList(people);
+        jibbleCache.peopleList = people;
       } catch {
         // Quiet — Add Entry just falls back to the people we've already seen in entries.
       }
@@ -2905,17 +2995,58 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     return () => { cancelled = true; };
   }, [isConfigured]);
 
+  // Adjustments audit log -- powers the "edited" badge on rows. Pull on
+  // mount and refresh after every successful adjust.
+  const refreshAdjustments = useCallback(async () => {
+    try {
+      const rows = await api.jibbleAdjustments.list(500);
+      setAdjustments(rows);
+      jibbleCache.adjustments = rows;
+    } catch {
+      // Quiet -- adjustments are nice-to-have, not load-bearing.
+    }
+  }, []);
+  useEffect(() => { refreshAdjustments(); }, [refreshAdjustments]);
+
   const fetchLive = useCallback(async () => {
     if (!isConfigured) return;
     try {
       const today = todayISO();
       const data = await api.proxy.jibbleGet(buildTimeEntriesPath(today, today, 200), 'time');
-      setRawLiveEntries((data?.value || []).filter(e => !isJibbleExcluded(e)));
+      const next = (data?.value || []).filter(e => !isJibbleExcluded(e));
+      setRawLiveEntries(next);
+      jibbleCache.rawLiveEntries = next;
       setLiveLastRefresh(new Date());
     } catch {
       // Quiet failure for background refresh
     }
   }, [isConfigured]);
+
+  // Fetch the last 7 days for the Reporting tab. Independent of the
+  // Overview tab's dateRange so the two views don't fight over the filter.
+  const fetch7Days = useCallback(async () => {
+    if (!isConfigured) return;
+    try {
+      const to = todayISO();
+      const fromDate = new Date();
+      fromDate.setDate(fromDate.getDate() - 6);
+      const from = fromDate.toISOString().split('T')[0];
+      const data = await api.proxy.jibbleGet(buildTimeEntriesPath(from, to, 1000), 'time');
+      const next = (data?.value || []).filter(e => !isJibbleExcluded(e));
+      setReport7Entries(next);
+      jibbleCache.report7Entries = next;
+    } catch {
+      // Quiet -- the Reporting tab shows an empty state if this fails.
+    }
+  }, [isConfigured]);
+
+  // Mount + 10-minute background refresh for the 7-day Reporting set.
+  useEffect(() => { fetch7Days(); }, [fetch7Days]);
+  useEffect(() => {
+    if (!isConfigured) return undefined;
+    const id = setInterval(fetch7Days, JIBBLE_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [isConfigured, fetch7Days]);
 
   useEffect(() => {
     if (!isConfigured) return;
@@ -2987,7 +3118,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
     .map(([id, name]) => ({ id, name }))
     .sort((a, b) => a.name.localeCompare(b.name)), [projectsMap]);
 
-  const openAdjustModal = (row) => {
+  const openAdjustModal = (row, defaults = {}) => {
     setAdjustError(null);
     setAdjustConfirmDelete(false);
     if (row) {
@@ -3000,19 +3131,22 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           in: isoToLocalInput(row.inIso),
           out: isoToLocalInput(row.outIso),
           projectId: row.projectId || '',
+          note: '',
         },
       });
     } else {
-      // Create mode — default to today + 08:00→17:00
-      const today = todayISO();
+      // Create mode -- default to today + 08:00->17:00 unless the caller
+      // passed defaults (e.g. the Reporting tab knows the person + date).
+      const dateISO = defaults.date || todayISO();
       setAdjust({
         mode: 'create',
         row: null,
         form: {
-          personId: peopleForPicker[0]?.id || '',
-          in: `${today}T08:00`,
-          out: `${today}T17:00`,
+          personId: defaults.personId || peopleForPicker[0]?.id || '',
+          in: `${dateISO}T08:00`,
+          out: `${dateISO}T17:00`,
           projectId: '',
+          note: '',
         },
       });
     }
@@ -3034,25 +3168,44 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       const { mode, row, form } = adjust;
       const inIso = localInputToIso(form.in);
       const outIso = localInputToIso(form.out);
+      const note = (form.note || '').trim();
       if (!form.personId) throw new Error('Please pick a person');
       if (!inIso) throw new Error('Clock-in time is required');
       if (outIso && inIso && new Date(outIso) <= new Date(inIso)) {
         throw new Error('Clock-out must be after clock-in');
       }
+      if (!note) {
+        throw new Error('A reason note is required so the team has a record of every change.');
+      }
 
       const projectIdOrNull = form.projectId || null;
+      const diff = {};
 
       if (mode === 'create') {
-        await api.proxy.jibbleWrite({
+        // Capture the new event ids so the audit log can reference them.
+        const inResp = await api.proxy.jibbleWrite({
           method: 'POST', path: '/TimeEntries', svc: 'time',
           body: { personId: form.personId, type: 'In', time: inIso, projectId: projectIdOrNull },
         });
+        let outResp = null;
         if (outIso) {
-          await api.proxy.jibbleWrite({
+          outResp = await api.proxy.jibbleWrite({
             method: 'POST', path: '/TimeEntries', svc: 'time',
             body: { personId: form.personId, type: 'Out', time: outIso, projectId: projectIdOrNull },
           });
         }
+        await api.jibbleAdjustments.create({
+          action: 'create',
+          inEventId: inResp?.id || null,
+          outEventId: outResp?.id || null,
+          personId: form.personId,
+          note,
+          diff: {
+            in: { to: inIso },
+            ...(outIso ? { out: { to: outIso } } : {}),
+            ...(projectIdOrNull ? { projectId: { to: projectIdOrNull } } : {}),
+          },
+        });
       } else {
         // Edit mode -- diff each field and PATCH only what changed.
         const originalIn = isoToLocalInput(row.inIso);
@@ -3064,6 +3217,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
             method: 'PATCH', path: `/TimeEntries/${row.inEventId}`, svc: 'time',
             body: { time: inIso },
           });
+          diff.in = { from: row.inIso, to: inIso };
         }
         if (form.out !== originalOut) {
           if (row.outEventId) {
@@ -3072,16 +3226,19 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                 method: 'PATCH', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
                 body: { time: outIso },
               });
+              diff.out = { from: row.outIso, to: outIso };
             } else {
               await api.proxy.jibbleWrite({
                 method: 'DELETE', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
               });
+              diff.out = { from: row.outIso, to: null };
             }
           } else if (outIso) {
             await api.proxy.jibbleWrite({
               method: 'POST', path: '/TimeEntries', svc: 'time',
               body: { personId: row.personId, type: 'Out', time: outIso, projectId: projectIdOrNull },
             });
+            diff.out = { from: null, to: outIso };
           }
         }
         if (form.projectId !== originalProject) {
@@ -3097,12 +3254,26 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
               body: { projectId: projectIdOrNull },
             });
           }
+          diff.projectId = { from: originalProject || null, to: projectIdOrNull };
         }
+        if (Object.keys(diff).length === 0) {
+          throw new Error('Nothing changed -- update at least one field before saving.');
+        }
+        await api.jibbleAdjustments.create({
+          action: 'edit',
+          inEventId: row.inEventId || null,
+          outEventId: row.outEventId || null,
+          personId: row.personId || null,
+          note,
+          diff,
+        });
       }
 
       showToast(mode === 'create' ? 'Time entry added' : 'Time entry updated', 'success');
       closeAdjustModal();
       fetchEntries();
+      fetch7Days();
+      refreshAdjustments();
     } catch (err) {
       setAdjustError(err.message || 'Save failed');
     } finally {
@@ -3112,7 +3283,12 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
 
   const deleteAdjust = async () => {
     if (!adjust || adjust.mode !== 'edit') return;
-    const { row } = adjust;
+    const { row, form } = adjust;
+    const note = (form.note || '').trim();
+    if (!note) {
+      setAdjustError('A reason note is required to delete this entry.');
+      return;
+    }
     setAdjustSaving(true);
     setAdjustError(null);
     try {
@@ -3126,9 +3302,19 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           method: 'DELETE', path: `/TimeEntries/${row.outEventId}`, svc: 'time',
         });
       }
+      await api.jibbleAdjustments.create({
+        action: 'delete',
+        inEventId: row.inEventId || null,
+        outEventId: row.outEventId || null,
+        personId: row.personId || null,
+        note,
+        diff: { in: { from: row.inIso, to: null }, out: { from: row.outIso, to: null } },
+      });
       showToast('Time entry deleted', 'success');
       closeAdjustModal();
       fetchEntries();
+      fetch7Days();
+      refreshAdjustments();
     } catch (err) {
       setAdjustError(err.message || 'Delete failed');
     } finally {
@@ -3171,12 +3357,36 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         </div>
         <div className="flex gap-2">
           <Button variant="primary" icon={Plus} onClick={() => openAdjustModal(null)}>Add Entry</Button>
-          <Button variant="ghost" icon={RefreshCw} onClick={fetchEntries} disabled={loading}>
+          <Button variant="ghost" icon={RefreshCw} onClick={() => { fetchEntries(); fetch7Days(); fetchLive(); refreshAdjustments(); }} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </Button>
           <Button variant="ghost" icon={ExternalLink} onClick={() => window.open('https://web.jibble.io', '_blank')}>Open Jibble</Button>
           <Button variant="ghost" icon={SettingsIcon} onClick={onNavigateToSettings}>Settings</Button>
         </div>
+      </div>
+
+      {/* Sub-page tabs */}
+      <div className="flex gap-1 mb-4 border-b" style={{ borderColor: brand.border }}>
+        {[
+          { key: 'overview', label: 'Overview' },
+          { key: 'reporting', label: 'Reporting' },
+        ].map(t => (
+          <button
+            key={t.key}
+            onClick={() => setSubPage(t.key)}
+            className="px-4 py-2 text-sm font-medium btn-press transition-all"
+            style={{
+              borderBottom: `2px solid ${subPage === t.key ? brand.gold : 'transparent'}`,
+              color: subPage === t.key ? brand.navy : brand.textMuted,
+              marginBottom: '-1px',
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+        <p className="ml-auto text-[11px] self-center" style={{ color: brand.textMuted }}>
+          Auto-refresh every 10 min
+        </p>
       </div>
 
       {/* Sync error banner */}
@@ -3192,6 +3402,8 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
           </div>
         </Card>
       )}
+
+      {subPage === 'overview' && (<>
 
       {/* Date range chips + filters */}
       <Card className="mb-4 p-4">
@@ -3364,152 +3576,130 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         )}
       </Card>
 
-      {/* Reporting — one card at a time, driven by the period chips + person filter above. */}
-      {(() => {
+      </>)}
+
+      {/* Reporting tab -- pick a person + a day from the last 7. */}
+      {subPage === 'reporting' && (() => {
         const TARGET_HOURS = 8;
 
-        // Helpers to bucket an entry's date into a period key
-        const mondayOf = (dateISO) => {
-          const d = new Date(dateISO);
-          const day = d.getDay() || 7; // Sun → 7
-          if (day !== 1) d.setDate(d.getDate() - (day - 1));
-          return d.toISOString().split('T')[0];
-        };
-        const sundayOf = (mondayISO) => {
-          const d = new Date(mondayISO);
-          d.setDate(d.getDate() + 6);
-          return d.toISOString().split('T')[0];
-        };
-        const monthLabelOf = (key) => {
-          const [y, m] = key.split('-').map(Number);
-          return new Date(y, m - 1, 1).toLocaleDateString('en-ZA', { month: 'long', year: 'numeric' });
-        };
-
-        const keyFor = (dateISO) => {
-          if (reportGranularity === 'week') return mondayOf(dateISO);
-          if (reportGranularity === 'month') return dateISO.slice(0, 7);
-          return dateISO;
-        };
-        const periodLabel = (key) => {
-          if (reportGranularity === 'week') return `${key} to ${sundayOf(key)}`;
-          if (reportGranularity === 'month') return monthLabelOf(key);
-          return key;
-        };
-        const reportTitle = reportGranularity === 'week' ? 'Weekly' : reportGranularity === 'month' ? 'Monthly' : 'Daily';
-
-        // Person's centre universe: every centre this person has been seen at
-        // across the broader Jibble pull (not narrowed by location/search).
-        // Used to inject 0-visit rows in week/month rollups so Week/Month
-        // reports list every centre the person normally visits.
-        const centreUniverseByPerson = new Map();
-        entries.forEach(e => {
-          if (!e.employee || !e.location) return;
-          if (!centreUniverseByPerson.has(e.employee)) centreUniverseByPerson.set(e.employee, new Set());
-          centreUniverseByPerson.get(e.employee).add(e.location);
-        });
-
-        // Group filtered entries by person → period key → [entries]
-        const byPersonKey = new Map();
-        filteredEntries.forEach(e => {
-          if (!e.date) return;
-          const k = keyFor(e.date);
-          if (!byPersonKey.has(e.employee)) byPersonKey.set(e.employee, new Map());
-          const keyMap = byPersonKey.get(e.employee);
-          if (!keyMap.has(k)) keyMap.set(k, []);
-          keyMap.get(k).push(e);
-        });
-
-        // Flatten to report cards. For week/month also compute visits-by-centre
-        // with 0-visit rows for centres the person normally goes to.
-        const reports = [];
-        byPersonKey.forEach((keyMap, person) => {
-          keyMap.forEach((rows, key) => {
-            const sorted = [...rows].sort((a, b) => {
-              const ai = a.inIso ? new Date(a.inIso).getTime() : 0;
-              const bi = b.inIso ? new Date(b.inIso).getTime() : 0;
-              return ai - bi;
-            });
-            const total = sorted.reduce((s, r) => s + (r.hours || 0), 0);
-            const visits = new Map();
-            sorted.forEach(row => {
-              const centre = row.location || '—';
-              const prev = visits.get(centre) || { count: 0, hours: 0 };
-              visits.set(centre, { count: prev.count + 1, hours: prev.hours + (row.hours || 0) });
-            });
-            // Inject 0-visit rows for centres in the person's universe but not visited this period.
-            const universe = centreUniverseByPerson.get(person) || new Set();
-            universe.forEach(centre => {
-              if (!visits.has(centre)) visits.set(centre, { count: 0, hours: 0 });
-            });
-            const visitList = Array.from(visits.entries())
-              .map(([centre, v]) => ({ centre, count: v.count, hours: v.hours }))
-              .sort((a, b) => b.count - a.count || b.hours - a.hours || a.centre.localeCompare(b.centre));
-            reports.push({ person, key, rows: sorted, total, visits: visitList });
+        // Build the last 7 calendar days, most recent first.
+        const day7 = [];
+        for (let i = 0; i < 7; i++) {
+          const d = new Date();
+          d.setHours(0, 0, 0, 0);
+          d.setDate(d.getDate() - i);
+          day7.push({
+            iso: d.toISOString().split('T')[0],
+            weekday: d.toLocaleDateString('en-ZA', { weekday: 'short' }),
+            short: d.toLocaleDateString('en-ZA', { day: 'numeric', month: 'short' }),
           });
-        });
-        reports.sort((a, b) => {
-          if (a.key !== b.key) return b.key.localeCompare(a.key);
-          return a.person.localeCompare(b.person);
-        });
-
-        // Only one report at a time. Most recent / first match wins.
-        const r = reports[0];
-
-        const sectionHeader = (
-          <div className="mb-3 flex items-end justify-between flex-wrap gap-2">
-            <div>
-              <p className="text-xs tracking-[0.2em] uppercase" style={{ color: brand.gold }}>Time & Attendance</p>
-              <h2 className="text-xl" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>Reporting</h2>
-            </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              {[
-                { key: 'day', label: 'Day' },
-                { key: 'week', label: 'Week' },
-                { key: 'month', label: 'Month' },
-              ].map(g => (
-                <button
-                  key={g.key}
-                  onClick={() => setReportGranularity(g.key)}
-                  className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
-                  style={{
-                    backgroundColor: reportGranularity === g.key ? brand.navy : 'transparent',
-                    color: reportGranularity === g.key ? '#fff' : brand.text,
-                    border: `1px solid ${reportGranularity === g.key ? brand.navy : brand.border}`,
-                  }}
-                >
-                  {g.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        );
-
-        if (!r) {
-          return (
-            <>
-              {sectionHeader}
-              <Card className="p-8">
-                <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
-                  {loading ? 'Loading…' : 'No entries match your filters.'}
-                </p>
-              </Card>
-            </>
-          );
         }
 
-        const balance = TARGET_HOURS - r.total;
-        const isDay = reportGranularity === 'day';
+        // Person picker -- union of peopleForPicker + anyone seen in the last 7 days,
+        // sorted A->Z. peopleForPicker is built lower in the component scope, but
+        // we redefine here so this block only depends on report7Paired + peopleList.
+        const peopleSeenInWindow = new Map();
+        report7Paired.forEach(p => {
+          if (p.personId && p.employee && !peopleSeenInWindow.has(p.personId)) {
+            peopleSeenInWindow.set(p.personId, { id: p.personId, fullName: p.employee });
+          }
+        });
+        const reportPeople = [
+          ...peopleList,
+          ...Array.from(peopleSeenInWindow.values()).filter(p => !peopleList.some(x => x.id === p.id)),
+        ].sort((a, b) => a.fullName.localeCompare(b.fullName));
 
-        // Week/Month → centre-aggregated table (Project | Visits | Total Time + Total footer)
-        // Day → per-entry table (Property | Time In | Time Out | Total) + Balance row
+        const selectedPerson = reportPeople.find(p => p.id === reportPersonId) || null;
+        const dayRows = (selectedPerson && reportDate)
+          ? report7Paired
+              .filter(r => r.personId === selectedPerson.id && r.date === reportDate)
+              .sort((a, b) => {
+                const ai = a.inIso ? new Date(a.inIso).getTime() : 0;
+                const bi = b.inIso ? new Date(b.inIso).getTime() : 0;
+                return ai - bi;
+              })
+          : [];
+        const total = dayRows.reduce((s, r) => s + (r.hours || 0), 0);
+        const balance = TARGET_HOURS - total;
+        const selectedDayLabel = (() => {
+          if (!reportDate) return '';
+          const d = new Date(reportDate);
+          return d.toLocaleDateString('en-ZA', { weekday: 'long', day: 'numeric', month: 'long' });
+        })();
+
         return (
           <>
-            {sectionHeader}
-            <Card key={`${r.person}|${r.key}`} className="p-5">
-              <h3 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
-                {r.person} – {reportTitle} Work Report ({periodLabel(r.key)})
-              </h3>
-              {isDay ? (
+            {/* Date row -- last 7 days */}
+            <Card className="mb-4 p-4">
+              <p className="text-xs font-medium tracking-wider uppercase mb-2" style={{ color: brand.textMuted }}>Day</p>
+              <div className="flex gap-1.5 flex-wrap">
+                {day7.map(d => (
+                  <button
+                    key={d.iso}
+                    onClick={() => setReportDate(d.iso)}
+                    className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                    style={{
+                      backgroundColor: reportDate === d.iso ? brand.navy : 'transparent',
+                      color: reportDate === d.iso ? '#fff' : brand.text,
+                      border: `1px solid ${reportDate === d.iso ? brand.navy : brand.border}`,
+                    }}
+                  >
+                    {d.weekday} {d.short}
+                  </button>
+                ))}
+              </div>
+            </Card>
+
+            {/* Person picker */}
+            <Card className="mb-4 p-4">
+              <p className="text-xs font-medium tracking-wider uppercase mb-2" style={{ color: brand.textMuted }}>Person</p>
+              {reportPeople.length === 0 ? (
+                <p className="text-xs italic" style={{ color: brand.textMuted }}>
+                  {loading ? 'Loading…' : 'No people found in Jibble.'}
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {reportPeople.map(p => (
+                    <button
+                      key={p.id}
+                      onClick={() => setReportPersonId(reportPersonId === p.id ? '' : p.id)}
+                      className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                      style={{
+                        backgroundColor: reportPersonId === p.id ? brand.gold : '#fff',
+                        color: reportPersonId === p.id ? '#fff' : brand.text,
+                        border: `1px solid ${reportPersonId === p.id ? brand.gold : brand.border}`,
+                      }}
+                    >
+                      {p.fullName}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </Card>
+
+            {/* Daily report body */}
+            {!selectedPerson ? (
+              <Card className="p-8">
+                <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                  Pick a person above to see their work for {selectedDayLabel}.
+                </p>
+              </Card>
+            ) : dayRows.length === 0 ? (
+              <Card className="p-8">
+                <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                  {selectedPerson.fullName} has no clock events on {selectedDayLabel}.
+                </p>
+                <div className="flex justify-center mt-3">
+                  <Button variant="ghost" size="sm" icon={Plus} onClick={() => openAdjustModal(null, { personId: selectedPerson.id, date: reportDate })}>
+                    Add Entry for this Day
+                  </Button>
+                </div>
+              </Card>
+            ) : (
+              <Card className="p-5">
+                <h3 className="text-xl mb-4" style={{ fontFamily: 'Georgia, serif', color: brand.navy, fontWeight: 600 }}>
+                  {selectedPerson.fullName} -- Daily Work Report ({selectedDayLabel})
+                </h3>
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
                     <thead>
@@ -3518,31 +3708,45 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                         <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time In</th>
                         <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Time Out</th>
                         <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Total</th>
-                        <th className="px-2 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '60px' }}>Adjust</th>
+                        <th className="px-2 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '90px' }}>Adjust</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {r.rows.map((row, idx) => (
-                        <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
-                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
-                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
-                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
-                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
-                          <td className="px-2 py-2 text-center" style={{ border: `1px solid ${brand.border}` }}>
-                            <button
-                              onClick={() => openAdjustModal(row)}
-                              className="p-1.5 rounded btn-press transition-all hover:bg-black hover:bg-opacity-5"
-                              title="Edit entry"
-                            >
-                              <Edit2 size={14} style={{ color: brand.gold }} />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      {dayRows.map((row, idx) => {
+                        const rowNotes = rowAdjustments(row);
+                        return (
+                          <tr key={row.id} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff' }}>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{row.location}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.inIso)}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtTimeSec(row.outIso)}</td>
+                            <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(row.hours)}</td>
+                            <td className="px-2 py-2 text-center" style={{ border: `1px solid ${brand.border}` }}>
+                              <div className="flex items-center justify-center gap-1">
+                                {rowNotes.length > 0 && (
+                                  <span
+                                    title={rowNotes.map(n => `${new Date(n.createdAt).toLocaleString('en-ZA')} -- ${n.userEmail || 'user'}: ${n.note}`).join('\n\n')}
+                                    className="text-[10px] font-semibold rounded px-1.5 py-0.5"
+                                    style={{ backgroundColor: brand.warningLight, color: brand.warning, border: `1px solid ${brand.warning}` }}
+                                  >
+                                    EDIT × {rowNotes.length}
+                                  </span>
+                                )}
+                                <button
+                                  onClick={() => openAdjustModal(row)}
+                                  className="p-1.5 rounded btn-press transition-all hover:bg-black hover:bg-opacity-5"
+                                  title="Edit entry"
+                                >
+                                  <Edit2 size={14} style={{ color: brand.gold }} />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
                       <tr style={{ backgroundColor: '#f8f8f8' }}>
                         <td colSpan={2} style={{ border: `1px solid ${brand.border}` }} />
                         <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>Total Worked:</td>
-                        <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
+                        <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(total)}</td>
                         <td style={{ border: `1px solid ${brand.border}` }} />
                       </tr>
                       <tr style={{ backgroundColor: '#f8f8f8' }}>
@@ -3554,34 +3758,8 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                     </tbody>
                   </table>
                 </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}>
-                    <thead>
-                      <tr style={{ backgroundColor: brand.navy }}>
-                        <th className="px-4 py-2 text-left text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}` }}>Project</th>
-                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '120px' }}>Visits</th>
-                        <th className="px-4 py-2 text-center text-xs font-semibold tracking-wider" style={{ color: '#fff', border: `1px solid ${brand.border}`, width: '160px' }}>Total Time</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {r.visits.map((v, idx) => (
-                        <tr key={v.centre} style={{ backgroundColor: idx % 2 === 0 ? '#f8f8f8' : '#fff', opacity: v.count === 0 ? 0.55 : 1 }}>
-                          <td className="px-4 py-2" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.centre}</td>
-                          <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{v.count}</td>
-                          <td className="px-4 py-2 text-center" style={{ color: brand.text, border: `1px solid ${brand.border}` }}>{fmtHoursMin(v.hours)}</td>
-                        </tr>
-                      ))}
-                      <tr style={{ backgroundColor: brand.cream }}>
-                        <td className="px-4 py-2 text-right font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>Total Hours</td>
-                        <td className="px-4 py-2" style={{ border: `1px solid ${brand.border}` }} />
-                        <td className="px-4 py-2 text-center font-semibold" style={{ color: brand.navy, border: `1px solid ${brand.border}` }}>{fmtHoursMin(r.total)}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </Card>
+              </Card>
+            )}
           </>
         );
       })()}
@@ -3672,6 +3850,26 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </Select>
+              </div>
+
+              {/* Reason note -- mandatory. Stored alongside the entry so the
+                  team has a written record of every manual adjustment. */}
+              <div>
+                <label className="block text-xs font-medium tracking-wider uppercase mb-1.5" style={{ color: brand.textMuted }}>
+                  Reason for change <span style={{ color: brand.danger }}>*</span>
+                </label>
+                <textarea
+                  value={adjust.form.note || ''}
+                  onChange={(e) => updateAdjustForm('note', e.target.value)}
+                  placeholder={isCreate ? 'Why are you adding this entry? e.g. forgot to clock in, off-site meeting...' : 'Why are you changing this entry? e.g. employee forgot to clock out, wrong location...'}
+                  disabled={adjustSaving}
+                  rows={3}
+                  className="w-full px-3 py-2 text-sm rounded outline-none resize-y"
+                  style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}`, color: brand.text, fontFamily: 'inherit' }}
+                />
+                <p className="text-[11px] mt-1" style={{ color: brand.textMuted }}>
+                  Required. Saved with the entry as an audit-log note.
+                </p>
               </div>
 
               {/* Error banner */}

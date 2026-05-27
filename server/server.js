@@ -28,6 +28,7 @@ import secretsRouter from './routes/secrets.js';
 import proxyRouter from './routes/proxy.js';
 import docusignRouter from './routes/docusign.js';
 import packsRouter from './routes/packs.js';
+import jibbleRouter from './routes/jibble.js';
 import { publicRouter as webhookPublicRouter, apiRouter as webhookApiRouter } from './routes/webhooks.js';
 import { isProduction as docusignIsProduction, envDiagnostics as docusignEnvDiagnostics } from './docusign/auth.js';
 import { seedIfEmpty } from './seed.js';
@@ -124,6 +125,7 @@ app.use('/api/secrets', secretsRouter);
 app.use('/api/proxy', proxyRouter);
 app.use('/api/docusign', docusignRouter);
 app.use('/api/packs', packsRouter);
+app.use('/api/jibble', jibbleRouter);
 // Authenticated mgmt endpoints for webhooks (list events, clear, etc.).
 // The public receiver is mounted earlier, before CSRF/session.
 app.use('/api/webhooks', webhookApiRouter);

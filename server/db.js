@@ -32,7 +32,13 @@ const DEFAULT_DATA = {
   // (draft DOCX/PDF, signed PDF, FICA docs) are stored inline as
   // base64 inside the relevant fields — see lease-storage.js.
   packs: [],
-  nextId: { user: 1, secret: 1, audit: 1, webhook: 1, pack: 1 },
+  // Jibble time-entry adjustments. One row per add/edit/delete the user
+  // makes via the Reporting page's adjust modal. Captures the (required)
+  // note and the diff so the team has a written record of every change.
+  // { id, userId, userEmail, action: 'create'|'edit'|'delete',
+  //   inEventId, outEventId, personId, note, diff, createdAt }
+  jibbleAdjustments: [],
+  nextId: { user: 1, secret: 1, audit: 1, webhook: 1, pack: 1, jibbleAdjustment: 1 },
 };
 
 let db;
@@ -269,6 +275,48 @@ export const webhookEvents = {
     db.data.webhookEvents = db.data.webhookEvents.filter(e => !(e.userId === userId && (!integration || e.integration === integration)));
     if (db.data.webhookEvents.length !== before) await persist();
     return before - db.data.webhookEvents.length;
+  },
+};
+
+// ----- Jibble time-entry adjustments -----------------------------------
+// Audit log of every add/edit/delete the team makes via the Time Tracking
+// page's adjust modal. Each row mandates a note from the editor so the
+// reason for the change is captured alongside the new times.
+
+const ensureJibbleAdjustmentsArray = () => {
+  if (!Array.isArray(db.data.jibbleAdjustments)) db.data.jibbleAdjustments = [];
+};
+
+export const jibbleAdjustments = {
+  list(userId, limit = 500) {
+    ensureJibbleAdjustmentsArray();
+    return db.data.jibbleAdjustments
+      .filter(a => a.userId === userId)
+      .slice(0, limit);
+  },
+  async create({ userId, userEmail, action, inEventId, outEventId, personId, note, diff }) {
+    ensureJibbleAdjustmentsArray();
+    const row = {
+      id: nextId('jibbleAdjustment'),
+      userId,
+      userEmail: userEmail || null,
+      action,
+      inEventId: inEventId || null,
+      outEventId: outEventId || null,
+      personId: personId || null,
+      note: String(note || '').slice(0, 2000),
+      diff: diff || null,
+      createdAt: new Date().toISOString(),
+    };
+    db.data.jibbleAdjustments.unshift(row);
+    // Cap per-user history at 2000 rows. Old entries fall off the end.
+    const userRows = db.data.jibbleAdjustments.filter(a => a.userId === userId);
+    if (userRows.length > 2000) {
+      const keep = new Set(userRows.slice(0, 2000).map(a => a.id));
+      db.data.jibbleAdjustments = db.data.jibbleAdjustments.filter(a => a.userId !== userId || keep.has(a.id));
+    }
+    await persist();
+    return row;
   },
 };
 
