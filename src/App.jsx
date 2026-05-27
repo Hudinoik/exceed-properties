@@ -124,7 +124,15 @@ const useStoredState = (key, initialValue) => {
 // Format helpers
 const formatCurrency = (n) => `R ${Number(n || 0).toLocaleString('en-ZA')}`;
 const formatDate = (d) => d ? new Date(d).toLocaleDateString('en-ZA', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
-const todayISO = () => new Date().toISOString().split('T')[0];
+// Format a Date as YYYY-MM-DD in LOCAL time (not UTC). Jibble's
+// `belongsToDate` and the day chips both express the user's local
+// calendar date, so we must format in local TZ here too -- using
+// toISOString() drifts by a day when the local TZ is ahead of UTC.
+const localDateISO = (d) => {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const todayISO = () => localDateISO(new Date());
 
 // Time-ago helper for live UI
 const timeAgo = (iso) => {
@@ -2759,9 +2767,9 @@ const makePaired = (inEv, outEv, idx, projectsMap = {}) => {
 
 const startOfWeekISO = () => {
   const d = new Date();
-  const day = d.getDay() || 7; // Sun → 7
+  const day = d.getDay() || 7; // Sun -> 7
   if (day !== 1) d.setDate(d.getDate() - (day - 1));
-  return d.toISOString().split('T')[0];
+  return localDateISO(d);
 };
 
 const startOfMonthISO = () => {
@@ -3030,7 +3038,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       const to = todayISO();
       const fromDate = new Date();
       fromDate.setDate(fromDate.getDate() - 6);
-      const from = fromDate.toISOString().split('T')[0];
+      const from = localDateISO(fromDate);
       const data = await api.proxy.jibbleGet(buildTimeEntriesPath(from, to, 1000), 'time');
       const next = (data?.value || []).filter(e => !isJibbleExcluded(e));
       setReport7Entries(next);
@@ -3582,14 +3590,17 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
       {subPage === 'reporting' && (() => {
         const TARGET_HOURS = 8;
 
-        // Build the last 7 calendar days, most recent first.
+        // Build the last 7 calendar days, most recent first. localDateISO
+        // (not toISOString) so the key matches the user's local calendar
+        // day -- Jibble's belongsToDate is in the workspace's local day,
+        // not UTC.
         const day7 = [];
         for (let i = 0; i < 7; i++) {
           const d = new Date();
           d.setHours(0, 0, 0, 0);
           d.setDate(d.getDate() - i);
           day7.push({
-            iso: d.toISOString().split('T')[0],
+            iso: localDateISO(d),
             weekday: d.toLocaleDateString('en-ZA', { weekday: 'short' }),
             short: d.toLocaleDateString('en-ZA', { day: 'numeric', month: 'short' }),
           });
@@ -3623,7 +3634,12 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         const balance = TARGET_HOURS - total;
         const selectedDayLabel = (() => {
           if (!reportDate) return '';
-          const d = new Date(reportDate);
+          // Parse reportDate ("YYYY-MM-DD") as LOCAL midnight, not UTC, so
+          // the label stays consistent with the chip the user clicked.
+          // `new Date("2026-05-27")` alone parses as UTC midnight and
+          // shifts to the previous day in TZs west of GMT.
+          const [y, m, dd] = reportDate.split('-').map(Number);
+          const d = new Date(y, m - 1, dd);
           return d.toLocaleDateString('en-ZA', { weekday: 'long', day: 'numeric', month: 'long' });
         })();
 
