@@ -4861,11 +4861,24 @@ const LEASE_CONTROL_TOOL = {
       },
       initialPeriod: {
         type: 'object',
+        description: 'Section 1.9 INITIAL PERIOD OF LEASE. This section usually contains: a length ("PERIOD"/"DURATION", e.g. "5 YEARS" or "60 MONTHS"), a commencement date, and a termination/expiry date. All three are typically printed close together — do not confuse the length with the dates.',
         properties: {
-          years: { type: 'number' },
-          months: { type: 'number' },
-          commencementDate: { type: 'string', description: 'ISO format YYYY-MM-DD' },
-          terminationDate: { type: 'string', description: 'ISO format YYYY-MM-DD' },
+          years: {
+            type: 'integer',
+            description: 'Whole years of the lease term. Examples: "5 YEARS" → 5; "60 MONTHS" → 5; "13 MONTHS" → 1; "18 MONTHS" → 1; "6 MONTHS" → 0. If the document says "X YEARS Y MONTHS", years = X. Never include partial-year months here.',
+          },
+          months: {
+            type: 'integer',
+            description: 'Remainder months after whole years. MUST be 0-11. Examples: "5 YEARS" → 0; "60 MONTHS" → 0; "13 MONTHS" → 1; "18 MONTHS" → 6; "1 YEAR 1 MONTH" → 1. NEVER use 12 (12 months = 1 year, 0 months). NEVER put the total month count here when it exceeds 11.',
+          },
+          commencementDate: {
+            type: 'string',
+            description: 'Lease start date (label "COMMENCEMENT DATE" / "START DATE" / "FROM"). ISO format YYYY-MM-DD. This is a DATE, not a length — never put a year count here.',
+          },
+          terminationDate: {
+            type: 'string',
+            description: 'Lease end/expiry date (label "TERMINATION DATE" / "EXPIRY DATE" / "END DATE" / "TO"). ISO format YYYY-MM-DD. This is a DATE, not a length.',
+          },
         },
       },
       optionPeriod: {
@@ -5086,6 +5099,19 @@ const parseLeaseControlPdf = async (pdfText, model) => callClaudeTool({
     '',
     'TEXT FORMAT:',
     '  • The PDF has been extracted preserving spatial layout. Lines that contained text in multiple columns are joined with " | " as a column separator. Labels (e.g. "VAT NO", "REG NO") commonly appear on the LEFT of " | " and the value on the RIGHT — pair them accordingly.',
+    '',
+    'SECTION 1.9 — INITIAL PERIOD (extract carefully):',
+    '  • The section contains a LENGTH (e.g. "5 YEARS", "60 MONTHS", "1 YEAR 1 MONTH") AND two DATES (commencement + termination). These three values sit close together — do not confuse them.',
+    '  • Normalize the length into years (whole years) + months (0-11 remainder):',
+    '      "5 YEARS"           → years=5,  months=0',
+    '      "60 MONTHS"         → years=5,  months=0',
+    '      "12 MONTHS"         → years=1,  months=0',
+    '      "13 MONTHS"         → years=1,  months=1',
+    '      "1 YEAR 1 MONTH"    → years=1,  months=1',
+    '      "18 MONTHS"         → years=1,  months=6',
+    '      "6 MONTHS"          → years=0,  months=6',
+    '    months MUST be 0-11. If a lease is an exact number of years, months=0 — do not output 12.',
+    '  • Dates: commencementDate is the START (labels "COMMENCEMENT" / "FROM" / "START"). terminationDate is the END (labels "TERMINATION" / "EXPIRY" / "TO" / "END"). Never put a year count or month count into a date field.',
     '',
     'ABSOLUTE RULES:',
     '  • If a value is under "1.1 THE LANDLORD", it is a LANDLORD field. Never put it in tenant.',
@@ -6355,6 +6381,37 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
             } : {}),
           },
         };
+      } else if (kind === 'leaseControl') {
+        // The schedule being uploaded represents the CURRENT/EXPIRING lease.
+        // The form is the NEW lease being drafted (a renewal in practice —
+        // the schedule upload is what triggers this branch). Default the
+        // new lease to start the day after the parsed termination and to
+        // run for the same length. User can still edit any field.
+        const ip = parsed?.initialPeriod;
+        if (ip) {
+          // Defense in depth: even with the tightened prompt, Claude can
+          // occasionally return months >= 12. Normalize so months ∈ [0,11].
+          let y = Number(ip.years) || 0;
+          let m = Number(ip.months) || 0;
+          if (m >= 12) { y += Math.floor(m / 12); m = m % 12; }
+          const shifted = { ...ip, years: y, months: m };
+          if (ip.terminationDate && (y > 0 || m > 0)) {
+            // Build local-midnight dates so we don't get UTC-day drift.
+            const parts = String(ip.terminationDate).split('-').map(Number);
+            if (parts.length === 3 && parts.every(Number.isFinite)) {
+              const term = new Date(parts[0], parts[1] - 1, parts[2]);
+              const start = new Date(term); start.setDate(start.getDate() + 1);
+              const end = new Date(start);
+              end.setFullYear(end.getFullYear() + y);
+              end.setMonth(end.getMonth() + m);
+              end.setDate(end.getDate() - 1); // inclusive end
+              const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+              shifted.commencementDate = iso(start);
+              shifted.terminationDate = iso(end);
+            }
+          }
+          parsed = { ...parsed, initialPeriod: shifted };
+        }
       }
       // eslint-disable-next-line no-console
       console.log(`[Lease PDF Parse · ${kind}] Claude returned:`, parsed);
