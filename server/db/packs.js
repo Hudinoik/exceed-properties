@@ -81,6 +81,18 @@ export const canTransition = (fromStage, toStage, { viaWebhook = false } = {}) =
   return (ALLOWED_FORWARD[fromStage] || []).includes(toStage);
 };
 
+// Required-document slots that must be uploaded before a NEW lease can
+// move from offer_sent to lease_drafting. Renewals and addendums do not
+// require this checklist — they're handled via the renewal data path.
+export const REQUIRED_DOCS_NEW_LEASE = ['application', 'id', 'cipc', 'vat', 'proofOfAddress'];
+
+export const missingRequiredDocs = (pack) => {
+  if (!pack) return REQUIRED_DOCS_NEW_LEASE.slice();
+  if ((pack.packType || 'new') !== 'new') return [];
+  const docs = pack.documents || {};
+  return REQUIRED_DOCS_NEW_LEASE.filter(k => !docs[k] || !docs[k].base64);
+};
+
 // Snapshot a transition into stageHistory so the audit trail is on
 // the pack itself, not only in the global auditLog.
 const appendStageHistory = (pack, { from, to, by, reason }) => {
@@ -130,6 +142,9 @@ export const create = async ({ pack, by }) => {
     depositAmount: Number(pack.depositAmount) || 0,
     leaseTerm: Number(pack.leaseTerm) || 0,
     leaseStartDate: pack.leaseStartDate || null,
+    // Renewal-only: when does the CURRENT (expiring) lease end? Drafter
+    // uses this to default the new lease's commencement to the day after.
+    currentLeaseExpiry: pack.currentLeaseExpiry || null,
     stage: pack.stage && STAGES.includes(pack.stage) ? pack.stage : 'offer_sent',
     assignedAgent: pack.assignedAgent ?? null,
     archived: !!pack.archived,
@@ -137,6 +152,18 @@ export const create = async ({ pack, by }) => {
     // Optional document slots — populated as the workflow advances.
     ficaDocuments: Array.isArray(pack.ficaDocuments) ? pack.ficaDocuments : [],
     applicationForm: pack.applicationForm || null,
+    // Per-pack FICA document slots. Each slot is null until uploaded,
+    // then { name, base64, contentType, uploadedAt, uploadedBy }.
+    // Required for offer_sent → lease_drafting transition on new leases:
+    // application, id, cipc, vat, proofOfAddress. creditReport is optional.
+    documents: pack.documents && typeof pack.documents === 'object' ? pack.documents : {
+      application: null,
+      id: null,
+      cipc: null,
+      vat: null,
+      proofOfAddress: null,
+      creditReport: null,
+    },
     draftedLease: null,
     draftedLeaseHistory: [],
     // DocuSign-related fields. Set when the pack reaches docusign stage.
@@ -185,6 +212,17 @@ export const transition = async (packId, toStage, { by, reason, viaWebhook = fal
     e.code = 'illegal_transition';
     throw e;
   }
+  // Gate offer_sent → lease_drafting on the FICA checklist for new leases.
+  // Renewals and addendums skip this — they have their own path.
+  if (!viaWebhook && row.stage === 'offer_sent' && toStage === 'lease_drafting') {
+    const missing = missingRequiredDocs(row);
+    if (missing.length > 0) {
+      const e = new Error(`Missing required documents: ${missing.join(', ')}`);
+      e.code = 'missing_documents';
+      e.missing = missing;
+      throw e;
+    }
+  }
   const from = row.stage;
   row.stage = toStage;
   row.updatedAt = now();
@@ -202,7 +240,7 @@ export const transition = async (packId, toStage, { by, reason, viaWebhook = fal
 // docx-merger; DocuSign accepts DOCX natively, so PDF is optional.
 // send-to-docusign uses whichever format is available, preferring
 // PDF when both are present.
-export const saveDraft = async (packId, { docxBase64, pdfBase64, by }) => {
+export const saveDraft = async (packId, { docxBase64, pdfBase64, leaseOnlyDocxBase64, annexuresOnlyDocxBase64, by }) => {
   const db = await dbReady();
   const row = (db.data.packs || []).find(p => p.packId === packId);
   if (!row) throw new Error(`Pack not found: ${packId}`);
@@ -210,10 +248,16 @@ export const saveDraft = async (packId, { docxBase64, pdfBase64, by }) => {
     throw new Error('saveDraft requires docxBase64 or pdfBase64 (or both)');
   }
   const version = (row.draftedLeaseHistory?.length || 0) + 1;
+  // leaseOnly / annexuresOnly let the lease-checking view download the
+  // Part A (Lease) and Part B (Annexures: resolution + surety) as
+  // SEPARATE files for printing, alongside the merged full draft used
+  // for DocuSign.
   const entry = {
     version,
     docxBase64: docxBase64 || null,
     pdfBase64: pdfBase64 || null,
+    leaseOnlyDocxBase64: leaseOnlyDocxBase64 || null,
+    annexuresOnlyDocxBase64: annexuresOnlyDocxBase64 || null,
     docxSize: docxBase64 ? Math.floor(docxBase64.length * 3 / 4) : 0,
     pdfSize: pdfBase64 ? Math.floor(pdfBase64.length * 3 / 4) : 0,
     draftedAt: now(),
@@ -237,6 +281,51 @@ export const saveDraft = async (packId, { docxBase64, pdfBase64, by }) => {
   row.updatedAt = now();
   await db.write();
   return row;
+};
+
+// Upload a per-pack FICA document to the named slot. Overwrites any
+// existing file in that slot. Slot keys must be one of the well-known
+// document kinds defined in REQUIRED_DOCS_NEW_LEASE plus 'creditReport'.
+const ALLOWED_DOC_SLOTS = [...REQUIRED_DOCS_NEW_LEASE, 'creditReport'];
+export const saveDocument = async (packId, { slot, name, base64, contentType, by }) => {
+  const db = await dbReady();
+  const row = (db.data.packs || []).find(p => p.packId === packId);
+  if (!row) throw new Error(`Pack not found: ${packId}`);
+  if (!ALLOWED_DOC_SLOTS.includes(slot)) {
+    throw new Error(`Unknown document slot: ${slot}`);
+  }
+  if (!base64) throw new Error('base64 is required');
+  if (!row.documents || typeof row.documents !== 'object') row.documents = {};
+  row.documents[slot] = {
+    name: String(name || 'document'),
+    base64,
+    contentType: contentType || 'application/octet-stream',
+    size: Math.floor(base64.length * 3 / 4),
+    uploadedAt: now(),
+    uploadedBy: by || null,
+  };
+  row.updatedAt = now();
+  await db.write();
+  return row;
+};
+export const deleteDocument = async (packId, slot) => {
+  const db = await dbReady();
+  const row = (db.data.packs || []).find(p => p.packId === packId);
+  if (!row) throw new Error(`Pack not found: ${packId}`);
+  if (!ALLOWED_DOC_SLOTS.includes(slot)) {
+    throw new Error(`Unknown document slot: ${slot}`);
+  }
+  if (row.documents && row.documents[slot]) {
+    row.documents[slot] = null;
+    row.updatedAt = now();
+    await db.write();
+  }
+  return row;
+};
+export const readDocument = async (packId, slot) => {
+  const row = await get(packId);
+  if (!row || !row.documents) return null;
+  return row.documents[slot] || null;
 };
 
 // Append a comment to the pack thread. type: 'user' or 'system'.
@@ -334,12 +423,18 @@ export const markLoaded = async (packId, { propertyInspectRef, by } = {}) => {
 
 // Read a draft PDF (or DOCX) at the given version. Returns the
 // base64 string or null if the pack/version doesn't exist.
+//   format='pdf'        → the merged full lease PDF (if rendered)
+//   format='docx'       → the merged full lease DOCX
+//   format='lease'      → Part A only (Lease body, no annexures)
+//   format='annexures'  → Part B only (Resolution + Surety annexures)
 export const readDraftFile = async (packId, { version, format = 'pdf' } = {}) => {
   const row = await get(packId);
   if (!row) return null;
   const history = Array.isArray(row.draftedLeaseHistory) ? row.draftedLeaseHistory : [];
   const entry = version ? history.find(e => e.version === Number(version)) : history[history.length - 1];
   if (!entry) return null;
+  if (format === 'lease') return entry.leaseOnlyDocxBase64 || null;
+  if (format === 'annexures') return entry.annexuresOnlyDocxBase64 || null;
   return format === 'docx' ? entry.docxBase64 : entry.pdfBase64;
 };
 

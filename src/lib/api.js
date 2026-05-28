@@ -254,9 +254,9 @@ export const packs = {
     });
     return r.pack;
   },
-  async saveDraft(packId, { docxBase64, pdfBase64 }) {
+  async saveDraft(packId, { docxBase64, pdfBase64, leaseOnlyDocxBase64, annexuresOnlyDocxBase64 }) {
     const r = await request(`/api/packs/${encodeURIComponent(packId)}/draft`, {
-      method: 'POST', body: { docxBase64, pdfBase64 },
+      method: 'POST', body: { docxBase64, pdfBase64, leaseOnlyDocxBase64, annexuresOnlyDocxBase64 },
     });
     return r.pack;
   },
@@ -288,6 +288,18 @@ export const packs = {
       method: 'POST', body: { body },
     });
     return r.comment;
+  },
+  async uploadDocument(packId, slot, { name, base64, contentType }) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/documents/${encodeURIComponent(slot)}`, {
+      method: 'POST', body: { name, base64, contentType },
+    });
+    return r.pack;
+  },
+  async deleteDocument(packId, slot) {
+    const r = await request(`/api/packs/${encodeURIComponent(packId)}/documents/${encodeURIComponent(slot)}`, {
+      method: 'DELETE',
+    });
+    return r.pack;
   },
   // Files are returned as Blob -- use FileSaver/etc. to surface them.
   async downloadFile(packId, fileType) {

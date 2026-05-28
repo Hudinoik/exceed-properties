@@ -6074,14 +6074,29 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
             buildingName: pack.property || prev.premises.buildingName,
             unitNumber: pack.unit || prev.premises.unitNumber,
           },
-          initialPeriod: {
-            ...prev.initialPeriod,
-            commencementDate: pack.leaseStartDate || prev.initialPeriod.commencementDate,
-            ...(pack.leaseTerm > 0 ? {
-              years: Math.floor(pack.leaseTerm / 12),
-              months: pack.leaseTerm % 12,
-            } : {}),
-          },
+          initialPeriod: (() => {
+            // For renewals, default the commencement to the day AFTER the
+            // current lease expiry — this is what the user asked for so the
+            // new lease picks up seamlessly when the old one ends. The user
+            // can still override.
+            let commencement = pack.leaseStartDate || prev.initialPeriod.commencementDate;
+            if (pack.packType === 'renewal' && pack.currentLeaseExpiry) {
+              const parts = String(pack.currentLeaseExpiry).split('-').map(Number);
+              if (parts.length === 3 && parts.every(Number.isFinite)) {
+                const d = new Date(parts[0], parts[1] - 1, parts[2]);
+                d.setDate(d.getDate() + 1);
+                commencement = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+              }
+            }
+            return {
+              ...prev.initialPeriod,
+              commencementDate: commencement,
+              ...(pack.leaseTerm > 0 ? {
+                years: Math.floor(pack.leaseTerm / 12),
+                months: pack.leaseTerm % 12,
+              } : {}),
+            };
+          })(),
           monthlyRental: {
             ...prev.monthlyRental,
             years: [
@@ -6114,9 +6129,23 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
       return;
     }
     try {
-      const blob = await buildLeaseBlob();
-      const docxBase64 = await blobToBase64(blob);
-      await api.packs.saveDraft(boundPack.packId, { docxBase64 });
+      // Build the full merged lease (for DocuSign) PLUS Part A (lease only)
+      // and Part B (annexures: resolution + surety) as separate blobs so
+      // the lease-checking view can present each one to the user for
+      // printing on its own. buildLeaseParts returns null for part B
+      // if the template is missing — we just skip those slots in that case.
+      const [mergedBlob, parts] = await Promise.all([
+        buildLeaseBlob(),
+        buildLeaseParts(),
+      ]);
+      const docxBase64 = await blobToBase64(mergedBlob);
+      const leaseOnlyDocxBase64 = parts.partA ? await blobToBase64(parts.partA) : null;
+      const annexuresOnlyDocxBase64 = parts.partB ? await blobToBase64(parts.partB) : null;
+      await api.packs.saveDraft(boundPack.packId, {
+        docxBase64,
+        leaseOnlyDocxBase64,
+        annexuresOnlyDocxBase64,
+      });
       if (goToChecking) {
         await api.packs.transition(boundPack.packId, 'lease_checking', 'draft complete');
       }
@@ -6690,6 +6719,31 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
         merger.save('blob', (out) => out ? resolve(out) : reject(new Error('docx-merger returned empty output')));
       } catch (e) { reject(e); }
     });
+  };
+
+  // Build Part A and Part B as SEPARATE blobs (no merging) for the
+  // lease-checking download menu. Part B contains the resolution +
+  // surety annexures (surety stripped if not required). Returns
+  // { partA, partB } — either may be null if rendering fails.
+  const buildLeaseParts = async () => {
+    const data = buildLeaseData(form);
+    const dataPartB = { ...data, sureties: form.suretyRequired ? data.sureties : [] };
+    const out = { partA: null, partB: null };
+    try {
+      out.partA = await renderPart('/lease-template.docx', data, { patchRentalSchedule: true });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[Lease parts] Part A failed:', err.message);
+    }
+    try {
+      out.partB = await renderPart('/part-b-template.docx', dataPartB, {
+        postProcess: form.suretyRequired ? null : stripSuretyAnnexureFromXml,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[Lease parts] Part B skipped:', err.message);
+    }
+    return out;
   };
 
   // Send the rendered lease to DocuSign as a new envelope.
@@ -7933,7 +7987,7 @@ const LeasePreviewBody = ({ form }) => {
 // belong on the pack detail page when that lands; the calculation
 // can be ported then.
 
-const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employees, debtors, landlords = {}, integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
+const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employees, debtors, landlords = {}, tenancies = [], integrations, setIntegrations, showToast, logAction, currentUser, onNavigateToSettings, onNavigate }) => {
   // Pack -> lease-shape compatibility shim. The pipeline rebuild
   // (commit c/8) made packs the source of truth, but most of the
   // existing rendering code (LeaseCard, edit modal, resolution
@@ -8074,6 +8128,71 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
   const [activeCategory, setActiveCategory] = useState('commercial'); // 'commercial' | 'residential' — kept separate, no combined "All" view
   const [calculatorOpen, setCalculatorOpen] = useState(false);
   const [resolutionLease, setResolutionLease] = useState(null);
+  // FICA / application docs modal — opened from offer_sent cards.
+  // Holds the pack id; we look up the latest pack record from `packs`
+  // each render so uploads/deletes show up without an extra fetch.
+  const [docsModalPackId, setDocsModalPackId] = useState(null);
+  const [docsBusy, setDocsBusy] = useState(null); // current slot mid-upload
+  // Lease-checking view: opens a printable list of the three drafted
+  // documents (full lease, lease body, annexures).
+  const [checkingViewPackId, setCheckingViewPackId] = useState(null);
+  const FICA_DOC_SLOTS = [
+    { slot: 'application', label: 'Application Form (PDF)', required: true, accept: 'application/pdf,.pdf' },
+    { slot: 'id', label: 'ID Document', required: true, accept: 'application/pdf,.pdf,image/*' },
+    { slot: 'cipc', label: 'CIPC Docs', required: true, accept: 'application/pdf,.pdf' },
+    { slot: 'vat', label: 'VAT Docs', required: true, accept: 'application/pdf,.pdf' },
+    { slot: 'proofOfAddress', label: 'Proof of Address', required: true, accept: 'application/pdf,.pdf,image/*' },
+    { slot: 'creditReport', label: 'Credit Report', required: false, accept: 'application/pdf,.pdf' },
+  ];
+  // Required-doc list per server/db/packs.js REQUIRED_DOCS_NEW_LEASE.
+  // Used to compute the missing count on the card chip + gate Start Draft.
+  const REQUIRED_FICA_SLOTS = ['application', 'id', 'cipc', 'vat', 'proofOfAddress'];
+  const missingRequiredDocsFor = (lease) => {
+    if ((lease.packType || 'new') !== 'new') return [];
+    const docs = lease.documents || {};
+    return REQUIRED_FICA_SLOTS.filter(s => !docs[s]);
+  };
+
+  const uploadDocSlot = async (packId, slot, file) => {
+    if (!file) return;
+    setDocsBusy(slot);
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => {
+          const dataUrl = fr.result;
+          const comma = String(dataUrl).indexOf(',');
+          resolve(comma >= 0 ? String(dataUrl).slice(comma + 1) : '');
+        };
+        fr.onerror = () => reject(new Error('Failed to read file'));
+        fr.readAsDataURL(file);
+      });
+      await api.packs.uploadDocument(packId, slot, {
+        name: file.name,
+        base64,
+        contentType: file.type || 'application/octet-stream',
+      });
+      await refetchPacks({ archived: showArchived });
+      showToast(`Uploaded ${file.name}`, 'success');
+    } catch (err) {
+      showToast(`Upload failed: ${err.message}`, 'error');
+    } finally {
+      setDocsBusy(null);
+    }
+  };
+  const deleteDocSlot = async (packId, slot) => {
+    if (!window.confirm('Remove this document?')) return;
+    setDocsBusy(slot);
+    try {
+      await api.packs.deleteDocument(packId, slot);
+      await refetchPacks({ archived: showArchived });
+      showToast('Document removed', 'success');
+    } catch (err) {
+      showToast(`Remove failed: ${err.message}`, 'error');
+    } finally {
+      setDocsBusy(null);
+    }
+  };
   const [resolutionDraft, setResolutionDraft] = useState('');
   const [viewMode, setViewMode] = useState('pipeline'); // 'pipeline' | 'table'
   const [stageFilter, setStageFilter] = useState('All');
@@ -8182,16 +8301,26 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
   // and /api/packs/:id/resend-reminder) instead of hitting DocuSign
   // directly from the SPA.
 
-  const schema = {
-    tenant: [validators.required],
-    property: [validators.required],
-    unit: [validators.required],
-    startDate: [validators.required],
-    endDate: [validators.required],
-    monthlyRent: [validators.positiveNumber],
-    deposit: [validators.positiveNumber],
-    assignedTo: [validators.required],
-  };
+  // Required-field set depends on the pack type. Renewals ALWAYS need
+  // tenantCode + currentLeaseExpiry so the lease drafter can default
+  // the new lease's start date to the day after the current lease ends.
+  const schema = (() => {
+    const base = {
+      tenant: [validators.required],
+      property: [validators.required],
+      unit: [validators.required],
+      startDate: [validators.required],
+      endDate: [validators.required],
+      monthlyRent: [validators.positiveNumber],
+      deposit: [validators.positiveNumber],
+      assignedTo: [validators.required],
+    };
+    if (form.packType === 'renewal') {
+      base.tenantCode = [validators.required];
+      base.currentLeaseExpiry = [validators.required];
+    }
+    return base;
+  })();
 
   const handleField = (f, v) => {
     setForm({ ...form, [f]: v });
@@ -8237,14 +8366,27 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
     return employees;
   }, [employees, form.type]);
 
+  // Two-step create flow:
+  //   Step 1 — pick pack type (new / renewal / addendum). User can't fill
+  //            fields until they answer this because the validation rules
+  //            change (renewal makes tenantCode + currentLeaseExpiry
+  //            required so the drafter can default the new lease's start
+  //            to the day after the current lease expires).
+  //   Step 2 — the rest of the form, with a back button to go back to step 1.
+  const [createStep, setCreateStep] = useState(1);
+
   const openCreate = (category = 'commercial') => {
     setEditingId(null);
     setForm({
-      type: category, tenant: '', property: '', unit: '',
+      type: category, packType: '', tenantCode: '', tenant: '',
+      property: '', unit: '',
+      currentLeaseExpiry: '',
       startDate: '', endDate: '', monthlyRent: '', deposit: '',
       assignedTo: '', pipelineStage: 'offer',
     });
-    setErrors({}); setTouched({}); setModalOpen(true);
+    setErrors({}); setTouched({});
+    setCreateStep(1);
+    setModalOpen(true);
   };
 
   const openEdit = (lease) => {
@@ -8297,9 +8439,10 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
           tenantCode: form.tenantCode || '',
           tenantEmail: form.tenantEmail || '',
           packType: form.packType || 'new',
+          currentLeaseExpiry: form.currentLeaseExpiry || null,
           stage: 'offer_sent',
         });
-        logAction(`Created pack ${created.packId} for ${created.tenantName}`);
+        logAction(`Created pack ${created.packId} for ${created.tenantName} (${form.packType || 'new'})`);
         showToast('Pack created', 'success');
       }
       await refetchPacks({ archived: showArchived });
@@ -8468,24 +8611,50 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
               that depend on data we don't yet have on the pack (e.g.
               hasDraft for "Send to Checking") guard themselves and
               fall back to disabled states. */}
-          {isOfferSent && (
-            <button
-              onClick={async () => {
-                // Move to drafting first, then open the drafter
-                // pre-filled. The drafter pre-fill itself is commit
-                // (d) -- this commit just transitions and navigates.
-                const ok = await transitionPack(lease.packId, 'lease_drafting');
-                if (ok) {
-                  window.__draftingPackId = lease.packId;
-                  onNavigate?.('leaseDrafter');
-                }
-              }}
-              className="flex-1 text-xs px-2 py-1 rounded btn-press"
-              style={{ backgroundColor: '#7B61FF', color: '#fff' }}
-            >
-              Start Draft →
-            </button>
-          )}
+          {isOfferSent && (() => {
+            const missing = missingRequiredDocsFor(lease);
+            const ready = missing.length === 0;
+            const isNewLease = (lease.packType || 'new') === 'new';
+            return (
+              <>
+                <button
+                  onClick={() => setDocsModalPackId(lease.packId)}
+                  className="text-xs px-2 py-1 rounded btn-press"
+                  style={{
+                    color: ready ? brand.success : brand.danger,
+                    border: `1px solid ${ready ? brand.success : brand.danger}`,
+                    backgroundColor: ready ? brand.successLight : brand.dangerLight,
+                  }}
+                  title={isNewLease ? (ready ? 'All FICA docs uploaded' : `${missing.length} required doc${missing.length === 1 ? '' : 's'} missing`) : 'View attached documents'}
+                >
+                  {isNewLease ? `Docs ${REQUIRED_FICA_SLOTS.length - missing.length}/${REQUIRED_FICA_SLOTS.length}` : 'Docs'}
+                </button>
+                <button
+                  disabled={isNewLease && !ready}
+                  onClick={async () => {
+                    // Move to drafting first, then open the drafter
+                    // pre-filled. Server also gates this transition —
+                    // we mirror the check client-side for a nicer error.
+                    const ok = await transitionPack(lease.packId, 'lease_drafting');
+                    if (ok) {
+                      window.__draftingPackId = lease.packId;
+                      onNavigate?.('leaseDrafter');
+                    }
+                  }}
+                  className="flex-1 text-xs px-2 py-1 rounded btn-press"
+                  style={{
+                    backgroundColor: (isNewLease && !ready) ? brand.borderDark : '#7B61FF',
+                    color: '#fff',
+                    cursor: (isNewLease && !ready) ? 'not-allowed' : 'pointer',
+                    opacity: (isNewLease && !ready) ? 0.6 : 1,
+                  }}
+                  title={(isNewLease && !ready) ? `Upload the missing FICA docs first: ${missing.join(', ')}` : 'Start drafting the lease'}
+                >
+                  Start Draft →
+                </button>
+              </>
+            );
+          })()}
           {isDrafting && (
             <>
               <button
@@ -8509,6 +8678,14 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
           )}
           {isChecking && (
             <>
+              <button
+                onClick={() => setCheckingViewPackId(lease.packId)}
+                className="text-xs px-2 py-1 rounded btn-press"
+                style={{ color: brand.navy, border: `1px solid ${brand.border}`, backgroundColor: '#fff' }}
+                title="View & print the lease, resolution and surety documents"
+              >
+                View / Print
+              </button>
               <button
                 onClick={() => advanceStage(lease)}
                 className="flex-1 text-xs px-2 py-1 rounded btn-press"
@@ -8856,16 +9033,72 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
 
       {/* Create/Edit Modal */}
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingId ? 'Edit Lease' : 'New Pack'} size="lg">
+        {/* Step 1 — pick the pack type. Editing skips this. */}
+        {!editingId && createStep === 1 ? (
+          <>
+            <p className="text-sm mb-4" style={{ color: brand.textMuted }}>
+              What kind of lease pack are you creating? This drives which fields are required and how the lease drafter pre-fills the new lease.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {[
+                { key: 'new', label: 'New Lease', description: 'Fresh tenant. Full FICA pack will be required before drafting (ID, CIPC, VAT, Proof of Address, Application Form).' },
+                { key: 'renewal', label: 'Renewal', description: 'Existing tenant extending their lease. Tenant Code + current lease expiry are required so the drafter starts the new lease the day after.' },
+                { key: 'addendum', label: 'Addendum', description: 'Amendment to an existing lease (e.g. variation of terms). No FICA refresh required.' },
+              ].map(opt => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  onClick={() => { handleField('packType', opt.key); setCreateStep(2); }}
+                  className="text-left p-4 rounded btn-press transition-all"
+                  style={{
+                    backgroundColor: form.packType === opt.key ? brand.cream : '#fff',
+                    border: `2px solid ${form.packType === opt.key ? brand.gold : brand.border}`,
+                  }}
+                >
+                  <p className="text-sm font-semibold mb-1" style={{ color: brand.navy }}>{opt.label}</p>
+                  <p className="text-xs" style={{ color: brand.textMuted }}>{opt.description}</p>
+                </button>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
+              <Button variant="ghost" onClick={() => setModalOpen(false)}>Cancel</Button>
+            </div>
+          </>
+        ) : (
+        <>
+        {/* Header summarising the chosen type, with a Back button to switch */}
+        {!editingId && (
+          <div className="flex items-center gap-2 mb-3 pb-3" style={{ borderBottom: `1px solid ${brand.border}` }}>
+            <span className="px-2 py-1 text-[11px] font-semibold rounded uppercase tracking-wider"
+              style={{ backgroundColor: brand.cream, color: brand.gold }}>
+              {form.packType === 'renewal' ? 'Renewal' : form.packType === 'addendum' ? 'Addendum' : 'New Lease'}
+            </span>
+            <button onClick={() => setCreateStep(1)} className="text-xs underline ml-2" style={{ color: brand.textMuted }}>
+              ← change type
+            </button>
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
+          {/* Tenant Code lives at the very top of step 2 — optional for new
+              leases, required for renewals (to look up the prior lease). */}
+          <Field
+            label="Tenant Code"
+            required={form.packType === 'renewal'}
+            hint={form.packType === 'renewal' ? 'Required for renewals' : 'Optional — leave blank if unknown'}
+            error={touched.tenantCode && errors.tenantCode}
+          >
+            <Input
+              value={form.tenantCode}
+              onChange={(e) => handleField('tenantCode', e.target.value)}
+              onBlur={() => handleBlur('tenantCode')}
+              error={touched.tenantCode && errors.tenantCode}
+              placeholder="e.g. KFCBOUG01"
+            />
+          </Field>
           <Field label="Lease Category" required>
             <Select value={form.type} onChange={(e) => handleField('type', e.target.value)}>
               <option value="commercial">Commercial</option>
               <option value="residential">Residential</option>
-            </Select>
-          </Field>
-          <Field label="Pipeline Stage" required>
-            <Select value={form.pipelineStage} onChange={(e) => handleField('pipelineStage', e.target.value)}>
-              {LEASE_STAGE_ORDER.map(s => <option key={s} value={s}>{LEASE_STAGES[s].label}</option>)}
             </Select>
           </Field>
           <Field label="Tenant Name" required error={touched.tenant && errors.tenant}>
@@ -8881,9 +9114,54 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
               <Input value={form.property} onChange={(e) => handleField('property', e.target.value)} onBlur={() => handleBlur('property')} error={touched.property && errors.property} placeholder="e.g. Riverside Estate" />
             )}
           </Field>
-          <Field label="Unit / Suite" required error={touched.unit && errors.unit}>
-            <Input value={form.unit} onChange={(e) => handleField('unit', e.target.value)} onBlur={() => handleBlur('unit')} error={touched.unit && errors.unit} placeholder="e.g. Shop 12 or Unit 4B" />
-          </Field>
+          {/* Unit dropdown sourced from tenancies for the selected property.
+              Free-text fallback if the property has no recorded tenancies yet. */}
+          {(() => {
+            const propUnits = form.property
+              ? Array.from(new Set(
+                  tenancies
+                    .filter(t => String(t.property || '').toLowerCase().includes(String(form.property || '').toLowerCase()))
+                    .map(t => t.unit)
+                    .filter(Boolean),
+                )).sort()
+              : [];
+            const hasUnits = propUnits.length > 0;
+            return (
+              <Field label="Unit" required error={touched.unit && errors.unit} hint={hasUnits ? `${propUnits.length} unit${propUnits.length === 1 ? '' : 's'} on file for this property` : (form.property ? 'No tenancies on file — type the unit identifier' : 'Pick a property first')}>
+                {hasUnits ? (
+                  <Select
+                    value={form.unit}
+                    onChange={(e) => handleField('unit', e.target.value)}
+                    error={touched.unit && errors.unit}
+                  >
+                    <option value="">Select unit…</option>
+                    {propUnits.map(u => <option key={u} value={u}>{u}</option>)}
+                  </Select>
+                ) : (
+                  <Input
+                    value={form.unit}
+                    onChange={(e) => handleField('unit', e.target.value)}
+                    onBlur={() => handleBlur('unit')}
+                    error={touched.unit && errors.unit}
+                    placeholder="e.g. Shop 12 or Unit 4B"
+                  />
+                )}
+              </Field>
+            );
+          })()}
+          {/* Renewal-only: when does the CURRENT lease expire? Used as the
+              default new-lease commencement (day after) in the drafter. */}
+          {form.packType === 'renewal' && (
+            <Field label="Current Lease Expiry" required hint="The new lease will default to the day after this" error={touched.currentLeaseExpiry && errors.currentLeaseExpiry}>
+              <Input
+                type="date"
+                value={form.currentLeaseExpiry}
+                onChange={(e) => handleField('currentLeaseExpiry', e.target.value)}
+                onBlur={() => handleBlur('currentLeaseExpiry')}
+                error={touched.currentLeaseExpiry && errors.currentLeaseExpiry}
+              />
+            </Field>
+          )}
           <Field label="Assigned To" required error={touched.assignedTo && errors.assignedTo} hint={`From ${form.type === 'commercial' ? 'Commercial Leasing' : 'Residential Leasing'} team`}>
             <Select value={form.assignedTo} onChange={(e) => handleField('assignedTo', e.target.value)} error={touched.assignedTo && errors.assignedTo}>
               <option value="">Select agent...</option>
@@ -8907,6 +9185,167 @@ const LeasingSection = ({ packs, packsLoaded, refetchPacks, properties, employee
           <Button variant="ghost" onClick={() => setModalOpen(false)}>Cancel</Button>
           <Button variant="primary" icon={Save} onClick={handleSubmit}>{editingId ? 'Save Changes' : 'Create Lease'}</Button>
         </div>
+        </>
+        )}
+      </Modal>
+
+      {/* FICA / Application docs modal — per offer_sent pack */}
+      <Modal
+        open={!!docsModalPackId}
+        onClose={() => { if (!docsBusy) setDocsModalPackId(null); }}
+        title="Tenant FICA & Application Documents"
+        size="lg"
+      >
+        {docsModalPackId && (() => {
+          const pack = packs.find(p => p.packId === docsModalPackId);
+          if (!pack) return <p className="text-sm" style={{ color: brand.textMuted }}>Pack not found.</p>;
+          const docs = pack.documents || {};
+          const isNewLease = (pack.packType || 'new') === 'new';
+          return (
+            <>
+              <p className="text-xs mb-3" style={{ color: brand.textMuted }}>
+                {isNewLease
+                  ? 'All required documents must be uploaded before this pack can move to Lease Drafting. Credit Report is optional.'
+                  : `${pack.packType === 'renewal' ? 'Renewal' : 'Addendum'} — FICA documents are optional and not required to advance.`}
+              </p>
+              <div className="space-y-2">
+                {FICA_DOC_SLOTS.map(({ slot, label, required, accept }) => {
+                  const doc = docs[slot];
+                  const isBusy = docsBusy === slot;
+                  return (
+                    <div key={slot} className="p-3 rounded flex items-center gap-3" style={{ border: `1px solid ${brand.border}`, backgroundColor: doc ? brand.successLight : '#fff' }}>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold" style={{ color: brand.navy }}>
+                          {label}
+                          {required && isNewLease && (
+                            <span className="ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded" style={{ backgroundColor: brand.dangerLight, color: brand.danger }}>
+                              REQUIRED
+                            </span>
+                          )}
+                          {!required && (
+                            <span className="ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded" style={{ backgroundColor: brand.cream, color: brand.textMuted }}>
+                              OPTIONAL
+                            </span>
+                          )}
+                        </p>
+                        {doc ? (
+                          <p className="text-xs mt-0.5" style={{ color: brand.textMuted }}>
+                            {doc.name} · {(doc.size / 1024).toFixed(0)} KB · {formatDate(doc.uploadedAt)}
+                          </p>
+                        ) : (
+                          <p className="text-xs mt-0.5 italic" style={{ color: brand.textMuted }}>Not uploaded</p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {doc && (
+                          <>
+                            <a
+                              href={`/api/packs/${encodeURIComponent(pack.packId)}/files/document-${encodeURIComponent(slot)}`}
+                              className="text-xs px-2 py-1 rounded btn-press"
+                              style={{ color: brand.navy, border: `1px solid ${brand.border}` }}
+                              target="_blank" rel="noopener noreferrer"
+                            >
+                              View
+                            </a>
+                            <button
+                              onClick={() => deleteDocSlot(pack.packId, slot)}
+                              disabled={isBusy}
+                              className="text-xs px-2 py-1 rounded btn-press"
+                              style={{ color: brand.danger, border: `1px solid ${brand.danger}` }}
+                            >
+                              Remove
+                            </button>
+                          </>
+                        )}
+                        <label
+                          className="text-xs px-2 py-1 rounded btn-press cursor-pointer"
+                          style={{ backgroundColor: brand.gold, color: '#fff', opacity: isBusy ? 0.6 : 1 }}
+                        >
+                          {isBusy ? 'Uploading…' : doc ? 'Replace' : 'Upload'}
+                          <input
+                            type="file"
+                            accept={accept}
+                            className="hidden"
+                            disabled={isBusy}
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file) uploadDocSlot(pack.packId, slot, file);
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
+                <Button variant="ghost" onClick={() => setDocsModalPackId(null)} disabled={!!docsBusy}>Close</Button>
+              </div>
+            </>
+          );
+        })()}
+      </Modal>
+
+      {/* Lease-checking View / Print modal — exposes the three drafted
+          documents as standalone downloads so the user can print each
+          one separately (the full lease for the landlord, the resolution
+          copy for the tenant, and the surety annexure on its own). */}
+      <Modal
+        open={!!checkingViewPackId}
+        onClose={() => setCheckingViewPackId(null)}
+        title="Lease Checking — View & Print"
+        size="md"
+      >
+        {checkingViewPackId && (() => {
+          const pack = packs.find(p => p.packId === checkingViewPackId);
+          if (!pack) return <p className="text-sm" style={{ color: brand.textMuted }}>Pack not found.</p>;
+          const latest = pack.draftedLeaseHistory?.[pack.draftedLeaseHistory.length - 1];
+          if (!latest) return <p className="text-sm italic" style={{ color: brand.textMuted }}>No draft saved yet.</p>;
+          const base = `/api/packs/${encodeURIComponent(pack.packId)}/files`;
+          const files = [
+            { key: 'lease', label: 'Lease', sub: 'Part A — the main lease body. Hand to the landlord.', href: `${base}/lease.docx`, available: !!latest.hasLeaseOnly },
+            { key: 'annexures', label: 'Annexures (Resolution & Surety)', sub: 'Part B — corporate resolution + deed of suretyship. Hand the resolution copy to the tenant; surety to the surety.', href: `${base}/annexures.docx`, available: !!latest.hasAnnexures },
+            { key: 'merged', label: 'Full Lease (merged)', sub: 'Part A + Part B combined — the file sent to DocuSign.', href: `${base}/draft-latest.docx`, available: true },
+          ];
+          return (
+            <>
+              <p className="text-xs mb-3" style={{ color: brand.textMuted }}>
+                Each document below is a standalone Word file. Click to download, then print directly from Word.
+              </p>
+              <div className="space-y-2">
+                {files.map(f => (
+                  <div key={f.key} className="p-3 rounded flex items-center gap-3" style={{ border: `1px solid ${brand.border}`, backgroundColor: '#fff' }}>
+                    <FileText size={18} style={{ color: brand.gold }} />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold" style={{ color: brand.navy }}>{f.label}</p>
+                      <p className="text-xs" style={{ color: brand.textMuted }}>{f.sub}</p>
+                    </div>
+                    {f.available ? (
+                      <a
+                        href={f.href}
+                        className="text-xs px-2 py-1 rounded btn-press"
+                        style={{ backgroundColor: brand.navy, color: '#fff' }}
+                      >
+                        Download .docx
+                      </a>
+                    ) : (
+                      <span className="text-xs italic" style={{ color: brand.textMuted }}>
+                        Re-save draft to generate
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] mt-3" style={{ color: brand.textMuted }}>
+                Standalone Lease and Annexures files are populated on each new draft save. If a download shows as unavailable, return to the drafter and click "Send to Checking" to regenerate.
+              </p>
+              <div className="flex justify-end gap-2 mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
+                <Button variant="ghost" onClick={() => setCheckingViewPackId(null)}>Close</Button>
+              </div>
+            </>
+          );
+        })()}
       </Modal>
 
       {/* Resolution Modal — paste / view the landlord resolution attached to a lease */}
@@ -15925,7 +16364,7 @@ export default function ExceedProperties() {
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'tenancy': return checkPerm(PERMISSIONS.VIEW_TENANCY) || <TenancyActivitySection inspections={inspections} integrations={integrations} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'projections': return checkPerm(PERMISSIONS.VIEW_PROJECTIONS) || <ProjectionsSection showToast={showToast} logAction={logAction} />;
-      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection packs={packs} packsLoaded={packsLoaded} refetchPacks={refetchPacks} properties={properties} employees={employees} debtors={debtors} landlords={landlords} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
+      case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection packs={packs} packsLoaded={packsLoaded} refetchPacks={refetchPacks} properties={properties} employees={employees} debtors={debtors} landlords={landlords} tenancies={tenancies} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
       case 'ai': return checkPerm(PERMISSIONS.VIEW_AI) || <AISection employees={employees} setEmployees={setEmployees} properties={properties} setProperties={setProperties} leases={leases} setLeases={setLeases} debtors={debtors} maintenance={maintenance} outages={outages} tenancies={tenancies} landlords={landlords} integrations={integrations} showToast={showToast} logAction={logAction} onNavigateToSettings={() => setActiveNav('settings')} currentUser={currentUser} />;
       case 'leaseDrafter': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeaseDrafter currentUser={currentUser} showToast={showToast} logAction={logAction} integrations={integrations} debtors={debtors} onNavigateToSettings={() => setActiveNav('settings')} onClose={() => setActiveNav('leasing')} />;
       case 'debtors': return checkPerm(PERMISSIONS.VIEW_DEBTORS) || <DebtorsSection debtors={debtors} setDebtors={setDebtors} debtorAccounts={debtorAccounts} setDebtorAccounts={setDebtorAccounts} debtorNotes={debtorNotes} setDebtorNotes={setDebtorNotes} currentUser={currentUser} showToast={showToast} logAction={logAction} />;

@@ -27,12 +27,29 @@ router.use(requireAuth);
 // otherwise; a pipeline view of 50 packs makes that 500MB).
 const strip = (pack) => {
   if (!pack) return pack;
-  const { signedPdfBase64, draftedLeaseHistory, ...rest } = pack;
+  const { signedPdfBase64, draftedLeaseHistory, documents, ...rest } = pack;
+  // Replace each doc slot with metadata only — the SPA fetches the file
+  // bytes separately via /files/document-:slot when the user downloads.
+  let stripDocs = null;
+  if (documents && typeof documents === 'object') {
+    stripDocs = {};
+    for (const [k, v] of Object.entries(documents)) {
+      stripDocs[k] = v ? {
+        name: v.name, contentType: v.contentType, size: v.size,
+        uploadedAt: v.uploadedAt, uploadedBy: v.uploadedBy,
+      } : null;
+    }
+  }
   return {
     ...rest,
+    documents: stripDocs,
     // History entries keep their metadata, drop the bytes.
     draftedLeaseHistory: Array.isArray(draftedLeaseHistory)
-      ? draftedLeaseHistory.map(({ docxBase64: _d, pdfBase64: _p, ...meta }) => meta)
+      ? draftedLeaseHistory.map(({ docxBase64: _d, pdfBase64: _p, leaseOnlyDocxBase64: _l, annexuresOnlyDocxBase64: _a, ...meta }) => ({
+          ...meta,
+          hasLeaseOnly: !!_l,
+          hasAnnexures: !!_a,
+        }))
       : [],
     signedPdfAvailable: !!signedPdfBase64,
   };
@@ -145,6 +162,9 @@ router.post('/:packId/stage', async (req, res) => {
     if (err.code === 'illegal_transition') {
       return res.status(409).json({ error: err.message });
     }
+    if (err.code === 'missing_documents') {
+      return res.status(409).json({ error: err.message, missing: err.missing });
+    }
     if (err.message?.startsWith('Pack not found')) {
       return res.status(404).json({ error: 'Pack not found' });
     }
@@ -161,13 +181,13 @@ router.post('/:packId/stage', async (req, res) => {
 // drafter offer "Save Draft" vs "Save and Send to Checking" as
 // distinct actions).
 router.post('/:packId/draft', async (req, res) => {
-  const { docxBase64, pdfBase64 } = req.body || {};
+  const { docxBase64, pdfBase64, leaseOnlyDocxBase64, annexuresOnlyDocxBase64 } = req.body || {};
   if (!docxBase64 && !pdfBase64) {
     return res.status(400).json({ error: 'At least one of docxBase64 or pdfBase64 is required' });
   }
   try {
     const updated = await packs.saveDraft(req.params.packId, {
-      docxBase64, pdfBase64, by: req.session.userId,
+      docxBase64, pdfBase64, leaseOnlyDocxBase64, annexuresOnlyDocxBase64, by: req.session.userId,
     });
     await audit.log({
       userId: req.session.userId, userEmail: req.session.email,
@@ -403,6 +423,21 @@ router.get('/:packId/files/:fileType', async (req, res) => {
       base64 = await packs.readSignedPdf(packId);
       contentType = 'application/pdf';
       downloadName = `${packId}-signed.pdf`;
+    } else if (fileType.startsWith('document-')) {
+      // FICA / application doc download. fileType = "document-<slot>".
+      const slot = fileType.slice('document-'.length);
+      const doc = await packs.readDocument(packId, slot);
+      if (!doc) return res.status(404).json({ error: 'Document not uploaded' });
+      base64 = doc.base64;
+      contentType = doc.contentType || 'application/octet-stream';
+      downloadName = doc.name || `${packId}-${slot}`;
+    } else if (fileType === 'lease.docx' || fileType === 'annexures.docx') {
+      // Standalone Part A (lease) and Part B (annexures: resolution +
+      // surety) for the lease-checking view to print separately.
+      const format = fileType === 'lease.docx' ? 'lease' : 'annexures';
+      base64 = await packs.readDraftFile(packId, { format });
+      contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      downloadName = `${packId}-${fileType}`;
     } else {
       const m = fileType.match(/^draft-(latest|\d+)\.(pdf|docx)$/);
       if (!m) return res.status(400).json({ error: 'Unknown file type' });
@@ -422,6 +457,55 @@ router.get('/:packId/files/:fileType', async (req, res) => {
     // eslint-disable-next-line no-console
     console.error('[packs] file download failed:', err.message);
     res.status(500).json({ error: 'Failed to download file' });
+  }
+});
+
+// ----- POST /api/packs/:packId/documents/:slot ---------------
+// Body: { name, base64, contentType }
+// Upload a FICA / application document to the named slot. The slot
+// names are validated server-side (saveDocument throws on unknown
+// slots). Pack must NOT already be past offer_sent to keep the file
+// list aligned with what was used to authorise the draft.
+router.post('/:packId/documents/:slot', async (req, res) => {
+  const { packId, slot } = req.params;
+  const { name, base64, contentType } = req.body || {};
+  if (!base64) return res.status(400).json({ error: 'base64 is required' });
+  try {
+    const updated = await packs.saveDocument(packId, {
+      slot, name, base64, contentType, by: req.session.userId,
+    });
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'pack.document.upload',
+      details: { packId, slot, name: name || null, size: updated.documents?.[slot]?.size || 0 },
+      ip: req.ip,
+    });
+    res.json({ pack: strip(updated) });
+  } catch (err) {
+    if (err.message?.startsWith('Pack not found')) return res.status(404).json({ error: 'Pack not found' });
+    if (err.message?.startsWith('Unknown document slot')) return res.status(400).json({ error: err.message });
+    // eslint-disable-next-line no-console
+    console.error('[packs] document upload failed:', err.message);
+    res.status(500).json({ error: 'Failed to save document' });
+  }
+});
+router.delete('/:packId/documents/:slot', async (req, res) => {
+  const { packId, slot } = req.params;
+  try {
+    const updated = await packs.deleteDocument(packId, slot);
+    await audit.log({
+      userId: req.session.userId, userEmail: req.session.email,
+      action: 'pack.document.delete',
+      details: { packId, slot },
+      ip: req.ip,
+    });
+    res.json({ pack: strip(updated) });
+  } catch (err) {
+    if (err.message?.startsWith('Pack not found')) return res.status(404).json({ error: 'Pack not found' });
+    if (err.message?.startsWith('Unknown document slot')) return res.status(400).json({ error: err.message });
+    // eslint-disable-next-line no-console
+    console.error('[packs] document delete failed:', err.message);
+    res.status(500).json({ error: 'Failed to delete document' });
   }
 });
 
