@@ -4766,23 +4766,45 @@ const extractPdfText = async (file) => {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    // Group items by their Y coordinate so multi-column layouts (e.g. an
-    // invoice with "Bill To" on the left and the landlord block on the
-    // right) keep their lines intact instead of being flattened into a
-    // single space-joined blob. Within each line, sort by X so columns
-    // read left-to-right. This makes it much easier for Claude to spot
-    // the BANKING DETAILS block on a typical SA tax invoice.
     const items = (content.items || []).filter(it => 'str' in it && it.str);
+    // Bucket Y to the nearest LINE_TOL so sub-pixel jitter on a single visual
+    // line (superscripts, baseline adjustments) doesn't fragment text across
+    // multiple rows. Math.round alone splits y=100.4 and y=100.6 into two
+    // lines and breaks every prompt that depends on line structure.
+    const LINE_TOL = 3;
+    const bucketY = (y) => Math.round(y / LINE_TOL) * LINE_TOL;
     const lines = new Map();
     for (const it of items) {
-      const y = Math.round((it.transform?.[5] ?? 0));
+      const y = bucketY(it.transform?.[5] ?? 0);
       const x = it.transform?.[4] ?? 0;
+      const w = it.width ?? 0;
       if (!lines.has(y)) lines.set(y, []);
-      lines.get(y).push({ x, s: it.str });
+      lines.get(y).push({ x, w, s: it.str });
     }
     const sortedY = [...lines.keys()].sort((a, b) => b - a); // top of page first
+    // Within a line, insert a column-gap marker when the whitespace between
+    // adjacent fragments exceeds COL_GAP points. Without this, the invoice's
+    // "Bill To" (left) and landlord block (right) collapse into one space-
+    // joined string — and Claude has no way to tell which side is which,
+    // even though every prompt instructs it to use TOP-RIGHT vs LEFT.
+    const COL_GAP = 40;
     const pageText = sortedY
-      .map(y => lines.get(y).sort((a, b) => a.x - b.x).map(p => p.s).join(' ').replace(/\s+/g, ' ').trim())
+      .map(y => {
+        const parts = lines.get(y).sort((a, b) => a.x - b.x);
+        let out = '';
+        let lastRight = null;
+        for (const p of parts) {
+          const right = p.x + (p.w || 0);
+          if (lastRight != null && p.x - lastRight > COL_GAP) {
+            out += '    |    ';
+          } else if (out) {
+            out += ' ';
+          }
+          out += p.s;
+          lastRight = right;
+        }
+        return out.replace(/[ \t]+/g, ' ').replace(/ \| /g, ' | ').trim();
+      })
       .filter(Boolean)
       .join('\n');
     text += pageText + '\n\n';
@@ -5027,6 +5049,11 @@ const callClaudeTool = async ({ model, tool, systemPrompt, userText }) => {
   const res = await api.proxy.anthropicMessages({
     model: model || 'claude-haiku-4-5-20251001',
     max_tokens: 4096,
+    // Deterministic extraction. Without this, the default sampling
+    // temperature is 1.0 and identical PDFs can return different fields
+    // on different runs — the exact "sometimes right, sometimes wrong"
+    // symptom we were seeing.
+    temperature: 0,
     tools: [tool],
     tool_choice: { type: 'tool', name: tool.name },
     system: systemPrompt,
@@ -5056,6 +5083,9 @@ const parseLeaseControlPdf = async (pdfText, model) => callClaudeTool({
     '  • "1.16/1.17 LEASE FEES" → leaseFees.amount',
     '',
     'EXTRACT EVERY FIELD YOU CAN FIND for both parties. Specifically for the TENANT, look for and extract: company name, registration number, VAT number (or "TBA" if shown that way), physical/postal address (multi-line OK), phone, email, and contact person. The tenant section often spans multiple lines with these labels.',
+    '',
+    'TEXT FORMAT:',
+    '  • The PDF has been extracted preserving spatial layout. Lines that contained text in multiple columns are joined with " | " as a column separator. Labels (e.g. "VAT NO", "REG NO") commonly appear on the LEFT of " | " and the value on the RIGHT — pair them accordingly.',
     '',
     'ABSOLUTE RULES:',
     '  • If a value is under "1.1 THE LANDLORD", it is a LANDLORD field. Never put it in tenant.',
@@ -5118,10 +5148,13 @@ const parseInvoicePdf = async (pdfText, model) => callClaudeTool({
   systemPrompt: [
     'You extract structured data from South African commercial lease tax invoices.',
     '',
+    'TEXT FORMAT:',
+    '  • The PDF has been extracted preserving spatial layout. Lines that contained text in multiple columns are joined with " | " as a column separator. Treat each " | "-separated segment as its OWN column — text on the LEFT of " | " is the left column, text on the RIGHT of " | " is the right column.',
+    '',
     'INVOICE LAYOUT FOR THIS USER:',
-    '  • The LANDLORD\'s identity (company name, address, phone, registration number, VAT number) is printed in the TOP-RIGHT of the page.',
+    '  • The LANDLORD\'s identity (company name, address, phone, registration number, VAT number) is printed in the TOP-RIGHT of the page — i.e. on the RIGHT side of " | " in the early lines of the document.',
     '  • The LANDLORD\'s banking details are printed in a separate banking block lower on the page (labelled BANKING DETAILS / EFT DETAILS / PAYMENT DETAILS / BANK DETAILS).',
-    '  • The TENANT is the "Bill To" / "Invoice To" / "Customer" block (usually middle-left). You must NOT extract any tenant information. The schema you are calling has NO tenant fields — only landlord, deposit, and utilities.',
+    '  • The TENANT is the "Bill To" / "Invoice To" / "Customer" block (usually middle-LEFT — i.e. on the LEFT side of " | "). You must NOT extract any tenant information. The schema you are calling has NO tenant fields — only landlord, deposit, and utilities.',
     '',
     'RULES:',
     '  1. ONLY extract landlord identity from the TOP-RIGHT region of the page.',
