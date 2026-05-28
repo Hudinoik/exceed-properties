@@ -38,7 +38,13 @@ const DEFAULT_DATA = {
   // { id, userId, userEmail, action: 'create'|'edit'|'delete',
   //   inEventId, outEventId, personId, note, diff, createdAt }
   jibbleAdjustments: [],
-  nextId: { user: 1, secret: 1, audit: 1, webhook: 1, pack: 1, jibbleAdjustment: 1 },
+  // Flag actions against the auto-derived time-tracking flags. Flags
+  // themselves are computed client-side from time entries (late in /
+  // early out / short hours) — only the actions taken on them persist.
+  // { id, userId, flagKey (personId|date), type: 'dismiss'|'comment',
+  //   actorEmail, actorName, actorRole, comment (for comment), createdAt }
+  timeFlagActions: [],
+  nextId: { user: 1, secret: 1, audit: 1, webhook: 1, pack: 1, jibbleAdjustment: 1, timeFlagAction: 1 },
 };
 
 let db;
@@ -317,6 +323,50 @@ export const jibbleAdjustments = {
     }
     await persist();
     return row;
+  },
+};
+
+// ----- Time-tracking flag actions --------------------------------------
+// Flags themselves are derived in the browser from the time entries
+// (late clock-in, early clock-out, short hours). Only the human actions
+// — a property-manager comment explaining why, and the director's
+// dismissal — need to persist. flagKey is "<personId>|<YYYY-MM-DD>";
+// multiple flag kinds on the same day share one comment thread.
+
+const ensureTimeFlagActionsArray = () => {
+  if (!Array.isArray(db.data.timeFlagActions)) db.data.timeFlagActions = [];
+};
+
+export const timeFlagActions = {
+  list(userId) {
+    ensureTimeFlagActionsArray();
+    return db.data.timeFlagActions.filter(a => a.userId === userId);
+  },
+  async create({ userId, flagKey, type, actorEmail, actorName, actorRole, comment }) {
+    ensureTimeFlagActionsArray();
+    const row = {
+      id: nextId('timeFlagAction'),
+      userId,
+      flagKey: String(flagKey),
+      type,
+      actorEmail: actorEmail || null,
+      actorName: actorName || null,
+      actorRole: actorRole || null,
+      comment: type === 'comment' ? String(comment || '').slice(0, 2000) : null,
+      createdAt: new Date().toISOString(),
+    };
+    db.data.timeFlagActions.unshift(row);
+    await persist();
+    return row;
+  },
+  async undismiss({ userId, flagKey }) {
+    ensureTimeFlagActionsArray();
+    const before = db.data.timeFlagActions.length;
+    db.data.timeFlagActions = db.data.timeFlagActions.filter(
+      a => !(a.userId === userId && a.flagKey === flagKey && a.type === 'dismiss'),
+    );
+    if (db.data.timeFlagActions.length !== before) await persist();
+    return before - db.data.timeFlagActions.length;
   },
 };
 

@@ -744,6 +744,8 @@ const PERMISSIONS = {
   EDIT_EMPLOYEES: 'edit:employees',
   VIEW_TIME: 'view:time',
   APPROVE_TIME: 'approve:time',
+  COMMENT_TIME_FLAG: 'comment:timeFlag',
+  DISMISS_TIME_FLAG: 'dismiss:timeFlag',
   VIEW_INSPECTIONS: 'view:inspections',
   EDIT_INSPECTIONS: 'edit:inspections',
   VIEW_MAINTENANCE: 'view:maintenance',
@@ -779,6 +781,7 @@ const ROLES = {
     permissions: [
       PERMISSIONS.VIEW_DASHBOARD, PERMISSIONS.VIEW_PROPERTIES, PERMISSIONS.EDIT_PROPERTIES,
       PERMISSIONS.VIEW_EMPLOYEES, PERMISSIONS.VIEW_TIME, PERMISSIONS.APPROVE_TIME,
+      PERMISSIONS.COMMENT_TIME_FLAG,
       PERMISSIONS.VIEW_INSPECTIONS, PERMISSIONS.EDIT_INSPECTIONS,
       PERMISSIONS.VIEW_MAINTENANCE, PERMISSIONS.EDIT_MAINTENANCE,
       PERMISSIONS.VIEW_OUTAGES, PERMISSIONS.REPORT_OUTAGES,
@@ -2777,6 +2780,99 @@ const makePaired = (inEv, outEv, idx, projectsMap = {}) => {
   };
 };
 
+// ----- Time-tracking flag rules ---------------------------------------
+// Pure detection of anomalies in paired clock entries. A flag is a
+// per-(person, date) record that can carry multiple reasons (late in,
+// early out, short hours). flagKey is stable so dismissals/comments
+// stored server-side remain matched across reloads and across users.
+
+const TIME_FLAG_RULES = {
+  LATE_IN_MINUTES: 8 * 60 + 30,   // first clock-in after 08:30 → flag
+  EARLY_OUT_MINUTES: 15 * 60 + 30, // last clock-out before 15:30 → flag
+  MIN_HOURS_PER_DAY: 4,            // total worked < 4h → flag
+};
+
+const minutesOfDay = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  return d.getHours() * 60 + d.getMinutes();
+};
+
+const fmtHHMM = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+// Group paired entries by (personId, date) then derive flag reasons.
+// Returns an array of:
+//   { flagKey, personId, employee, date, reasons: [{kind, label, detail}],
+//     totalHours, firstInIso, lastOutIso, entryIds }
+// Open-shift days (no clockOut yet) are skipped — we only flag once the
+// day's pattern is final. Future-proofing: callers can re-evaluate.
+const computeTimeFlags = (pairedEntries, { todayIso } = {}) => {
+  const today = todayIso || (new Date()).toISOString().slice(0, 10);
+  const byPersonDate = new Map();
+  for (const p of pairedEntries) {
+    if (!p.personId || !p.date) continue;
+    if (p.date >= today) continue; // don't flag today or future — still in progress
+    const k = `${p.personId}|${p.date}`;
+    if (!byPersonDate.has(k)) byPersonDate.set(k, []);
+    byPersonDate.get(k).push(p);
+  }
+  const flags = [];
+  byPersonDate.forEach((rows, key) => {
+    // Skip if ANY shift on that day is still open — wait for it to close.
+    if (rows.some(r => r.isOpen)) return;
+    rows.sort((a, b) => new Date(a.inIso || 0) - new Date(b.inIso || 0));
+    const firstIn = rows.find(r => r.inIso)?.inIso || null;
+    const lastOut = [...rows].reverse().find(r => r.outIso)?.outIso || null;
+    const totalHours = rows.reduce((s, r) => s + (r.hours || 0), 0);
+    const reasons = [];
+    const inMin = minutesOfDay(firstIn);
+    if (inMin != null && inMin > TIME_FLAG_RULES.LATE_IN_MINUTES) {
+      reasons.push({
+        kind: 'late_in',
+        label: 'Late clock-in',
+        detail: `First clock-in at ${fmtHHMM(firstIn)} (after 08:30)`,
+      });
+    }
+    const outMin = minutesOfDay(lastOut);
+    if (outMin != null && outMin < TIME_FLAG_RULES.EARLY_OUT_MINUTES) {
+      reasons.push({
+        kind: 'early_out',
+        label: 'Early clock-out',
+        detail: `Last clock-out at ${fmtHHMM(lastOut)} (before 15:30)`,
+      });
+    }
+    if (totalHours > 0 && totalHours < TIME_FLAG_RULES.MIN_HOURS_PER_DAY) {
+      reasons.push({
+        kind: 'short_hours',
+        label: 'Short hours',
+        detail: `Worked ${totalHours.toFixed(2)}h (under ${TIME_FLAG_RULES.MIN_HOURS_PER_DAY}h)`,
+      });
+    }
+    if (reasons.length === 0) return;
+    const [personId, date] = key.split('|');
+    flags.push({
+      flagKey: key,
+      personId,
+      employee: rows[0].employee,
+      date,
+      reasons,
+      totalHours,
+      firstInIso: firstIn,
+      lastOutIso: lastOut,
+      entryIds: rows.map(r => r.id),
+    });
+  });
+  // Most-recent days first, then by employee for stable rendering.
+  flags.sort((a, b) => (b.date.localeCompare(a.date)) || a.employee.localeCompare(b.employee));
+  return flags;
+};
+
 const startOfWeekISO = () => {
   const d = new Date();
   const day = d.getDay() || 7; // Sun -> 7
@@ -2811,7 +2907,7 @@ const jibbleCache = {
   configStatus: 'unknown',
 };
 
-const TimeTrackingSection = ({ employees, showToast, integrations, setIntegrations, onNavigateToSettings }) => {
+const TimeTrackingSection = ({ employees, showToast, integrations, setIntegrations, onNavigateToSettings, currentUser }) => {
   const jibble = integrations?.jibble || {};
 
   // Configured-ness comes from the server vault. Cached at module level
@@ -2904,6 +3000,26 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
   const [history, setHistory] = useState(null);
   const openHistoryModal = (row, notes) => setHistory({ row, notes });
   const closeHistoryModal = () => setHistory(null);
+
+  // Flagged sub-page state. Actions (PM comments + director dismissals)
+  // are loaded from the server; flags themselves are derived from
+  // `entries` in a useMemo below.
+  const [flagActions, setFlagActions] = useState([]);
+  const [flagLookbackDays, setFlagLookbackDays] = useState(14);
+  const [flagShowDismissed, setFlagShowDismissed] = useState(false);
+  const [flagBusy, setFlagBusy] = useState(null); // flagKey currently mutating
+  const [flagDraftComment, setFlagDraftComment] = useState({}); // {flagKey: text}
+  const refreshFlagActions = useCallback(async () => {
+    try {
+      const rows = await api.timeFlags.list();
+      setFlagActions(rows);
+    } catch {
+      // Quiet — not load-bearing; will retry next mount.
+    }
+  }, []);
+  useEffect(() => { refreshFlagActions(); }, [refreshFlagActions]);
+  const canDismissFlag = hasPermission(currentUser, PERMISSIONS.DISMISS_TIME_FLAG);
+  const canCommentFlag = hasPermission(currentUser, PERMISSIONS.COMMENT_TIME_FLAG);
 
   const entries = useMemo(() => pairClockEvents(rawEntries, projectsMap), [rawEntries, projectsMap]);
   const liveEntries = useMemo(
@@ -3479,6 +3595,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
         {[
           { key: 'overview', label: 'Overview' },
           { key: 'reporting', label: 'Reporting' },
+          { key: 'flagged', label: 'Flagged' },
         ].map(t => (
           <button
             key={t.key}
@@ -4073,6 +4190,235 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                   </div>
                 </Card>
               )
+            )}
+          </>
+        );
+      })()}
+
+      {/* Flagged tab — auto-derived from `entries`. Property managers can
+          add reason comments; only the director can dismiss/reopen. */}
+      {subPage === 'flagged' && (() => {
+        const flags = computeTimeFlags(entries);
+        const actionsByKey = new Map();
+        flagActions.forEach(a => {
+          if (!actionsByKey.has(a.flagKey)) actionsByKey.set(a.flagKey, { comments: [], dismissal: null });
+          const bucket = actionsByKey.get(a.flagKey);
+          if (a.type === 'comment') bucket.comments.push(a);
+          else if (a.type === 'dismiss') {
+            if (!bucket.dismissal || new Date(a.createdAt) > new Date(bucket.dismissal.createdAt)) {
+              bucket.dismissal = a;
+            }
+          }
+        });
+        const enriched = flags.map(f => ({
+          ...f,
+          comments: (actionsByKey.get(f.flagKey)?.comments || []).slice().sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)),
+          dismissal: actionsByKey.get(f.flagKey)?.dismissal || null,
+        }));
+        const visible = enriched.filter(f => flagShowDismissed || !f.dismissal);
+        const dismissedCount = enriched.filter(f => !!f.dismissal).length;
+
+        const submitComment = async (flag) => {
+          const text = (flagDraftComment[flag.flagKey] || '').trim();
+          if (!text) return;
+          setFlagBusy(flag.flagKey);
+          try {
+            const actorName = currentUser ? `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() : null;
+            await api.timeFlags.addComment({
+              flagKey: flag.flagKey,
+              comment: text,
+              actorRole: currentUser?.systemRole,
+              actorName,
+            });
+            setFlagDraftComment(prev => ({ ...prev, [flag.flagKey]: '' }));
+            await refreshFlagActions();
+            showToast('Comment added', 'success');
+          } catch (err) {
+            showToast(`Could not add comment: ${err.message}`, 'error');
+          } finally {
+            setFlagBusy(null);
+          }
+        };
+        const dismissFlag = async (flag) => {
+          setFlagBusy(flag.flagKey);
+          try {
+            const actorName = currentUser ? `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() : null;
+            await api.timeFlags.dismiss({
+              flagKey: flag.flagKey,
+              actorRole: currentUser?.systemRole,
+              actorName,
+            });
+            await refreshFlagActions();
+            showToast('Flag dismissed', 'success');
+          } catch (err) {
+            showToast(`Could not dismiss: ${err.message}`, 'error');
+          } finally {
+            setFlagBusy(null);
+          }
+        };
+        const reopenFlag = async (flag) => {
+          setFlagBusy(flag.flagKey);
+          try {
+            await api.timeFlags.reopen({
+              flagKey: flag.flagKey,
+              actorRole: currentUser?.systemRole,
+            });
+            await refreshFlagActions();
+            showToast('Flag re-opened', 'success');
+          } catch (err) {
+            showToast(`Could not re-open: ${err.message}`, 'error');
+          } finally {
+            setFlagBusy(null);
+          }
+        };
+
+        return (
+          <>
+            <Card className="mb-4 p-4">
+              <div className="flex items-center gap-2 flex-wrap mb-2">
+                <p className="text-xs font-medium tracking-wider uppercase" style={{ color: brand.textMuted }}>Period</p>
+                {[
+                  { key: 'today', label: 'Today' },
+                  { key: 'week', label: 'This Week' },
+                  { key: 'month', label: 'This Month' },
+                  { key: 'custom', label: 'Custom' },
+                ].map(r => (
+                  <button
+                    key={r.key}
+                    onClick={() => setRangeKey(r.key)}
+                    className="px-3 py-1.5 text-xs font-medium rounded btn-press transition-all"
+                    style={{
+                      backgroundColor: rangeKey === r.key ? brand.navy : 'transparent',
+                      color: rangeKey === r.key ? '#fff' : brand.text,
+                      border: `1px solid ${rangeKey === r.key ? brand.navy : brand.border}`,
+                    }}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+                {rangeKey === 'custom' && (
+                  <div className="flex items-center gap-2 ml-2">
+                    <input type="date" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="px-2 py-1 text-xs rounded outline-none" style={{ border: `1px solid ${brand.border}` }} />
+                    <span style={{ color: brand.textMuted }}>→</span>
+                    <input type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="px-2 py-1 text-xs rounded outline-none" style={{ border: `1px solid ${brand.border}` }} />
+                  </div>
+                )}
+                <label className="flex items-center gap-2 ml-auto text-xs cursor-pointer" style={{ color: brand.text }}>
+                  <input
+                    type="checkbox"
+                    checked={flagShowDismissed}
+                    onChange={(e) => setFlagShowDismissed(e.target.checked)}
+                  />
+                  Show dismissed ({dismissedCount})
+                </label>
+              </div>
+              <p className="text-xs" style={{ color: brand.textMuted }}>
+                Auto-flags any day where first clock-in is after 08:30, last clock-out is before 15:30, or total worked is under {TIME_FLAG_RULES.MIN_HOURS_PER_DAY} hours.
+                {!canDismissFlag && !canCommentFlag && ' Read-only view — only directors can dismiss flags; property managers can add reason comments.'}
+                {canCommentFlag && !canDismissFlag && ' You can add a reason comment; only the director can dismiss.'}
+              </p>
+            </Card>
+
+            {visible.length === 0 ? (
+              <Card className="p-8">
+                <p className="text-sm italic text-center" style={{ color: brand.textMuted }}>
+                  {loading ? 'Loading…' : enriched.length === 0 ? 'No flags in this period — everyone clocked in on time.' : 'All flags in this period have been dismissed.'}
+                </p>
+              </Card>
+            ) : (
+              <div className="space-y-3">
+                {visible.map(flag => {
+                  const isDismissed = !!flag.dismissal;
+                  const reasonColor = (kind) => kind === 'short_hours' ? brand.danger : kind === 'late_in' ? brand.gold : '#A86523';
+                  return (
+                    <Card key={flag.flagKey} className="p-4" style={isDismissed ? { backgroundColor: '#f4f3ee', opacity: 0.75 } : undefined}>
+                      <div className="flex items-start justify-between gap-3 flex-wrap mb-2">
+                        <div>
+                          <p className="text-sm font-semibold" style={{ color: brand.navy }}>
+                            {flag.employee} <span className="font-normal" style={{ color: brand.textMuted }}>· {flag.date}</span>
+                          </p>
+                          <p className="text-xs mt-0.5" style={{ color: brand.textMuted }}>
+                            In {fmtHHMM(flag.firstInIso)} · Out {fmtHHMM(flag.lastOutIso)} · {flag.totalHours.toFixed(2)}h total
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {isDismissed ? (
+                            <>
+                              <span className="px-2 py-1 text-[11px] font-semibold rounded" style={{ backgroundColor: brand.successLight, color: brand.success }}>
+                                Dismissed by {flag.dismissal.actorName || flag.dismissal.actorEmail || 'admin'}
+                              </span>
+                              {canDismissFlag && (
+                                <Button variant="ghost" size="sm" onClick={() => reopenFlag(flag)} disabled={flagBusy === flag.flagKey}>
+                                  Re-open
+                                </Button>
+                              )}
+                            </>
+                          ) : canDismissFlag ? (
+                            <Button variant="primary" size="sm" onClick={() => dismissFlag(flag)} disabled={flagBusy === flag.flagKey}>
+                              {flagBusy === flag.flagKey ? 'Dismissing…' : 'Dismiss flag'}
+                            </Button>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2 mb-3">
+                        {flag.reasons.map(r => (
+                          <span
+                            key={r.kind}
+                            className="px-2 py-1 text-[11px] font-medium rounded"
+                            style={{ backgroundColor: '#fff', color: reasonColor(r.kind), border: `1px solid ${reasonColor(r.kind)}` }}
+                            title={r.detail}
+                          >
+                            {r.label} · {r.detail}
+                          </span>
+                        ))}
+                      </div>
+                      {(flag.comments.length > 0 || canCommentFlag) && (
+                        <div className="border-t pt-3 mt-2" style={{ borderColor: brand.border }}>
+                          {flag.comments.length > 0 && (
+                            <div className="space-y-2 mb-3">
+                              {flag.comments.map(c => (
+                                <div key={c.id} className="p-2 rounded" style={{ backgroundColor: brand.cream }}>
+                                  <p className="text-[11px] font-semibold" style={{ color: brand.navy }}>
+                                    {c.actorName || c.actorEmail || 'Property manager'}
+                                    {c.actorRole && (
+                                      <span className="font-normal ml-1" style={{ color: brand.textMuted }}>
+                                        · {ROLES[c.actorRole]?.label || c.actorRole}
+                                      </span>
+                                    )}
+                                    <span className="font-normal ml-2" style={{ color: brand.textMuted }}>{timeAgo(c.createdAt)}</span>
+                                  </p>
+                                  <p className="text-sm mt-1" style={{ color: brand.text, whiteSpace: 'pre-wrap' }}>{c.comment}</p>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {canCommentFlag && !isDismissed && (
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={flagDraftComment[flag.flagKey] || ''}
+                                onChange={(e) => setFlagDraftComment(prev => ({ ...prev, [flag.flagKey]: e.target.value }))}
+                                onKeyDown={(e) => { if (e.key === 'Enter') submitComment(flag); }}
+                                placeholder="Add a reason for this flag…"
+                                className="flex-1 px-3 py-1.5 text-sm rounded outline-none"
+                                style={{ backgroundColor: '#fff', border: `1px solid ${brand.border}` }}
+                              />
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => submitComment(flag)}
+                                disabled={flagBusy === flag.flagKey || !(flagDraftComment[flag.flagKey] || '').trim()}
+                              >
+                                Comment
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })}
+              </div>
             )}
           </>
         );
@@ -14588,7 +14934,9 @@ const AISection = ({
   leases, setLeases,
   debtors, maintenance, outages, tenancies, landlords,
   integrations, showToast, logAction, onNavigateToSettings,
+  currentUser,
 }) => {
+  const canSeeTime = hasPermission(currentUser, PERMISSIONS.VIEW_TIME);
   const anthropicCfg = integrations?.anthropic || {};
   const [hasKey, setHasKey] = useState(false);
   useEffect(() => {
@@ -14598,6 +14946,53 @@ const AISection = ({
       .catch(() => { if (!cancelled) setHasKey(false); });
     return () => { cancelled = true; };
   }, []);
+
+  // Time-tracking context: fetch a 30-day window of Jibble entries +
+  // server-stored flag actions so the assistant can answer "who worked
+  // the most", "who was late this week", etc. Cached for the lifetime
+  // of this mount; refreshed automatically every 10 min while open.
+  const [timeContext, setTimeContext] = useState(null); // { entries, projectsMap, flagActions, fetchedAt, error }
+  const fetchTimeContext = useCallback(async () => {
+    if (!canSeeTime) { setTimeContext({ entries: [], flagActions: [], error: 'permission' }); return; }
+    try {
+      // 30-day lookback ending today — wide enough to answer "this month"
+      // and most "this week" questions without blowing the prompt budget.
+      const to = todayISO();
+      const fromDate = new Date(); fromDate.setDate(fromDate.getDate() - 30);
+      const from = localDateISO(fromDate);
+      const params = new URLSearchParams();
+      params.set('$top', '1000');
+      params.set('$filter', `belongsToDate ge ${from} and belongsToDate le ${to}`);
+      params.set('$orderby', 'time desc');
+      params.set('$expand', 'person');
+      const [entriesRes, projectsRes, flagActionsList] = await Promise.all([
+        api.proxy.jibbleGet(`/TimeEntries?${params.toString()}`, 'time').catch(() => null),
+        Object.keys(jibbleCache.projectsMap || {}).length > 0
+          ? Promise.resolve({ value: Object.entries(jibbleCache.projectsMap).map(([id, name]) => ({ id, name })) })
+          : api.proxy.jibbleGet('/Projects?$top=500', 'workspace').catch(() => null),
+        api.timeFlags.list().catch(() => []),
+      ]);
+      const rawEntries = (entriesRes?.value || []).filter(e => !isJibbleExcluded(e));
+      const projectsMap = {};
+      (projectsRes?.value || []).forEach(p => { if (p?.id) projectsMap[p.id] = p.name || p.title || p.code || p.id; });
+      setTimeContext({
+        entries: pairClockEvents(rawEntries, projectsMap),
+        flagActions: flagActionsList || [],
+        fetchedAt: Date.now(),
+        rangeFrom: from,
+        rangeTo: to,
+        error: entriesRes ? null : 'Jibble not configured or unreachable',
+      });
+    } catch (err) {
+      setTimeContext({ entries: [], flagActions: [], rangeFrom: null, rangeTo: null, error: err.message });
+    }
+  }, []);
+  useEffect(() => { fetchTimeContext(); }, [fetchTimeContext]);
+  useEffect(() => {
+    if (!canSeeTime) return undefined;
+    const id = setInterval(fetchTimeContext, JIBBLE_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [fetchTimeContext, canSeeTime]);
 
   // messages: [{ role: 'user'|'assistant', content: string | [{type, ...}], proposals?: [{kind, items}] }]
   const [messages, setMessages] = useStoredState('ep:aiMessages', []);
@@ -14628,6 +15023,102 @@ const AISection = ({
     // Send a compact list of property names + lease counts so Claude can
     // reason about the portfolio without spilling sensitive details.
     const propertyList = properties.slice(0, 50).map(p => `${p.address} (${p.type || '—'}, ${p.occupied || 0}/${p.units || 0} units, mgr: ${p.manager || '—'})`).join('\n');
+
+    // ----- Time-tracking context block -----
+    // Build a structured summary of the last 30 days so the assistant can
+    // answer questions like "who worked the most" / "who was late this
+    // week" without us hard-coding per-question logic.
+    let timeBlock;
+    if (timeContext && timeContext.entries && timeContext.entries.length > 0) {
+      const today = todayISO();
+      const wkStart = startOfWeekISO();
+      const monthStart = startOfMonthISO();
+      // Per-person aggregates over the loaded window.
+      const byPerson = new Map();
+      timeContext.entries.forEach(e => {
+        if (!e.employee) return;
+        const k = e.employee;
+        if (!byPerson.has(k)) byPerson.set(k, {
+          employee: k,
+          personId: e.personId || null,
+          totalHours: 0, weekHours: 0, monthHours: 0, todayHours: 0,
+          daysWorked: new Set(), firstInMinutes: [], lastOutMinutes: [],
+          openShifts: 0, byDate: new Map(),
+        });
+        const row = byPerson.get(k);
+        row.totalHours += e.hours || 0;
+        if (e.date >= wkStart) row.weekHours += e.hours || 0;
+        if (e.date >= monthStart) row.monthHours += e.hours || 0;
+        if (e.date === today) row.todayHours += e.hours || 0;
+        if (e.date) row.daysWorked.add(e.date);
+        if (e.isOpen) row.openShifts += 1;
+        const inMin = minutesOfDay(e.inIso);
+        const outMin = minutesOfDay(e.outIso);
+        if (!row.byDate.has(e.date)) row.byDate.set(e.date, { firstIn: inMin, lastOut: outMin });
+        else {
+          const bucket = row.byDate.get(e.date);
+          if (inMin != null && (bucket.firstIn == null || inMin < bucket.firstIn)) bucket.firstIn = inMin;
+          if (outMin != null && (bucket.lastOut == null || outMin > bucket.lastOut)) bucket.lastOut = outMin;
+        }
+      });
+      byPerson.forEach(row => {
+        row.byDate.forEach(d => {
+          if (d.firstIn != null) row.firstInMinutes.push(d.firstIn);
+          if (d.lastOut != null) row.lastOutMinutes.push(d.lastOut);
+        });
+      });
+      const fmtMin = (m) => m == null ? null : `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+      const avg = (arr) => arr.length === 0 ? null : Math.round(arr.reduce((s, x) => s + x, 0) / arr.length);
+      const peopleSummary = Array.from(byPerson.values())
+        .map(r => ({
+          employee: r.employee,
+          hoursLast30Days: Number(r.totalHours.toFixed(2)),
+          hoursThisWeek: Number(r.weekHours.toFixed(2)),
+          hoursThisMonth: Number(r.monthHours.toFixed(2)),
+          hoursToday: Number(r.todayHours.toFixed(2)),
+          daysWorked: r.daysWorked.size,
+          avgFirstClockIn: fmtMin(avg(r.firstInMinutes)),
+          avgLastClockOut: fmtMin(avg(r.lastOutMinutes)),
+          currentlyClockedIn: r.openShifts > 0,
+        }))
+        .sort((a, b) => b.hoursLast30Days - a.hoursLast30Days);
+      const currentlyClockedIn = peopleSummary.filter(p => p.currentlyClockedIn).map(p => p.employee);
+      const flags = computeTimeFlags(timeContext.entries);
+      const dismissedKeys = new Set(
+        (timeContext.flagActions || []).filter(a => a.type === 'dismiss').map(a => a.flagKey),
+      );
+      const activeFlags = flags
+        .filter(f => !dismissedKeys.has(f.flagKey))
+        .slice(0, 30)
+        .map(f => ({
+          employee: f.employee,
+          date: f.date,
+          reasons: f.reasons.map(r => r.kind),
+          firstIn: fmtHHMM(f.firstInIso),
+          lastOut: fmtHHMM(f.lastOutIso),
+          hours: Number(f.totalHours.toFixed(2)),
+        }));
+      timeBlock = [
+        '',
+        `Time-tracking snapshot (${timeContext.rangeFrom} to ${timeContext.rangeTo}, source: Jibble):`,
+        `  Window: last 30 days · today is ${today} · week starts ${wkStart} · month starts ${monthStart}`,
+        `  Per-person totals (sorted by hours desc):`,
+        JSON.stringify(peopleSummary, null, 2),
+        `  Currently clocked in: ${currentlyClockedIn.length === 0 ? '(none)' : currentlyClockedIn.join(', ')}`,
+        `  Active flags (auto-detected anomalies, dismissals removed): ${activeFlags.length}`,
+        activeFlags.length > 0 ? JSON.stringify(activeFlags, null, 2) : '',
+        '  Flag rules: late_in = first clock-in after 08:30; early_out = last clock-out before 15:30; short_hours = total < 4h.',
+      ].filter(Boolean).join('\n');
+    } else if (timeContext && timeContext.error === 'permission') {
+      timeBlock = '\nTime-tracking data is not visible to this user (their role does not have VIEW_TIME). Decline questions about who worked when, who was late, etc.';
+    } else if (timeContext && timeContext.error) {
+      timeBlock = `\nTime-tracking data is unavailable (${timeContext.error}). Tell the user to configure Jibble in Settings → Integrations.`;
+    } else if (timeContext === null) {
+      timeBlock = '\nTime-tracking data is still loading — if asked, mention you do not have it yet for this session.';
+    } else {
+      timeBlock = '\nTime-tracking data is empty for the last 30 days.';
+    }
+
     return [
       'You are the assistant for the Exceed Properties web application.',
       'You can answer questions about the portfolio, explain how the app works, and help the user import data.',
@@ -14637,6 +15128,12 @@ const AISection = ({
       '',
       'Known properties (up to 50):',
       propertyList || '(none yet)',
+      timeBlock,
+      '',
+      'TIME-TRACKING QUESTIONS:',
+      '  • You CAN answer questions like "who worked the most", "who was late this week", "who is clocked in right now", "what days has X been flagged".',
+      '  • Use the per-person totals and the active-flags list above. Do NOT invent hours or names not present in that data.',
+      '  • If the data window does not cover the asked period (e.g. user asks about last quarter but you only have 30 days), say so plainly.',
       '',
       'When the user asks you to ADD records (properties, employees, leases) from data they paste or attach:',
       '  • Call the relevant tool (add_properties / add_employees / add_leases) with the parsed records.',
@@ -15243,13 +15740,13 @@ export default function ExceedProperties() {
       case 'ondesk': return checkPerm(PERMISSIONS.VIEW_ONDESK) || <OnDeskSection employees={employees} deskStatuses={deskStatuses} setDeskStatuses={setDeskStatuses} activityLog={activityLog} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'properties': return checkPerm(PERMISSIONS.VIEW_PROPERTIES) || <PropertiesSection properties={properties} setProperties={setProperties} tenancies={tenancies} setTenancies={setTenancies} employees={employees} landlords={landlords} setLandlords={setLandlords} showToast={showToast} logAction={logAction} />;
       case 'employees': return checkPerm(PERMISSIONS.VIEW_EMPLOYEES) || <PeopleSection employees={employees} setEmployees={setEmployees} currentUser={currentUser} setCurrentUser={setCurrentUser} showToast={showToast} logAction={logAction} />;
-      case 'time': return checkPerm(PERMISSIONS.VIEW_TIME) || <TimeTrackingSection employees={employees} showToast={showToast} integrations={integrations} setIntegrations={setIntegrations} onNavigateToSettings={() => setActiveNav('settings')} />;
+      case 'time': return checkPerm(PERMISSIONS.VIEW_TIME) || <TimeTrackingSection employees={employees} showToast={showToast} integrations={integrations} setIntegrations={setIntegrations} onNavigateToSettings={() => setActiveNav('settings')} currentUser={currentUser} />;
       case 'maintenance': return checkPerm(PERMISSIONS.VIEW_MAINTENANCE) || <MaintenanceSection maintenance={maintenance} setMaintenance={setMaintenance} properties={properties} employees={employees} showToast={showToast} logAction={logAction} />;
       case 'outages': return checkPerm(PERMISSIONS.VIEW_OUTAGES) || <OutagesSection outages={outages} setOutages={setOutages} properties={properties} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'tenancy': return checkPerm(PERMISSIONS.VIEW_TENANCY) || <TenancyActivitySection inspections={inspections} integrations={integrations} onNavigateToSettings={() => setActiveNav('settings')} />;
       case 'projections': return checkPerm(PERMISSIONS.VIEW_PROJECTIONS) || <ProjectionsSection showToast={showToast} logAction={logAction} />;
       case 'leasing': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeasingSection packs={packs} packsLoaded={packsLoaded} refetchPacks={refetchPacks} properties={properties} employees={employees} debtors={debtors} landlords={landlords} integrations={integrations} setIntegrations={setIntegrations} showToast={showToast} logAction={logAction} currentUser={currentUser} onNavigateToSettings={() => setActiveNav('settings')} onNavigate={setActiveNav} />;
-      case 'ai': return checkPerm(PERMISSIONS.VIEW_AI) || <AISection employees={employees} setEmployees={setEmployees} properties={properties} setProperties={setProperties} leases={leases} setLeases={setLeases} debtors={debtors} maintenance={maintenance} outages={outages} tenancies={tenancies} landlords={landlords} integrations={integrations} showToast={showToast} logAction={logAction} onNavigateToSettings={() => setActiveNav('settings')} />;
+      case 'ai': return checkPerm(PERMISSIONS.VIEW_AI) || <AISection employees={employees} setEmployees={setEmployees} properties={properties} setProperties={setProperties} leases={leases} setLeases={setLeases} debtors={debtors} maintenance={maintenance} outages={outages} tenancies={tenancies} landlords={landlords} integrations={integrations} showToast={showToast} logAction={logAction} onNavigateToSettings={() => setActiveNav('settings')} currentUser={currentUser} />;
       case 'leaseDrafter': return checkPerm(PERMISSIONS.VIEW_LEASING) || <LeaseDrafter currentUser={currentUser} showToast={showToast} logAction={logAction} integrations={integrations} debtors={debtors} onNavigateToSettings={() => setActiveNav('settings')} onClose={() => setActiveNav('leasing')} />;
       case 'debtors': return checkPerm(PERMISSIONS.VIEW_DEBTORS) || <DebtorsSection debtors={debtors} setDebtors={setDebtors} debtorAccounts={debtorAccounts} setDebtorAccounts={setDebtorAccounts} debtorNotes={debtorNotes} setDebtorNotes={setDebtorNotes} currentUser={currentUser} showToast={showToast} logAction={logAction} />;
       case 'settings': return checkPerm(PERMISSIONS.VIEW_SETTINGS) || (

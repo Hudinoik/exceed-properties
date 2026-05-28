@@ -326,6 +326,36 @@ export const jibbleAdjustments = {
   },
 };
 
+// --- Time-tracking flag actions ---
+// Flags are computed in the browser; only human actions (PM comments
+// and director dismissals) persist. flagKey is "<personId>|<YYYY-MM-DD>".
+export const timeFlags = {
+  async list() {
+    const r = await request('/api/jibble/flag-actions');
+    return r.actions || [];
+  },
+  async addComment({ flagKey, comment, actorRole, actorName }) {
+    const r = await request('/api/jibble/flag-actions', {
+      method: 'POST',
+      body: { flagKey, type: 'comment', comment, actorRole, actorName },
+    });
+    return r.action;
+  },
+  async dismiss({ flagKey, actorRole, actorName }) {
+    const r = await request('/api/jibble/flag-actions', {
+      method: 'POST',
+      body: { flagKey, type: 'dismiss', actorRole, actorName },
+    });
+    return r.action;
+  },
+  async reopen({ flagKey, actorRole }) {
+    return request('/api/jibble/flag-actions/dismiss', {
+      method: 'DELETE',
+      body: { flagKey, actorRole },
+    });
+  },
+};
+
 // Convenience: flatten a secrets array into an object {key: {hasValue, last4, ...}}
 // for easy access from React components.
 export const secretsToMap = (rows) => {
