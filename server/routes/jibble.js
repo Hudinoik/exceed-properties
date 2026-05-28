@@ -93,7 +93,10 @@ router.post('/flag-actions', async (req, res) => {
   }
 });
 
-router.delete('/flag-actions/dismiss', async (req, res) => {
+// Re-open a dismissed flag. Implemented as POST (not DELETE) because some
+// upstream proxies (Cloudflare, Render) strip the body from DELETE requests
+// and we'd see a 502 before this handler ever ran.
+router.post('/flag-actions/reopen', async (req, res) => {
   const { flagKey, actorRole } = req.body || {};
   if (!flagKey) return res.status(400).json({ error: 'flagKey is required' });
   if (actorRole !== 'director') {

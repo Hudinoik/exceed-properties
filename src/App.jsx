@@ -2804,6 +2804,15 @@ const TIME_FLAG_RULES = {
   LOOKBACK_DAYS: 30,               // only flag the last month — never further
 };
 
+// People who should never appear on the Flagged page regardless of pattern.
+// Matched as a case-insensitive substring against the employee name so
+// "Peter Smit" / "peter" / "PETER" all match.
+const TIME_FLAG_EXCLUDED_NAMES = ['peter'];
+const isTimeFlagExcluded = (employee) => {
+  const name = String(employee || '').toLowerCase();
+  return TIME_FLAG_EXCLUDED_NAMES.some(excl => name.includes(excl));
+};
+
 const minutesOfDay = (iso) => {
   if (!iso) return null;
   const d = new Date(iso);
@@ -2836,6 +2845,7 @@ const computeTimeFlags = (pairedEntries, { todayIso } = {}) => {
     if (!p.personId || !p.date) continue;
     if (p.date >= today) continue;      // don't flag today or future — still in progress
     if (p.date < cutoffIso) continue;   // older than the lookback window — ignore
+    if (isTimeFlagExcluded(p.employee)) continue; // person opted out of flagging
     const k = `${p.personId}|${p.date}`;
     if (!byPersonDate.has(k)) byPersonDate.set(k, []);
     byPersonDate.get(k).push(p);
@@ -4308,6 +4318,29 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
             setFlagBusy(null);
           }
         };
+        // Jump from a flag card to the Reporting tab pre-pointed at that
+        // person + day. The flag.personId may come from a Jibble personId
+        // — the Reporting picker keys off the same id.
+        const jumpToReporting = (flag) => {
+          setReportPersonId(flag.personId || '');
+          setReportGranularity('day');
+          setReportDate(flag.date);
+          setSubPage('reporting');
+        };
+
+        // Group enriched flags by employee so the page reads as one block
+        // per person rather than a flat list. Sort by total flag count
+        // desc, then by employee name for stability.
+        const groupedByEmployee = (() => {
+          const m = new Map();
+          visible.forEach(f => {
+            if (!m.has(f.employee)) m.set(f.employee, { employee: f.employee, personId: f.personId, flags: [] });
+            m.get(f.employee).flags.push(f);
+          });
+          return Array.from(m.values()).sort((a, b) =>
+            b.flags.length - a.flags.length || a.employee.localeCompare(b.employee),
+          );
+        })();
 
         return (
           <>
@@ -4363,21 +4396,40 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                 </p>
               </Card>
             ) : (
-              <div className="space-y-3">
-                {visible.map(flag => {
+              <div className="space-y-5">
+                {groupedByEmployee.map(group => (
+                  <div key={group.employee}>
+                    <div className="flex items-center gap-3 mb-2 px-1">
+                      <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0" style={{ backgroundColor: brand.navy, color: '#fff' }}>
+                        {group.employee.split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase()}
+                      </div>
+                      <p className="text-sm font-semibold" style={{ color: brand.navy }}>
+                        {group.employee}
+                        <span className="ml-2 px-2 py-0.5 text-[11px] font-medium rounded" style={{ backgroundColor: brand.cream, color: brand.text }}>
+                          {group.flags.length} flag{group.flags.length === 1 ? '' : 's'}
+                        </span>
+                      </p>
+                    </div>
+                    <div className="space-y-2 pl-3" style={{ borderLeft: `2px solid ${brand.border}` }}>
+                      {group.flags.map(flag => {
                   const isDismissed = !!flag.dismissal;
                   const reasonColor = (kind) => kind === 'short_hours' ? brand.danger : kind === 'late_in' ? brand.gold : '#A86523';
                   return (
                     <Card key={flag.flagKey} className="p-4" style={isDismissed ? { backgroundColor: '#f4f3ee', opacity: 0.75 } : undefined}>
                       <div className="flex items-start justify-between gap-3 flex-wrap mb-2">
-                        <div>
-                          <p className="text-sm font-semibold" style={{ color: brand.navy }}>
-                            {flag.employee} <span className="font-normal" style={{ color: brand.textMuted }}>· {flag.date}</span>
+                        <button
+                          type="button"
+                          onClick={() => jumpToReporting(flag)}
+                          className="text-left btn-press"
+                          title="Open this day in Reporting"
+                        >
+                          <p className="text-sm font-semibold underline-offset-2 hover:underline" style={{ color: brand.navy }}>
+                            {formatDate(flag.date)}
                           </p>
                           <p className="text-xs mt-0.5" style={{ color: brand.textMuted }}>
                             In {fmtHHMM(flag.firstInIso)} · Out {fmtHHMM(flag.lastOutIso)} · {flag.totalHours.toFixed(2)}h total
                           </p>
-                        </div>
+                        </button>
                         <div className="flex items-center gap-2">
                           {isDismissed ? (
                             <>
@@ -4455,6 +4507,9 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                     </Card>
                   );
                 })}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </>

@@ -349,8 +349,8 @@ export const timeFlags = {
     return r.action;
   },
   async reopen({ flagKey, actorRole }) {
-    return request('/api/jibble/flag-actions/dismiss', {
-      method: 'DELETE',
+    return request('/api/jibble/flag-actions/reopen', {
+      method: 'POST',
       body: { flagKey, actorRole },
     });
   },
