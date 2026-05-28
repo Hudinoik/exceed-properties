@@ -5941,9 +5941,13 @@ const buildLeaseData = (form) => {
 
 // Dropzone for Lease Control / Invoice PDFs. Supports drag-and-drop and
 // click-to-browse. Renders loading / success / error states inline.
-const PdfDropzone = ({ kind, state, error, filename, aiReady, onFile, onNavigateToSettings }) => {
+const PdfDropzone = ({ kind, state, error, filename, aiReady, onFile, onNavigateToSettings, lockedReason }) => {
   const [over, setOver] = useState(false);
   const inputRef = useRef(null);
+  // Treat "locked" as a stronger version of !aiReady — click and drop
+  // are both no-ops, and the body shows the lock reason. Used to block
+  // the lease-control / invoice pair from being uploaded simultaneously.
+  const enabled = aiReady && !lockedReason;
 
   const onDrop = (e) => {
     e.preventDefault();
@@ -5960,16 +5964,17 @@ const PdfDropzone = ({ kind, state, error, filename, aiReady, onFile, onNavigate
   const baseStyle = {
     border: `2px dashed ${state === 'error' ? brand.danger : over ? brand.gold : brand.border}`,
     backgroundColor: state === 'success' ? brand.successLight : state === 'error' ? brand.dangerLight : '#FAFAF6',
-    cursor: aiReady ? 'pointer' : 'not-allowed',
-    transition: 'border-color 150ms, background-color 150ms',
+    cursor: enabled ? 'pointer' : 'not-allowed',
+    opacity: lockedReason ? 0.6 : 1,
+    transition: 'border-color 150ms, background-color 150ms, opacity 150ms',
   };
 
   return (
     <div
-      onClick={() => aiReady && inputRef.current?.click()}
-      onDragOver={(e) => { e.preventDefault(); if (aiReady) setOver(true); }}
+      onClick={() => enabled && inputRef.current?.click()}
+      onDragOver={(e) => { e.preventDefault(); if (enabled) setOver(true); }}
       onDragLeave={() => setOver(false)}
-      onDrop={(e) => aiReady && onDrop(e)}
+      onDrop={(e) => enabled && onDrop(e)}
       className="rounded p-4 text-center"
       style={baseStyle}
     >
@@ -5978,6 +5983,11 @@ const PdfDropzone = ({ kind, state, error, filename, aiReady, onFile, onNavigate
         <>
           <RefreshCw size={20} style={{ color: brand.gold }} className="mx-auto mb-1 animate-spin" />
           <p className="text-[11px]" style={{ color: brand.text }}>Parsing {filename || 'PDF'}…</p>
+        </>
+      ) : lockedReason && state !== 'success' ? (
+        <>
+          <Lock size={20} style={{ color: brand.textMuted }} className="mx-auto mb-1" />
+          <p className="text-[11px]" style={{ color: brand.textMuted }}>{lockedReason}</p>
         </>
       ) : state === 'success' ? (
         <>
@@ -6779,6 +6789,19 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
       showToast('Configure your Anthropic API key in Settings → Integrations first', 'error');
       return;
     }
+    // Mutex between the Lease Control Schedule and the Invoice: only one
+    // can parse at a time. Both populate overlapping landlord/banking
+    // fields, and running them concurrently confuses Claude (and also
+    // races the form merge). Other PDF kinds (CIPC/ID/Tax) are
+    // independent and unaffected.
+    if (kind === 'leaseControl' && uploadState.invoice === 'loading') {
+      showToast('Invoice is still parsing — wait for it to finish before adding a Lease Control Schedule', 'error');
+      return;
+    }
+    if (kind === 'invoice' && uploadState.leaseControl === 'loading') {
+      showToast('Lease Control Schedule is still parsing — wait for it to finish before adding an Invoice', 'error');
+      return;
+    }
     setUploadState(s => ({ ...s, [kind]: 'loading' }));
     setUploadError(e => ({ ...e, [kind]: null }));
     setUploadedName(n => ({ ...n, [kind]: file.name }));
@@ -7062,6 +7085,7 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
               aiReady={aiReady}
               onFile={handlePdfUpload}
               onNavigateToSettings={onNavigateToSettings}
+              lockedReason={uploadState.invoice === 'loading' ? 'Waiting for the Invoice to finish parsing…' : null}
             />
           </Card>
 
@@ -7075,6 +7099,7 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
               aiReady={aiReady}
               onFile={handlePdfUpload}
               onNavigateToSettings={onNavigateToSettings}
+              lockedReason={uploadState.leaseControl === 'loading' ? 'Waiting for the Lease Control Schedule to finish parsing…' : null}
             />
           </Card>
 
