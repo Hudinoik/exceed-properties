@@ -123,7 +123,17 @@ const useStoredState = (key, initialValue) => {
 
 // Format helpers
 const formatCurrency = (n) => `R ${Number(n || 0).toLocaleString('en-ZA')}`;
-const formatDate = (d) => d ? new Date(d).toLocaleDateString('en-ZA', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+// All user-facing date displays use DAY MONTH YEAR — never US month-first
+// or locale-dependent output. Pinned to a deterministic format here so we
+// don't rely on browser ICU data (which has historically produced
+// "2026/05/27" or "May 27, 2026" depending on the engine for en-ZA).
+const _MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const formatDate = (d) => {
+  if (!d) return '—';
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt.getTime())) return '—';
+  return `${String(dt.getDate()).padStart(2, '0')} ${_MONTH_SHORT[dt.getMonth()]} ${dt.getFullYear()}`;
+};
 // Format a Date as YYYY-MM-DD in LOCAL time (not UTC). Jibble's
 // `belongsToDate` and the day chips both express the user's local
 // calendar date, so we must format in local TZ here too -- using
@@ -2790,6 +2800,8 @@ const TIME_FLAG_RULES = {
   LATE_IN_MINUTES: 8 * 60 + 30,   // first clock-in after 08:30 → flag
   EARLY_OUT_MINUTES: 15 * 60 + 30, // last clock-out before 15:30 → flag
   MIN_HOURS_PER_DAY: 4,            // total worked < 4h → flag
+  MAX_GAP_MINUTES: 2 * 60,         // gap > 2h between same-day shifts → flag
+  LOOKBACK_DAYS: 30,               // only flag the last month — never further
 };
 
 const minutesOfDay = (iso) => {
@@ -2814,10 +2826,16 @@ const fmtHHMM = (iso) => {
 // day's pattern is final. Future-proofing: callers can re-evaluate.
 const computeTimeFlags = (pairedEntries, { todayIso } = {}) => {
   const today = todayIso || (new Date()).toISOString().slice(0, 10);
+  // Hard cap: never flag entries older than LOOKBACK_DAYS. Earliest
+  // allowed date (inclusive) = today − LOOKBACK_DAYS.
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - TIME_FLAG_RULES.LOOKBACK_DAYS);
+  const cutoffIso = `${cutoffDate.getFullYear()}-${String(cutoffDate.getMonth() + 1).padStart(2, '0')}-${String(cutoffDate.getDate()).padStart(2, '0')}`;
   const byPersonDate = new Map();
   for (const p of pairedEntries) {
     if (!p.personId || !p.date) continue;
-    if (p.date >= today) continue; // don't flag today or future — still in progress
+    if (p.date >= today) continue;      // don't flag today or future — still in progress
+    if (p.date < cutoffIso) continue;   // older than the lookback window — ignore
     const k = `${p.personId}|${p.date}`;
     if (!byPersonDate.has(k)) byPersonDate.set(k, []);
     byPersonDate.get(k).push(p);
@@ -2853,6 +2871,25 @@ const computeTimeFlags = (pairedEntries, { todayIso } = {}) => {
         label: 'Short hours',
         detail: `Worked ${totalHours.toFixed(2)}h (under ${TIME_FLAG_RULES.MIN_HOURS_PER_DAY}h)`,
       });
+    }
+    // Long-gap rule: between consecutive shifts ON THE SAME DAY, flag if
+    // the gap from clock-out to next clock-in exceeds MAX_GAP_MINUTES.
+    // Cross-day gaps are excluded by construction (grouping is per-day),
+    // which also automatically excludes the start of the day (before the
+    // first clock-in) and the end of the day (after the last clock-out).
+    for (let i = 0; i < rows.length - 1; i++) {
+      const prevOut = rows[i].outIso;
+      const nextIn = rows[i + 1].inIso;
+      if (!prevOut || !nextIn) continue;
+      const gapMin = (new Date(nextIn) - new Date(prevOut)) / 60000;
+      if (gapMin > TIME_FLAG_RULES.MAX_GAP_MINUTES) {
+        reasons.push({
+          kind: 'long_gap',
+          label: 'Long mid-day gap',
+          detail: `${(gapMin / 60).toFixed(1)}h gap between ${fmtHHMM(prevOut)} clock-out and ${fmtHHMM(nextIn)} clock-in`,
+        });
+        break; // one long_gap reason per day is enough
+      }
     }
     if (reasons.length === 0) return;
     const [personId, date] = key.split('|');
@@ -4313,7 +4350,7 @@ const TimeTrackingSection = ({ employees, showToast, integrations, setIntegratio
                 </label>
               </div>
               <p className="text-xs" style={{ color: brand.textMuted }}>
-                Auto-flags any day where first clock-in is after 08:30, last clock-out is before 15:30, or total worked is under {TIME_FLAG_RULES.MIN_HOURS_PER_DAY} hours.
+                Auto-flags any day (last {TIME_FLAG_RULES.LOOKBACK_DAYS} days only) where first clock-in is after 08:30, last clock-out is before 15:30, total worked is under {TIME_FLAG_RULES.MIN_HOURS_PER_DAY} hours, or a mid-day gap exceeds {TIME_FLAG_RULES.MAX_GAP_MINUTES / 60} hours.
                 {!canDismissFlag && !canCommentFlag && ' Read-only view — only directors can dismiss flags; property managers can add reason comments.'}
                 {canCommentFlag && !canDismissFlag && ' You can add a reason comment; only the director can dismiss.'}
               </p>
@@ -5062,7 +5099,14 @@ const fmtMoney = (n) => {
   // R + non-breaking space + thousands grouped with non-breaking spaces + dot decimal
   return `R ${int.replace(/\B(?=(\d{3})+(?!\d))/g, ' ')}.${dec}`;
 };
-const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString('en-ZA', { year: 'numeric', month: 'long', day: 'numeric' }) : '—';
+// "27 May 2026" — DAY MONTH YEAR, deterministic (no locale dependency).
+const fmtDate = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  return `${String(d.getDate()).padStart(2, '0')} ${months[d.getMonth()]} ${d.getFullYear()}`;
+};
 const fmtDateShort = (iso) => {
   if (!iso) return '';
   const d = new Date(iso);
@@ -5325,7 +5369,7 @@ const CIPC_TOOL = {
           companyName: { type: 'string', description: 'Registered company name exactly as printed' },
           tradingName: { type: 'string', description: 'Trading-as name if different from registered name' },
           registrationNumber: { type: 'string', description: 'Format YYYY/NNNNNN/NN (CIPC registration number)' },
-          entityType: { type: 'string', description: 'Company | CC | Trust | Partnership | Sole Proprietor — pick the closest match' },
+          entityType: { type: 'string', description: 'Company | CC | Trust | Individual — pick the closest match. Use "Individual" if the document indicates the tenant is a natural person signing personally (not a company/CC/Trust).' },
           status: { type: 'string', description: 'Company status — In Business, In Deregistration, etc.' },
           registrationDate: { type: 'string', description: 'ISO date YYYY-MM-DD' },
           financialYearEnd: { type: 'string', description: 'Month name or ISO date (e.g. "February" or "2026-02-28")' },
@@ -6055,6 +6099,11 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
   }, [debtors, form.tenant?.companyName]);
   const [badPayerAcknowledged, setBadPayerAcknowledged] = useState(false);
 
+  // Individual-capacity tenants don't need a corporate resolution and
+  // are automatically their own surety. Several sections of the drafter
+  // hide / grey out when this is true.
+  const isTenantIndividual = (form.tenant?.entityType || 'Company') === 'Individual';
+
   // Reset acknowledgement if the tenant name changes
   useEffect(() => { setBadPayerAcknowledged(false); }, [form.tenant?.companyName]);
 
@@ -6761,7 +6810,18 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
       }
       // eslint-disable-next-line no-console
       console.log(`[Lease PDF Parse · ${kind}] Claude returned:`, parsed);
-      const { mergedForm, filledPaths, skipped } = mergeParsedIntoForm(form, parsed, dirtyPaths);
+      // Apply the merge against the LATEST committed form, not the
+      // closure-captured `form` from when this handler started. Without
+      // this, two PDFs uploaded back-to-back both read the same stale
+      // starting form, and the second setForm clobbers the first.
+      let filledPaths = [];
+      let skipped = [];
+      setForm(prev => {
+        const r = mergeParsedIntoForm(prev, parsed, dirtyPaths);
+        filledPaths = r.filledPaths;
+        skipped = r.skipped;
+        return r.mergedForm;
+      });
       // eslint-disable-next-line no-console
       console.log(`[Lease PDF Parse · ${kind}] Filled (${filledPaths.length}):`, filledPaths);
       // eslint-disable-next-line no-console
@@ -6769,7 +6829,6 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
       const skippedByReason = skipped.reduce((acc, s) => { acc[s.reason] = (acc[s.reason] || 0) + 1; return acc; }, {});
       // eslint-disable-next-line no-console
       console.log(`[Lease PDF Parse · ${kind}] Skip summary:`, skippedByReason);
-      setForm(mergedForm);
       // Flash filled fields green for ~2s
       if (filledPaths.length > 0) {
         setFlashPaths(prev => { const n = new Set(prev); filledPaths.forEach(p => n.add(p)); return n; });
@@ -7089,25 +7148,53 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
               );
             })()}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
-              <Field label="Company Name"><Input value={form.tenant.companyName} onChange={(e) => upd('tenant.companyName', e.target.value)} /></Field>
-              <Field label="ID Number"><Input value={form.tenant.idNumber} onChange={(e) => upd('tenant.idNumber', e.target.value)} /></Field>
-              <Field label="Registration Number"><Input value={form.tenant.registrationNumber} onChange={(e) => upd('tenant.registrationNumber', e.target.value)} /></Field>
+              <Field label={isTenantIndividual ? 'Full Name' : 'Company Name'}><Input value={form.tenant.companyName} onChange={(e) => upd('tenant.companyName', e.target.value)} /></Field>
+              {/* ID Number only applies when the tenant is a natural person */}
+              {isTenantIndividual && (
+                <Field label="ID Number"><Input value={form.tenant.idNumber} onChange={(e) => upd('tenant.idNumber', e.target.value)} /></Field>
+              )}
+              {!isTenantIndividual && (
+                <Field label="Registration Number"><Input value={form.tenant.registrationNumber} onChange={(e) => upd('tenant.registrationNumber', e.target.value)} /></Field>
+              )}
               <Field label="VAT Number"><Input value={form.tenant.vatNumber} onChange={(e) => upd('tenant.vatNumber', e.target.value)} /></Field>
               <Field label="Address"><Input value={form.tenant.address} onChange={(e) => upd('tenant.address', e.target.value)} /></Field>
               <Field label="Phone"><Input value={form.tenant.phone} onChange={(e) => upd('tenant.phone', e.target.value)} /></Field>
               <Field label="Email"><Input type="email" value={form.tenant.email} onChange={(e) => upd('tenant.email', e.target.value)} /></Field>
               <Field label="Contact Person"><Input value={form.tenant.contactPerson} onChange={(e) => upd('tenant.contactPerson', e.target.value)} /></Field>
             </div>
-            <div className="mt-4 pt-4" style={{ borderTop: `1px solid ${brand.border}` }}>
-              <p className="text-[11px] tracking-wider uppercase mb-3" style={{ color: brand.gold }}>Tenant Resolution (Part B)</p>
+          </LeaseSection>
+
+          {/* Entity Type — its own block. Selecting Individual switches the
+              tenant section to natural-person mode and disables Resolution
+              + Surety (the individual is automatically the surety). */}
+          <LeaseSection number="1.2a" title="Entity Type" icon={User} color={brand.gold}
+            subtitle="Determines whether the tenant signs in a personal or corporate capacity.">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
+              <Field label="Tenant signs in the capacity of">
+                <Select value={form.tenant.entityType || 'Company'} onChange={(e) => upd('tenant.entityType', e.target.value)}>
+                  <option value="Company">Company (Pty) Ltd</option>
+                  <option value="CC">Close Corporation</option>
+                  <option value="Trust">Trust</option>
+                  <option value="Individual">Individual (natural person)</option>
+                </Select>
+              </Field>
+            </div>
+            {isTenantIndividual && (
+              <p className="mt-3 text-xs p-3 rounded" style={{ backgroundColor: brand.cream, color: brand.text }}>
+                Individual capacity — the tenant signs personally and is automatically the surety.
+                Resolution (Part B) and the separate Surety section are not applicable and have been disabled.
+              </p>
+            )}
+          </LeaseSection>
+
+          {/* Tenant Resolution (Part B) — its own block. Disabled when the
+              tenant is an Individual (no corporate resolution required). */}
+          <LeaseSection number="1.2b" title="Tenant Resolution (Part B)" icon={FileText} color={brand.gold}
+            subtitle={isTenantIndividual
+              ? 'Not applicable — the individual signs in their personal capacity.'
+              : 'Signatory details used in the corporate resolution annexed to the lease.'}>
+            <fieldset disabled={isTenantIndividual} style={{ opacity: isTenantIndividual ? 0.45 : 1, pointerEvents: isTenantIndividual ? 'none' : 'auto' }}>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4">
-                <Field label="Entity Type" hint="Determines DIRECTORS / MEMBERS / TRUSTEES in the resolution">
-                  <Select value={form.tenant.entityType || 'Company'} onChange={(e) => upd('tenant.entityType', e.target.value)}>
-                    <option value="Company">Company (Pty) Ltd</option>
-                    <option value="CC">Close Corporation</option>
-                    <option value="Trust">Trust</option>
-                  </Select>
-                </Field>
                 <Field label="Signatory Role" hint="Title used in the resolution and signature block">
                   <Select value={form.tenant.signatoryRole || 'Director'} onChange={(e) => upd('tenant.signatoryRole', e.target.value)}>
                     <option value="Director">Director</option>
@@ -7125,7 +7212,7 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
                   </Select>
                 </Field>
               </div>
-            </div>
+            </fieldset>
           </LeaseSection>
 
           {/* 1.3-1.8 Premises */}
@@ -7196,17 +7283,30 @@ const LeaseDrafter = ({ open, onClose, currentUser, showToast, logAction, integr
             </div>
           </LeaseSection>
 
-          {/* 1.11 Surety — optional, toggled via checkbox */}
+          {/* 1.11 Surety — optional, toggled via checkbox. Individual-capacity
+              tenants are automatically the surety, so the whole section is
+              greyed out and the checkbox is locked off. */}
           <LeaseSection
             number="1.11" title="Surety" icon={Shield} color={brand.navy}
             headerExtra={
-              <label className="flex items-center gap-2 text-xs cursor-pointer">
-                <input type="checkbox" checked={!!form.suretyRequired} onChange={(e) => upd('suretyRequired', e.target.checked)} />
+              <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ opacity: isTenantIndividual ? 0.5 : 1 }}>
+                <input
+                  type="checkbox"
+                  checked={!isTenantIndividual && !!form.suretyRequired}
+                  disabled={isTenantIndividual}
+                  onChange={(e) => upd('suretyRequired', e.target.checked)}
+                />
                 <span style={{ color: brand.textMuted }}>Surety required</span>
               </label>
             }
           >
-            {form.suretyRequired ? (
+            {isTenantIndividual ? (
+              <div className="flex items-center gap-2 p-3 rounded" style={{ backgroundColor: brand.cream, opacity: 0.7 }}>
+                <span className="text-xs font-medium" style={{ color: brand.textMuted }}>Status:</span>
+                <span className="px-2 py-0.5 text-xs font-semibold rounded" style={{ backgroundColor: '#fff', color: brand.navy }}>Automatic</span>
+                <span className="text-xs ml-2" style={{ color: brand.textMuted }}>Tenant signs in their personal capacity — they are automatically the surety. No separate surety is added.</span>
+              </div>
+            ) : form.suretyRequired ? (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-x-4">
                 <Field label="Name"><Input value={form.surety.name} onChange={(e) => upd('surety.name', e.target.value)} /></Field>
                 <Field label="ID Number"><Input value={form.surety.idNumber} onChange={(e) => upd('surety.idNumber', e.target.value)} /></Field>
